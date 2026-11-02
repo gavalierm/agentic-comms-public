@@ -1,0 +1,15 @@
+# Všeobecná jednotka poštovej služby (inštancia prod). Hodnoty servera
+# (User, Group, WorkingDirectory = klon comms, HOME) dodá drop-in
+# <jednotka>.service.d/*.conf z repa servera, napr. v repe servera.
+[Unit]
+Description=agentic pošta (comms serve, inštancia prod)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node bin/comms.mjs serve --instance prod
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

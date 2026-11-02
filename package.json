@@ -1,0 +1,17 @@
+{
+  "name": "agentic-comms",
+  "version": "0.4.0",
+  "private": true,
+  "type": "module",
+  "description": "Mail (comms) and wake-up module for agentic topics. No runtime dependencies.",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "comms": "bin/comms.mjs",
+    "wake": "bin/wake.mjs"
+  },
+  "scripts": {
+    "test": "node --test \"tests/**/*.test.mjs\""
+  }
+}

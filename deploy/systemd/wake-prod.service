@@ -1,0 +1,16 @@
+# Všeobecná jednotka budenia (inštancia prod, adaptér t3). Hodnoty servera
+# (User, Group, WorkingDirectory = klon comms, HOME, T3CODE_HOME, PATH s t3,
+# After= jednotky T3) dodá drop-in <jednotka>.service.d/*.conf z repa servera.
+[Unit]
+Description=agentic budenie (comms wake, inštancia prod, adaptér t3)
+After=comms-prod.service
+Wants=comms-prod.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node bin/wake.mjs run --instance prod --no-start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -76,3 +76,15 @@ export async function acquireWakeLock(stateDir, { log = () => {}, signal = null,
     },
   };
 }
+
+/**
+ * Wake of this state dir for other callers (client `count`, comms-public#4): null when wake never ran here
+ * (no wake-state.json), else { running, pid, heartbeat_at }. The lock file is removed on a clean stop, so a missing
+ * lock next to an existing state file means "stopped".
+ */
+export function wakeStatus(stateDir) {
+  if (!stateDir || !fs.existsSync(path.join(stateDir, 'wake-state.json'))) return null;
+  const lock = readWakeLock(stateDir);
+  const running = lockHeld(lock, { pid: -1 });
+  return { running, pid: running ? lock.pid : null, heartbeat_at: running ? lock.heartbeat_at : null };
+}

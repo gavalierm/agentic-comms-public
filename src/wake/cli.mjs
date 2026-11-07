@@ -3,7 +3,11 @@
 import { CommsError } from '../client/index.mjs';
 import { watchInstall } from '../common/selfrestart.mjs';
 import { RESTART_EXIT, CHILD_ENV } from './supervise.mjs';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import { acquireWakeLock, readWakeLock, lockHeld } from './lock.mjs';
+import { installPlan, formatPlan, applyPlan } from './install.mjs';
+import { baseDir } from '../common/paths.mjs';
 import { resolveWakeConfig, createWaker, WakeState, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE } from './index.mjs';
 
 const USAGE = `Použitie: wake <príkaz> [voľby]
@@ -11,6 +15,8 @@ const USAGE = `Použitie: wake <príkaz> [voľby]
   run       trvalý proces: odoberá udalosti pošty a budí držiteľov cez adaptér
   status    vypíše stav modulu (či beží: pid a posledný heartbeat; kurzor, zobudenia za hodinu)
   config    vypíše výslednú konfiguráciu (bez kľúča)
+  install   trvalý beh pre prihláseného používateľa: Linux systemd --user, macOS LaunchAgent, Windows Plánovač úloh
+            (voľby ako run; --print iba vypíše súbory a príkazy, --remove registráciu odstráni)
 
 Voľby pošty (ako comms): --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http://host:port>
                          --key <kľúč> | --instance-id <id> | --timeout <ms> | --no-start
@@ -35,7 +41,7 @@ Budiaca správa je vždy „${WAKE_TEMPLATE} <project>/<topic>“, nikdy telo sp
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'instance-id', 'timeout', 'client-dir',
   'machine', 'adapter', 'command', 'limit-per-hour', 'stop-on-repeat', 'max-event-age-ms', 'wait-ms', 'reconnect-ms', 'state-dir',
   'status-command', 'keepalive-since-command', 'keepalive-interval-ms']);
-const BOOL_FLAGS = new Set(['no-start', 'help', 'no-self-restart']);
+const BOOL_FLAGS = new Set(['no-start', 'help', 'no-self-restart', 'print', 'remove']);
 
 export function parseArgs(argv) {
   const out = { _: [] };
@@ -108,6 +114,21 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         stdout.write(JSON.stringify({ stopped: true, ...stats }) + '\n');
         return restart && process.env[CHILD_ENV] ? RESTART_EXIT : 0;
       }
+      case 'install': {
+        // comms-public#4: one command per system instead of a hand recipe. The service runs `wake run` with the same options.
+        const runArgs = argv.slice(argv.indexOf('install') + 1).filter((a) => a !== '--print' && a !== '--remove');
+        if (runArgs.some((a) => a === '--key' || a.startsWith('--key='))) throw new CommsError('USAGE', 'kľúč nepatrí do súboru služby: použite --config <súbor.json> alebo keys.json inštancie');
+        if (!['--instance', '--data-dir', '--config', '--url'].some((f) => runArgs.some((a) => a === f || a.startsWith(`${f}=`)))) runArgs.unshift('--instance', cfg.comms.instance);
+        const plan = installPlan({
+          platform: process.env.WAKE_INSTALL_PLATFORM || process.platform, instance: cfg.comms.instance, runArgs, remove: !!args.remove,
+          node: process.execPath, bin: fileURLToPath(new URL('../../bin/wake.mjs', import.meta.url)),
+          home: os.homedir(), base: baseDir(), env: process.env, uid: process.getuid?.() ?? 0,
+        });
+        if (args.print) { stdout.write(formatPlan(plan)); return 0; }
+        const res = applyPlan(plan, { stopWake: () => stopRunningWake(cfg.stateDir, log) });
+        stdout.write(JSON.stringify({ [args.remove ? 'removed' : 'installed']: res.ok, platform: plan.platform, files: res.ok ? plan.files.map((f) => f.path) : [], removed_files: res.ok ? plan.remove : [], notes: plan.notes, errors: res.errors }, null, 2) + '\n');
+        return res.ok ? 0 : 1;
+      }
       default:
         throw new CommsError('USAGE', `neznámy príkaz „${cmd}“`);
     }
@@ -117,4 +138,15 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
     if (e.code === 'USAGE') stderr.write(USAGE);
     return code;
   }
+}
+
+/** End the wake that holds this instance's lock (Windows install: the old task's node), wait until it is gone. */
+function stopRunningWake(stateDir, log) {
+  const lock = readWakeLock(stateDir);
+  if (!lockHeld(lock, { pid: -1 })) return;
+  try { process.kill(lock.pid, 'SIGTERM'); } catch { return; }
+  const alive = () => { try { process.kill(lock.pid, 0); return true; } catch { return false; } };
+  const until = Date.now() + 10000;
+  while (alive() && Date.now() < until) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  log(`bežiace budenie (pid ${lock.pid}) ${alive() ? 'sa neukončilo do 10 s' : 'ukončené'}`);
 }

@@ -10,6 +10,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { selfRestartEnabled, watchInstall } from '../common/selfrestart.mjs';
+import { wakeStatus } from '../wake/lock.mjs';
+import { resolveWakeConfig } from '../wake/index.mjs';
 
 const WAKE_BIN = fileURLToPath(new URL('../../bin/wake.mjs', import.meta.url));
 
@@ -250,7 +252,13 @@ async function run(cmd, args, cfg, io) {
       return client.ack(args.id);
     case 'count':
       if (!args.thread && !args.persona) need('project', 'topic');
-      return client.count({ project: args.project, topic: args.topic, thread: args.thread, persona: args.persona });
+    {
+      const r = await client.count({ project: args.project, topic: args.topic, thread: args.thread, persona: args.persona });
+      // comms-public#4: whether this machine's wake runs, for the session status line (null: wake never ran here).
+      // The state dir as `wake run` resolves it: workflow passes its own --client-dir (outbox), wake does not.
+      const wake = wakeStatus(wakeStateDir(args));
+      return wake ? { ...r, wake } : r;
+    }
     case 'notices':
       return client.notices(!!args.all);
     case 'decide':
@@ -295,4 +303,9 @@ function readAll(stream) {
     stream.on('end', () => resolve(s));
     stream.on('error', reject);
   });
+}
+
+function wakeStateDir(args) {
+  const { clientDir: _own, outbox: _outbox, ...opts } = args;
+  try { return resolveWakeConfig(opts).stateDir; } catch { return null; }
 }

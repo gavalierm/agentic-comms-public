@@ -214,70 +214,49 @@ Kľúč netreba: modul si v `keys.json` inštancie nájde alebo vytvorí kľúč
 
 Alternatíva: spustiť poštu spolu s budením jedným príkazom `node bin/comms.mjs serve --instance pilot --wake` (ukončenie služby ukončí aj budenie; samoreštart vrátane zmeny `wake.json` vtedy stráži služba).
 
-**Na serveri (Linux, trvalý beh):** druhá `systemd` služba používateľa, vzor `~/.config/systemd/user/<služba budenia>.service`:
+**Trvalý beh (Linux, macOS, Windows), od v0.4.6 jedným príkazom:**
 
-```ini
-[Unit]
-Description=agentic wake (pilot)
-After=<služba pošty>.service
-[Service]
-ExecStart=/usr/bin/node <klon agentic-comms>/bin/wake.mjs run --instance pilot
-Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.local/bin
-Restart=always
-[Install]
-WantedBy=default.target
+```sh
+node bin/wake.mjs install --instance pilot      # registrácia a spustenie
+node bin/wake.mjs install --instance pilot --print   # iba vypíše súbory a príkazy, nič nezmení
+node bin/wake.mjs install --instance pilot --remove  # zastavenie a odstránenie registrácie
 ```
 
-`systemctl --user enable --now wake`; `PATH` musí obsahovať priečinok s `t3`. Logy: `journalctl --user -u wake -f`.
+Služba spúšťa `wake run` s rovnakými voľbami ako `install` (bez `--instance`, `--data-dir`, `--config` a `--url` doplní `--instance` z konfigurácie); `--key` na príkazovom riadku odmietne, kľúč patrí do `keys.json` inštancie alebo do `--config`. Opakované `install` (napr. po presune klonu alebo zmene volieb) registráciu prepíše a budenie reštartuje. Výsledok je JSON (`installed`, súbory, `notes` s cestou k logu, `errors`).
+
+| systém | čo vznikne | log |
+| --- | --- | --- |
+| Linux | `systemd` služba používateľa `~/.config/systemd/user/agentic-wake-<inštancia>.service` (`Restart=always`), `enable` a `restart` | `journalctl --user -u agentic-wake-<inštancia> -f` |
+| macOS | LaunchAgent `~/Library/LaunchAgents/com.agentic-comms.wake.<inštancia>.plist` (`RunAtLoad`, `KeepAlive`), `launchctl bootstrap` | `<base>/wake-<inštancia>.log` |
+| Windows | úloha Plánovača `agentic-wake-<inštancia>`: pri prihlásení, bez okna (`conhost --headless`), bez časového limitu, jedna inštancia; slučka `<base>\wake-loop-<inštancia>.cmd` | `<base>\wake-<inštancia>.log` |
+
+`<base>` je priečinok inštancií: `%LOCALAPPDATA%\comms` (Windows), `~/Library/Application Support/comms` (macOS), alebo `COMMS_BASE_DIR`. `PATH` služby je `PATH` príkazu `install`, preto ho spúšťajte v termináli, kde funguje `t3` (Windows: `t3.cmd` nájde budenie samo).
+
+- **Linux:** bez bežiaceho používateľského systemd (napr. bez prihlásenia, chýba `XDG_RUNTIME_DIR`) `install` skončí chybou a nič nezapíše. Na serveri, kde sa nikto neprihlasuje, najprv `loginctl enable-linger`, inak služba skončí s odhlásením. Ručne napísanú službu budenia z návodu do v0.4.5 najprv vypnite (`systemctl --user disable --now <služba budenia>` a zmažte jej `.service`), inak bežia dve (druhá čaká na zámok).
+- **Windows:** `install` pred registráciou zastaví úlohu tejto inštancie, jej slučku a bežiace budenie (pid zo zámku); ručne založenú úlohu `agentic-wake` so slučkou `wake-loop.cmd` z návodu do v0.4.5 zastaví a odregistruje tiež. Súbor `wake-loop.cmd` a starý `wake.log` môžete potom zmazať. `Stop-ScheduledTask` sám nestačí (ukončí iba `conhost.exe`, slučka `cmd.exe` spustí `node` znova); na zastavenie použite `install --remove`, na reštart `install`.
+
+Pod systemd (`INVOCATION_ID`) reštartuje budenie po samoreštarte `Restart=always`, pod launchd a Plánovačom dozorný proces `wake run`; slučka na Windowse je poistka pri páde `node` a pri zmene samotného dozoru. Vo Windowse beží jedna reťaz `conhost → cmd → node → node` (dozor a budenie) a `status` ukazuje jeden `running`.
+
+Stavový riadok session workflow ukáže `wake: off`, keď budenie na stroji už bežalo (`wake-state.json` existuje) a teraz nebeží; `comms count` to vracia v poli `wake` (`running`, `pid`, `heartbeat_at`), na stroji, kde budenie nikdy nebežalo, pole chýba.
 
 **Pošta na inom stroji (T3 lokálne):** `node bin/wake.mjs run --url https://posta.example/ --key <kľúč> --instance-id <id>` (alebo rovnaký `--config` JSON ako klient). Pri `--url` je kľúč povinný a modul poštu nespúšťa.
 
-**Windows:** rovnaký príkaz v PowerShell (`node bin\wake.mjs run --instance pilot`) v otvorenom termináli, alebo trvalý beh cez Plánovač úloh nižšie.
+**Windows:** rovnaký príkaz v PowerShell (`node bin\wake.mjs run --instance pilot`) v otvorenom termináli, alebo trvalý beh `node bin\wake.mjs install --instance pilot` (vyššie).
 
 Na jednej inštancii beží vždy jedno budenie (od v0.4.3): druhé `wake run` vypíše `budenie tejto inštancie už beží (pid …); čakám, kým skončí` a prevezme prácu až po skončení prvého. Či budenie beží: `node bin\wake.mjs status --instance pilot`, pole `running` (pid a posledný heartbeat, obnovuje sa každých 30 s), `null` = nebeží.
 
-**Windows, trvalý beh (Plánovač úloh).** Samoreštart po aktualizácii (nový tag) alebo zmene `wake.json` od v0.4.5 rieši dozorný proces `wake run` (vyššie); Plánovač úloh by skončený proces znova nespustil. Úloha aj tak spúšťa slučku ako poistku: pri páde `node` a pri zmene samotného dozoru (ten ostáva v starej verzii do najbližšieho reštartu úlohy). Mimo klonu, napr. `%LOCALAPPDATA%\comms\wake-loop.cmd`:
-
-```bat
-@echo off
-:loop
-if not exist "<klon agentic-comms>\bin\wake.mjs" exit /b 0
-node "<klon agentic-comms>\bin\wake.mjs" run --instance pilot >> "%LOCALAPPDATA%\comms\wake.log" 2>&1
-timeout /t 5 /nobreak >nul
-goto loop
-```
-
-Úloha (PowerShell, raz), pri prihlásení, bez okna, bez časového limitu (predvolený limit 72 h by budenie zastavil), jedna inštancia:
-
-```powershell
-$a = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument "--headless cmd.exe /d /c `"$env:LOCALAPPDATA\comms\wake-loop.cmd`""
-$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-Register-ScheduledTask -TaskName agentic-wake -Description 'agentic-comms: budenie vlákien T3 (wake-loop.cmd). Vypnutie: README agentic-comms, Budenie' -Action $a -Trigger $t -Settings $s
-```
-
-`Stop-ScheduledTask` ukončí iba vrchný proces úlohy (`conhost.exe`); slučka `cmd.exe … wake-loop.cmd` beží ďalej ako sirota a do 5 s spustí `node` znova. Druhá slučka po `Start-ScheduledTask` sa k zámku budenia ani nedostane (`wake.log` drží prvý proces) a točí sa dokola. Zastavenie (a pred reštartom úlohy) preto ukončí slučku aj budenie:
-
-```powershell
-Stop-ScheduledTask -TaskName agentic-wake
-Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*wake-loop.cmd*' -or $_.CommandLine -like '*wake.mjs*run*' } | Invoke-CimMethod -MethodName Terminate
-Start-ScheduledTask -TaskName agentic-wake   # iba pri reštarte
-```
-
-Po reštarte beží jedna reťaz `conhost → cmd → node → node` (dozor a budenie) a `status` ukazuje jeden `running`.
-
-Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpis je v `%LOCALAPPDATA%\comms\wake.log`. Zlyhaný zvonček (napr. presunutý T3) je iba v logu.
+Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpis je v `%LOCALAPPDATA%\comms\wake-<inštancia>.log`. Zlyhaný zvonček (napr. presunutý T3) je iba v logu.
 
 **Odinštalovanie na Windowse** (čo inštalácia necháva mimo repozitárov):
 
-- úloha Plánovača: zastavenie podľa bodu vyššie (slučka aj budenie), potom `Unregister-ScheduledTask -TaskName agentic-wake -Confirm:$false`;
-- `%LOCALAPPDATA%\comms\` (dáta inštancií `<instance>\` vrátane `keys.json` a `wake.json`, `wake-loop.cmd`, `wake.log`);
+- úloha Plánovača: `node bin\wake.mjs install --instance <inštancia> --remove` (zastaví slučku aj budenie a odregistruje úlohu);
+- `%LOCALAPPDATA%\comms\` (dáta inštancií `<instance>\` vrátane `keys.json` a `wake.json`, `wake-loop-<inštancia>.cmd`, `wake-<inštancia>.log`);
 - pravidlá v `~/.gitconfig`, ak ste ich pri inštalácii pridali (napr. `credential` pre GitHub, `core.autocrlf`);
 - klony `agentic-comms` a workflow (`%USERPROFILE%\.claude\skills\workflow`).
 
 **Odinštalovanie na Linuxe a macOS:**
 
-- budenie a pošta: ukončiť `wake run` (Ctrl+C alebo `kill <pid>` z `status`, pole `running`); pri systemd `systemctl --user disable --now <služba budenia> <služba pošty>` a zmazať ich `.service` v `~/.config/systemd/user/`; pri launchd `launchctl bootout gui/$(id -u) <plist>` a zmazať plist v `~/Library/LaunchAgents/`;
+- budenie: `node bin/wake.mjs install --instance <inštancia> --remove`, alebo ukončiť `wake run` (Ctrl+C alebo `kill <pid>` z `status`, pole `running`); služby z ručného návodu: pri systemd `systemctl --user disable --now <služba budenia> <služba pošty>` a zmazať ich `.service` v `~/.config/systemd/user/`; pri launchd `launchctl bootout gui/$(id -u) <plist>` a zmazať plist v `~/Library/LaunchAgents/`;
 - dáta inštancií (vrátane `keys.json` a `wake.json`): `${XDG_DATA_HOME:-~/.local/share}/comms/` (Linux), `~/Library/Application Support/comms/` (macOS), alebo `COMMS_BASE_DIR`, ak ste ho nastavili;
 - klony `agentic-comms` a workflow (`~/.claude/skills/workflow`).
 

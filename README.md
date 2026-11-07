@@ -256,19 +256,21 @@ $s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -Multip
 Register-ScheduledTask -TaskName agentic-wake -Description 'agentic-comms: budenie vlákien T3 (wake-loop.cmd). Vypnutie: README agentic-comms, Budenie' -Action $a -Trigger $t -Settings $s
 ```
 
-`Stop-ScheduledTask` ukončí iba vrchný proces úlohy, nie `node … wake.mjs run`. Zastavenie (a pred reštartom úlohy) preto:
+`Stop-ScheduledTask` ukončí iba vrchný proces úlohy (`conhost.exe`); slučka `cmd.exe … wake-loop.cmd` beží ďalej ako sirota a do 5 s spustí `node` znova. Druhá slučka po `Start-ScheduledTask` sa k zámku budenia ani nedostane (`wake.log` drží prvý proces) a točí sa dokola. Zastavenie (a pred reštartom úlohy) preto ukončí slučku aj budenie:
 
 ```powershell
 Stop-ScheduledTask -TaskName agentic-wake
-Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object CommandLine -like '*wake.mjs*run*' | Invoke-CimMethod -MethodName Terminate
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*wake-loop.cmd*' -or $_.CommandLine -like '*wake.mjs*run*' } | Invoke-CimMethod -MethodName Terminate
 Start-ScheduledTask -TaskName agentic-wake   # iba pri reštarte
 ```
+
+Po reštarte beží jedna reťaz `conhost → cmd → node` a `status` ukazuje jeden `running`.
 
 Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpis je v `%LOCALAPPDATA%\comms\wake.log`. Zlyhaný zvonček (napr. presunutý T3) je iba v logu.
 
 **Odinštalovanie na Windowse** (čo inštalácia necháva mimo repozitárov):
 
-- úloha Plánovača: zastavenie podľa bodu vyššie, potom `Unregister-ScheduledTask -TaskName agentic-wake -Confirm:$false`;
+- úloha Plánovača: zastavenie podľa bodu vyššie (slučka aj budenie), potom `Unregister-ScheduledTask -TaskName agentic-wake -Confirm:$false`;
 - `%LOCALAPPDATA%\comms\` (dáta inštancií `<instance>\` vrátane `keys.json` a `wake.json`, `wake-loop.cmd`, `wake.log`);
 - pravidlá v `~/.gitconfig`, ak ste ich pri inštalácii pridali (napr. `credential` pre GitHub, `core.autocrlf`);
 - klony `agentic-comms` a workflow (`%USERPROFILE%\.claude\skills\workflow`).

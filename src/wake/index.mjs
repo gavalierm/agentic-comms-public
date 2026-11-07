@@ -358,6 +358,7 @@ export class Waker {
    * Closed turns of this machine that left a next step in the handover: ring the thread once per step after
    * `continueDelayMs` (an operator prompt in between opens a new turn and wins). The same step again after a
    * ring is no progress: one `turn-stalled` notice to the operator, no further ring. Code, not the agent, keeps the loop going.
+   * A turn closed with `resume_at` (the thread's timer, P-061) is rung at that time, also with the same step again.
    */
   async continueOnce() {
     if (!this.adapter) return [];
@@ -379,13 +380,16 @@ export class Waker {
     const prev = this.state.continued[turn.thread];
     if (prev && prev.closed_at === turn.closed_at) return res('skipped', prev.stalled ? 'stalled' : 'done');
     const now = this.now();
-    if (now - Date.parse(turn.closed_at) < this.opts.continueDelayMs) return res('skipped', 'delay');
+    // P-061 timer: a turn closed with resume_at is rung at that time (a deferral), else after continueDelayMs.
+    const due = turn.resume_at ? Date.parse(turn.resume_at) : Date.parse(turn.closed_at) + this.opts.continueDelayMs;
+    if (now < due) return res('skipped', 'delay');
     if (typeof this.adapter.status === 'function') {
       const st = await this.adapter.status(turn.thread);
       if (!st || !st.ok) return res('skipped', 'status-unknown');
       if (st.running) return res('skipped', 'running');
     }
-    if (prev && prev.next === turn.next) {
+    // A timer is a deliberate deferral: it rings even with the same step (the work goes on, P-061).
+    if (!turn.resume_at && prev && prev.next === turn.next) {
       this.state.continued[turn.thread] = { ...prev, closed_at: turn.closed_at, stalled: true };
       this.state.save();
       const where = turn.project && turn.topic ? `${turn.project}/${turn.topic}` : `vlákno ${turn.thread}`;

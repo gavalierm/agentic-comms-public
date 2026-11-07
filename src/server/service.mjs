@@ -47,12 +47,23 @@ export const EXPIRY_INTERVAL_MS = 30_000;
 export const TURN_STATES = ['open', 'closed'];
 /** Longest stored next step of a closed turn (characters). */
 export const MAX_NEXT = 300;
+/** Latest timer of a closed turn (P-061): a resume time beyond this is clamped. 30 days: a paused topic (snooze) rings at its end. */
+export const MAX_RESUME_MS = 30 * 24 * 3600 * 1000;
 /** Sender of the service's own replies in 0.2.x (old data only; since 0.3.0 the service sends no mail). */
 export const SYSTEM_SENDER = 'comms';
 /** Final outcome of a message with no answer (the state for the recipient stays `pending`). */
 export const OUTCOMES = ['expired', 'undelivered'];
 export const HOLDER_MODES = ['operator', 'auto'];
 export const VISIBILITIES = ['public', 'private'];
+
+/** Timer of a closed turn (P-061): ISO time within MAX_RESUME_MS of now, else clamped; invalid → null. */
+export function resumeAt(value, now = new Date().toISOString()) {
+  if (value == null || value === '') return null;
+  const t = Date.parse(value);
+  if (!Number.isFinite(t)) throw new HttpError(400, 'resume_at musí byť čas ISO 8601');
+  const base = Date.parse(now);
+  return new Date(Math.min(Math.max(t, base), base + MAX_RESUME_MS)).toISOString();
+}
 
 export class Service {
   constructor(store, { log = () => {} } = {}) {
@@ -547,7 +558,7 @@ export class Service {
    * of an older turn leaves the current record as it is (`stale: true`). `next` (closed only): the next step left in the
    * handover of the held topic; wake rings the thread to continue it (continuation, P-026).
    */
-  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null } = {}) {
+  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null } = {}) {
     requireThread(thread);
     const prev = this.store.turn(thread);
     const now = nowIso();
@@ -572,12 +583,13 @@ export class Service {
         this.log(`stale close of ${thread} (opened_at ${opened_at}, current ${prev ? prev.opened_at : 'none'})`);
         return { ok: true, stale: true };
       }
-      rec = { ...(prev || { thread, machine: normalizeMachine(machine), project, topic, holder_mode, opened_at: null, keepalive: { count: 0, last_at: null } }), state: 'closed', closed_at: now, close_reason: reason || null, next: next ? String(next).slice(0, MAX_NEXT) : null };
+      rec = { ...(prev || { thread, machine: normalizeMachine(machine), project, topic, holder_mode, opened_at: null, keepalive: { count: 0, last_at: null } }), state: 'closed', closed_at: now, close_reason: reason || null, next: next ? String(next).slice(0, MAX_NEXT) : null, resume_at: resumeAt(resume_at, now) };
     }
     this.store.saveTurn(rec);
     return { ok: true, turn: rec };
   }
 
+  /* resume_at (closed only, P-061): the thread's timer; wake rings the thread at that time with its next step. */
   turns({ open = false } = {}) {
     const list = this.store.turns((t) => !open || t.state === 'open');
     list.sort((a, b) => String(a.opened_at).localeCompare(String(b.opened_at)) || a.thread.localeCompare(b.thread));

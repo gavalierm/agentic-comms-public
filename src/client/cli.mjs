@@ -59,7 +59,7 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
   'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
-  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next']);
+  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at']);
 const BOOL_FLAGS = new Set(['no-start', 'all', 'ack', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close']);
 
 export function parseArgs(argv) {
@@ -233,7 +233,7 @@ async function run(cmd, args, cfg, io) {
       const quick = new Client({ ...cfg, timeout: Math.min(cfg.timeout, TURN_TIMEOUT) });
       return quick.turn({
         thread, state: args.state, machine: cfg.machine || null, project: args.project || null, topic: args.topic || null,
-        holder_mode: args.holderMode || null, ...(args.openedAt ? { opened_at: args.openedAt } : {}), ...(args.next ? { next: args.next } : {}),
+        holder_mode: args.holderMode || null, ...(args.openedAt ? { opened_at: args.openedAt } : {}), ...(args.next ? { next: args.next } : {}), ...(args.resumeAt ? { resume_at: args.resumeAt } : {}),
       });
     }
     case 'receive': {

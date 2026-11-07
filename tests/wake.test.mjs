@@ -646,3 +646,26 @@ test('continuation: a closed turn with a next step is rung once after the delay;
   await waker.continueOnce();
   assert.equal(adapter.calls.length, 2);
 });
+
+test('timer (P-061): a turn closed with resume_at is rung at that time, also with the same step again', async (t) => {
+  const { client, waker, adapter, clock } = await kaSetup(t);
+  const at = new Date(Date.now() + 10 * 60_000).toISOString();
+  await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', project: 'p', topic: 't' });
+  await client.turn({ thread: 'thr-1', state: 'closed', next: 'check reply', resume_at: at });
+  assert.equal((await client.turns(false)).turns.find((x) => x.thread === 'thr-1').resume_at, at);
+  clock.t = Date.now() + 2 * 60_000;
+  assert.equal((await waker.continueOnce()).find((x) => x.thread === 'thr-1').reason, 'delay', 'not before the timer');
+  clock.t = Date.parse(at) + 1000;
+  await waker.continueOnce();
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: CONTINUE_TEMPLATE }]);
+  // Deferred again with the same step: rung again at the new time, no stalled notice.
+  await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', project: 'p', topic: 't' });
+  await sleep(5);
+  const at2 = new Date(clock.t + 5 * 60_000).toISOString();
+  await client.turn({ thread: 'thr-1', state: 'closed', next: 'check reply', resume_at: at2 });
+  clock.t = Date.parse(at2) + 1000;
+  await waker.continueOnce();
+  assert.equal(adapter.calls.length, 2);
+  assert.equal((await client.notices()).notices.filter((n) => n.kind === 'turn-stalled').length, 0);
+  await assert.rejects(client.turn({ thread: 'thr-1', state: 'closed', next: 'x', resume_at: 'soon' }), /resume_at/);
+});

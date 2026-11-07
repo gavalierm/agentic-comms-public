@@ -210,7 +210,7 @@ Modul musí bežať **na stroji, kde je T3 (`t3` CLI)**, lebo volá `t3 thread s
 node bin/wake.mjs run --instance pilot
 ```
 
-Kľúč netreba: modul si v `keys.json` inštancie nájde alebo vytvorí kľúč odosielateľa `wake`. Beží, kým ho neukončíte (Ctrl+C); každé zobudenie vypíše jeden riadok na stderr. Ak pošta nebeží, spustí ju (ako klient), pri jej výpadku sa pripája znova (1 s … 30 s). Stav je v `<data-dir>/client/wake/wake-state.json`, zámok bežiaceho budenia v `wake.lock` vedľa neho (`node bin/wake.mjs status --instance pilot`).
+Kľúč netreba: modul si v `keys.json` inštancie nájde alebo vytvorí kľúč odosielateľa `wake`. Beží, kým ho neukončíte (Ctrl+C); každé zobudenie vypíše jeden riadok na stderr. Mimo systemd (terminál, launchd na macOS, Plánovač úloh na Windowse) beží `wake run` od v0.4.5 ako malý dozorný proces nad samotným budením: po samoreštarte (nový tag, zmena `wake.json`) vypíše `samoreštart: spúšťam budenie znova …` a spustí budenie v novej verzii; predtým budenie po aktualizácii skončilo a nikto ho znova nespustil. Pid v `status` je pid budenia; jeho ukončenie (aj Ctrl+C) zastaví oboje. Pod systemd (`INVOCATION_ID`) dozor nebeží, reštart robí `Restart=always`. Vypnutie dozoru: `COMMS_WAKE_SUPERVISOR=0`. Ak pošta nebeží, spustí ju (ako klient), pri jej výpadku sa pripája znova (1 s … 30 s). Stav je v `<data-dir>/client/wake/wake-state.json`, zámok bežiaceho budenia v `wake.lock` vedľa neho (`node bin/wake.mjs status --instance pilot`).
 
 Alternatíva: spustiť poštu spolu s budením jedným príkazom `node bin/comms.mjs serve --instance pilot --wake` (ukončenie služby ukončí aj budenie; samoreštart vrátane zmeny `wake.json` vtedy stráži služba).
 
@@ -236,7 +236,7 @@ WantedBy=default.target
 
 Na jednej inštancii beží vždy jedno budenie (od v0.4.3): druhé `wake run` vypíše `budenie tejto inštancie už beží (pid …); čakám, kým skončí` a prevezme prácu až po skončení prvého. Či budenie beží: `node bin\wake.mjs status --instance pilot`, pole `running` (pid a posledný heartbeat, obnovuje sa každých 30 s), `null` = nebeží.
 
-**Windows, trvalý beh (Plánovač úloh).** Samoreštart po aktualizácii (nový tag) alebo zmene `wake.json` ukončí proces s kódom 0 a Plánovač úloh ho sám znova nespustí; preto úloha spúšťa slučku. Mimo klonu, napr. `%LOCALAPPDATA%\comms\wake-loop.cmd`:
+**Windows, trvalý beh (Plánovač úloh).** Samoreštart po aktualizácii (nový tag) alebo zmene `wake.json` od v0.4.5 rieši dozorný proces `wake run` (vyššie); Plánovač úloh by skončený proces znova nespustil. Úloha aj tak spúšťa slučku ako poistku: pri páde `node` a pri zmene samotného dozoru (ten ostáva v starej verzii do najbližšieho reštartu úlohy). Mimo klonu, napr. `%LOCALAPPDATA%\comms\wake-loop.cmd`:
 
 ```bat
 @echo off
@@ -264,7 +264,7 @@ Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*wake-loop.
 Start-ScheduledTask -TaskName agentic-wake   # iba pri reštarte
 ```
 
-Po reštarte beží jedna reťaz `conhost → cmd → node` a `status` ukazuje jeden `running`.
+Po reštarte beží jedna reťaz `conhost → cmd → node → node` (dozor a budenie) a `status` ukazuje jeden `running`.
 
 Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpis je v `%LOCALAPPDATA%\comms\wake.log`. Zlyhaný zvonček (napr. presunutý T3) je iba v logu.
 
@@ -275,11 +275,17 @@ Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpi
 - pravidlá v `~/.gitconfig`, ak ste ich pri inštalácii pridali (napr. `credential` pre GitHub, `core.autocrlf`);
 - klony `agentic-comms` a workflow (`%USERPROFILE%\.claude\skills\workflow`).
 
+**Odinštalovanie na Linuxe a macOS:**
+
+- budenie a pošta: ukončiť `wake run` (Ctrl+C alebo `kill <pid>` z `status`, pole `running`); pri systemd `systemctl --user disable --now <služba budenia> <služba pošty>` a zmazať ich `.service` v `~/.config/systemd/user/`; pri launchd `launchctl bootout gui/$(id -u) <plist>` a zmazať plist v `~/Library/LaunchAgents/`;
+- dáta inštancií (vrátane `keys.json` a `wake.json`): `${XDG_DATA_HOME:-~/.local/share}/comms/` (Linux), `~/Library/Application Support/comms/` (macOS), alebo `COMMS_BASE_DIR`, ak ste ho nastavili;
+- klony `agentic-comms` a workflow (`~/.claude/skills/workflow`).
+
 ### Rozhranie a konfigurácia
 
 `node bin/wake.mjs run|status|config [voľby]`. Prednosť: voľba > premenná > `--config` > `<data-dir>/wake.json` > predvolené.
 
-**`wake.json`:** bez `--config` a `COMMS_CONFIG` sa sekcia `wake` číta zo súboru `<data-dir>/wake.json` (rovnaké kľúče ako v tabuľke, bez obalu `wake`), napríklad `{ "keepalive": { "since_command": "systemctl --user show -p ActiveEnterTimestamp --value t3" } }`. Nastavenie budenia tak nepotrebuje zmenu systemd jednotky. Súbor sa číta pri štarte; `wake run` však sleduje jeho mtime v tej istej 30 s kontrole a pri zmene (aj vzniku či zmazaní) sa ukončí s kódom 0, takže ho systemd spustí s novou konfiguráciou. S `--config` sa `wake.json` ignoruje.
+**`wake.json`:** bez `--config` a `COMMS_CONFIG` sa sekcia `wake` číta zo súboru `<data-dir>/wake.json` (rovnaké kľúče ako v tabuľke, bez obalu `wake`), napríklad `{ "keepalive": { "since_command": "systemctl --user show -p ActiveEnterTimestamp --value t3" } }`. Nastavenie budenia tak nepotrebuje zmenu systemd jednotky. Súbor sa číta pri štarte; `wake run` však sleduje jeho mtime v tej istej 30 s kontrole a pri zmene (aj vzniku či zmazaní) sa ukončí a spustí ho s novou konfiguráciou systemd (kód 0) alebo mimo systemd dozorný proces `wake run`. S `--config` sa `wake.json` ignoruje.
 
 | Voľba | Premenná | Kľúč v `--config` (`wake.*`) | Predvolené |
 |---|---|---|---|

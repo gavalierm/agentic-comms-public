@@ -2,6 +2,7 @@
 // event on stderr; stops on SIGINT/SIGTERM. `status` prints the persisted state.
 import { CommsError } from '../client/index.mjs';
 import { watchInstall } from '../common/selfrestart.mjs';
+import { RESTART_EXIT, CHILD_ENV } from './supervise.mjs';
 import { acquireWakeLock, readWakeLock, lockHeld } from './lock.mjs';
 import { resolveWakeConfig, createWaker, WakeState, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE } from './index.mjs';
 
@@ -94,8 +95,10 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         log(`stroj ${cfg.machine}, adaptér ${waker.adapter ? `${waker.adapter.name} (${waker.adapter.command.join(' ')})` : 'žiadny (nič sa nebudí)'}, limit ${cfg.limitPerHour}/h, stop pri ${cfg.stopOnRepeat} rovnakých, stav ${cfg.stateFile}`);
         log(`pošta: ${cfg.comms.url || cfg.comms.socket}`);
         log(cfg.keepaliveSinceCommand ? `keepalive: každých ${cfg.keepaliveIntervalMs} ms, štart T3 z „${cfg.keepaliveSinceCommand}“` : 'keepalive vypnutý (bez keepalive.since_command)');
-        // Self-restart: a new installation revision or a changed wake.json ends the process with 0 (systemd restarts it).
-        const watch = cfg.selfRestart ? watchInstall({ files: cfg.wakeFile ? [cfg.wakeFile] : [], log, onChange: () => ac.abort() }) : null;
+        // Self-restart: a new installation revision or a changed wake.json ends the process: with 0 under systemd
+        // (Restart=always), with RESTART_EXIT under the supervisor of bin/wake.mjs (terminal, macOS, Windows).
+        let restart = false;
+        const watch = cfg.selfRestart ? watchInstall({ files: cfg.wakeFile ? [cfg.wakeFile] : [], log, onChange: () => { restart = true; ac.abort(); } }) : null;
         log(watch ? `samoreštart: revízia ${watch.revision ?? 'bez .git'}${cfg.wakeFile ? `, sleduje ${cfg.wakeFile}` : ''}` : 'samoreštart vypnutý');
         // One wake per instance (comms-public#1): a second `run` waits until the first one ends.
         const lock = await acquireWakeLock(cfg.stateDir, { log, signal: ac.signal, ...(Number(process.env.WAKE_LOCK_POLL_MS) > 0 ? { pollMs: Number(process.env.WAKE_LOCK_POLL_MS) } : {}) });
@@ -103,7 +106,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         lock?.release();
         watch?.stop();
         stdout.write(JSON.stringify({ stopped: true, ...stats }) + '\n');
-        return 0;
+        return restart && process.env[CHILD_ENV] ? RESTART_EXIT : 0;
       }
       default:
         throw new CommsError('USAGE', `neznámy príkaz „${cmd}“`);

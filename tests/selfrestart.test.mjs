@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readRevision, selfRestartEnabled } from '../src/common/selfrestart.mjs';
 import { resolveWakeConfig } from '../src/wake/index.mjs';
+import { needsSupervisor } from '../src/wake/supervise.mjs';
 import { makeInstance, startInstance, tmpDir, cleanup, sleep } from './helpers.mjs';
 
 const COMMS_BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
@@ -88,7 +89,7 @@ test('serve: --no-self-restart and missing .git do not watch', async (t) => {
   assert.match(b.err, /bez \.git, nekontroluje sa/);
 });
 
-test('wake run: HEAD change and wake.json change each end the process with code 0', async (t) => {
+test('wake run under systemd (INVOCATION_ID): HEAD change and wake.json change each end the process with code 0', async (t) => {
   const inst = makeInstance('selfwake');
   const srv = await startInstance(inst);
   const root = fakeRepo();
@@ -96,7 +97,7 @@ test('wake run: HEAD change and wake.json change each end the process with code 
   t.after(async () => { await srv.stop(); cleanup(inst.dir, root, state); });
   const args = ['run', '--data-dir', inst.dir, '--no-start', '--adapter', 'none', '--wait-ms', '200', '--state-dir', state];
 
-  const a = run(WAKE_BIN, args, { COMMS_INSTALL_ROOT: root });
+  const a = run(WAKE_BIN, args, { COMMS_INSTALL_ROOT: root, INVOCATION_ID: 'test' });
   await until(() => a.err.includes('samoreštart: revízia'));
   fs.writeFileSync(path.join(root, '.git', 'HEAD'), SHA2 + '\n');
   const ra = await a.exited;
@@ -104,13 +105,43 @@ test('wake run: HEAD change and wake.json change each end the process with code 
   assert.match(a.err, /install changed .* exiting for restart/);
   assert.ok(fs.existsSync(path.join(state, 'wake-state.json')), 'stav wake zapísaný');
 
-  const b = run(WAKE_BIN, args, { COMMS_INSTALL_ROOT: root });
+  const b = run(WAKE_BIN, args, { COMMS_INSTALL_ROOT: root, INVOCATION_ID: 'test' });
   await until(() => b.err.includes('sleduje'));
   await sleep(150);
   fs.writeFileSync(path.join(inst.dir, 'wake.json'), JSON.stringify({ limit_per_hour: 3 }));
   const rb = await b.exited;
   assert.equal(rb.code, 0, b.err);
   assert.match(b.err, /config changed .*wake\.json, exiting for restart/);
+});
+
+test('needsSupervisor: only run outside systemd with self-restart on', () => {
+  assert.equal(needsSupervisor(['run'], {}), true);
+  assert.equal(needsSupervisor(['status'], {}), false);
+  assert.equal(needsSupervisor(['run', '--help'], {}), false);
+  assert.equal(needsSupervisor(['run'], { INVOCATION_ID: 'x' }), false);
+  assert.equal(needsSupervisor(['run'], { COMMS_WAKE_CHILD: '1' }), false);
+  assert.equal(needsSupervisor(['run'], { COMMS_WAKE_SUPERVISOR: '0' }), false);
+  assert.equal(needsSupervisor(['run'], { COMMS_SELF_RESTART: '0' }), false);
+  assert.equal(needsSupervisor(['run', '--no-self-restart'], {}), false);
+});
+
+// comms-public#3: in a terminal, launchd or a Windows scheduled task nothing restarted wake after its self-restart exit.
+test('wake run without a service manager: HEAD change restarts wake on the new revision, SIGTERM stops it with 0', async (t) => {
+  const inst = makeInstance('selfsup');
+  const srv = await startInstance(inst);
+  const root = fakeRepo();
+  const state = tmpDir('comms-selfsup-state-');
+  const args = ['run', '--data-dir', inst.dir, '--no-start', '--adapter', 'none', '--wait-ms', '200', '--state-dir', state];
+  const p = run(WAKE_BIN, args, { COMMS_INSTALL_ROOT: root });
+  t.after(async () => { try { p.child.kill('SIGKILL'); } catch { /* gone */ } await p.exited; await srv.stop(); cleanup(inst.dir, root, state); });
+  await until(() => p.err.includes('samoreštart: revízia'));
+  fs.writeFileSync(path.join(root, '.git', 'HEAD'), SHA2 + '\n');
+  await until(() => p.err.includes('spúšťam budenie znova'));
+  await until(() => p.err.split('samoreštart: revízia').length === 3);
+  assert.match(p.err.split('spúšťam budenie znova')[1], new RegExp(SHA2), 'nové budenie sleduje novú revíziu');
+  p.child.kill('SIGTERM');
+  const r = await p.exited;
+  assert.equal(r.code, 0, p.err);
 });
 
 test('resolveWakeConfig: wake.json from the data dir; env and --config take precedence', () => {

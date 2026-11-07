@@ -111,7 +111,7 @@ export class Service {
    * their stored values; holder_mode / holder_machine belong to the holder, so they are kept
    * only while the holder stays the same.
    *
-   * Close is `close: true` (the topic was finished and archived): like a release (own holder or
+   * Close is `close: true` (the topic was closed with done and archived): like a release (own holder or
    * takeover), plus `state: 'closed'` and `closed_at`. A closed topic takes no new mail (send and
    * reply answer 410 at once, alice 2026-11-02: an assist to an archived topic waited 4 h for nobody);
    * messages still pending in its mailbox bounce to their senders (`undelivered`, reason topic closed).

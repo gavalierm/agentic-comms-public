@@ -6,6 +6,8 @@
 // `status(threadId)` (keepalive) runs `t3 thread show --json <threadId>` (configurable
 // as `wake.status_command`) and reads `thread.status` and `thread.activeRunId`.
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 
 export const DEFAULT_T3_COMMAND = ['t3', 'thread', 'send'];
 export const DEFAULT_T3_STATUS_COMMAND = ['t3', 'thread', 'show', '--json'];
@@ -21,12 +23,37 @@ export function parseCommand(command) {
   return out;
 }
 
-/** Run argv without a shell; resolves { ok, code, stdout, stderr }, never throws. */
-export function runCommand(argv, { timeout = DEFAULT_TIMEOUT, env = process.env } = {}) {
+/**
+ * Windows (issue comms-public#2): T3 installs its CLI as `%USERPROFILE%\\.t3\\bin\\t3.cmd` and does not add it to PATH
+ * (threads get only T3CODE_CLI_PATH); Node finds no `.cmd` without a shell (ENOENT) and refuses to spawn `.cmd`/`.bat`
+ * without one (EINVAL, CVE-2024-27980). On win32 a bare `t3` resolves to T3CODE_CLI_PATH or that file, and a `.cmd`/`.bat`
+ * runs through `cmd.exe /d /s /c` with every argument quoted; an argument cmd could expand (`"`, `%`, a line break) is
+ * refused. Other platforms get argv unchanged.
+ * @returns {{ file: string, args: string[], verbatim: boolean } | { error: string }}
+ */
+export function platformCommand(argv, { platform = process.platform, env = process.env, exists = fs.existsSync } = {}) {
+  if (platform !== 'win32') return { file: argv[0], args: argv.slice(1), verbatim: false };
+  let file = argv[0];
+  if (file === 't3') {
+    const home = env.USERPROFILE || env.HOME || '';
+    const found = [env.T3CODE_CLI_PATH, home && path.win32.join(home, '.t3', 'bin', 't3.cmd')].find((f) => f && exists(f));
+    if (found) file = found;
+  }
+  if (!/\.(cmd|bat)$/i.test(file)) return { file, args: argv.slice(1), verbatim: false };
+  const all = [file, ...argv.slice(1)];
+  const bad = all.find((a) => /["%\r\n]/.test(a));
+  if (bad !== undefined) return { error: `argument pre ${path.win32.basename(file)} obsahuje znak, ktorý cmd.exe rozvinie: ${JSON.stringify(bad).slice(0, 80)}` };
+  return { file: env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', `"${all.map((a) => `"${a}"`).join(' ')}"`], verbatim: true };
+}
+
+/** Run argv without a shell (on Windows a .cmd through cmd.exe); resolves { ok, code, stdout, stderr }, never throws. */
+export function runCommand(argv, { timeout = DEFAULT_TIMEOUT, env = process.env, platform = process.platform } = {}) {
   return new Promise((resolve) => {
     let child;
+    const cmd = platformCommand(argv, { platform, env });
+    if (cmd.error) return resolve({ ok: false, code: null, stdout: '', stderr: cmd.error });
     try {
-      child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'], env, windowsHide: true });
+      child = spawn(cmd.file, cmd.args, { stdio: ['ignore', 'pipe', 'pipe'], env, windowsHide: true, windowsVerbatimArguments: cmd.verbatim });
     } catch (e) {
       return resolve({ ok: false, code: null, stdout: '', stderr: e.message });
     }

@@ -267,11 +267,26 @@ test('bin/wake.mjs run: rings through the command, survives a mail restart, stop
   await waitFor(() => lines().length >= 2, 8000);
   assert.equal(lines().length, 2);
 
+  // A second run of the same instance waits for the first (comms-public#1: a restarted scheduled task) and takes over
+  // when it ends.
+  const second = spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', inst.dir, '--no-start', '--command', `${process.execPath} ${FAKE_T3}`,
+    '--wait-ms', '300', '--reconnect-ms', '100', '--state-dir', dir], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_T3_LOG: logFile, COMMS_SELF_RESTART: '0', WAKE_LOCK_POLL_MS: '100' }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let err2 = '';
+  second.stderr.on('data', (d) => { err2 += d; });
+  const exited2 = new Promise((r) => second.on('exit', (code) => r(code)));
+  t.after(async () => { try { second.kill('SIGKILL'); } catch { /* gone */ } await exited2; });
+  await waitFor(() => err2.includes(`už beží (pid ${child.pid})`));
+
   child.kill('SIGTERM');
   const r = await exited;
   assert.equal(r.code, 0);
   assert.match(out, /"stopped":true/);
   assert.match(out, /"rang":2/);
+  await waitFor(() => err2.includes('zámok budenia prevzatý'));
+  second.kill('SIGTERM');
+  assert.equal(await exited2, 0);
 });
 
 // --- hotfix 0.2.1 / 0.3.0: expired deadline (`no reply <id>`) and keepalive ----------------

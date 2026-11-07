@@ -2,12 +2,13 @@
 // event on stderr; stops on SIGINT/SIGTERM. `status` prints the persisted state.
 import { CommsError } from '../client/index.mjs';
 import { watchInstall } from '../common/selfrestart.mjs';
+import { acquireWakeLock, readWakeLock, lockHeld } from './lock.mjs';
 import { resolveWakeConfig, createWaker, WakeState, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE } from './index.mjs';
 
 const USAGE = `Použitie: wake <príkaz> [voľby]
 
   run       trvalý proces: odoberá udalosti pošty a budí držiteľov cez adaptér
-  status    vypíše stav modulu (kurzor, zobudenia za hodinu)
+  status    vypíše stav modulu (či beží: pid a posledný heartbeat; kurzor, zobudenia za hodinu)
   config    vypíše výslednú konfiguráciu (bez kľúča)
 
 Voľby pošty (ako comms): --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http://host:port>
@@ -78,7 +79,9 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         st.prune(Date.now());
         const rings = Object.fromEntries(Object.entries(st.rings).map(([k, v]) => [k, v.length]));
         const keepalive = Object.fromEntries(Object.entries(st.keepalive).map(([k, v]) => [k, v.length]));
-        stdout.write(JSON.stringify({ state_file: cfg.stateFile, cursor: st.cursor, updated_at: st.updated_at, rings_last_hour: rings, keepalive_attempts_last_hour: keepalive, adapter: cfg.adapter, command: cfg.command, keepalive_since_command: cfg.keepaliveSinceCommand }, null, 2) + '\n');
+        const lock = readWakeLock(cfg.stateDir);
+        const running = lockHeld(lock, { pid: -1 }) ? { pid: lock.pid, started_at: lock.started_at, heartbeat_at: lock.heartbeat_at } : null;
+        stdout.write(JSON.stringify({ running, state_file: cfg.stateFile, cursor: st.cursor, updated_at: st.updated_at, rings_last_hour: rings, keepalive_attempts_last_hour: keepalive, adapter: cfg.adapter, command: cfg.command, keepalive_since_command: cfg.keepaliveSinceCommand }, null, 2) + '\n');
         return 0;
       }
       case 'run': {
@@ -94,7 +97,10 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         // Self-restart: a new installation revision or a changed wake.json ends the process with 0 (systemd restarts it).
         const watch = cfg.selfRestart ? watchInstall({ files: cfg.wakeFile ? [cfg.wakeFile] : [], log, onChange: () => ac.abort() }) : null;
         log(watch ? `samoreštart: revízia ${watch.revision ?? 'bez .git'}${cfg.wakeFile ? `, sleduje ${cfg.wakeFile}` : ''}` : 'samoreštart vypnutý');
-        const stats = await waker.run({ signal: ac.signal });
+        // One wake per instance (comms-public#1): a second `run` waits until the first one ends.
+        const lock = await acquireWakeLock(cfg.stateDir, { log, signal: ac.signal, ...(Number(process.env.WAKE_LOCK_POLL_MS) > 0 ? { pollMs: Number(process.env.WAKE_LOCK_POLL_MS) } : {}) });
+        const stats = lock ? await waker.run({ signal: ac.signal }) : { lock: 'neprevzatý' };
+        lock?.release();
         watch?.stop();
         stdout.write(JSON.stringify({ stopped: true, ...stats }) + '\n');
         return 0;

@@ -30,9 +30,9 @@ Verzie (P-051): `main` = stabilný stav, vydania sú tagy `vX.Y.Z`, vývoj v bra
 ### Lokálne (Linux, macOS, Windows)
 
 ```sh
-git clone <repo agentic-comms> agentic-comms
+git clone https://github.com/gavalierm/agentic-comms-public.git agentic-comms
 cd agentic-comms
-git checkout v0.1.0        # produkcia: tag vydania; test (pilot): branch dev
+git checkout "$(git tag -l 'v*' --sort=-v:refname | head -1)"   # produkcia: najnovší tag vydania; test (pilot): branch dev
 node bin/comms.mjs init --instance pilot --sender <vaše-meno>
 ```
 
@@ -100,7 +100,7 @@ Zmeny `config` platia po reštarte služby (`stop` a znovu `serve`/`health`).
 
 ### Windows
 
-Node 22 LTS a Git for Windows, príkazy rovnaké (`node bin\comms.mjs …`). Lokálny endpoint je named pipe, nie port; či nevyvolá dialóg firewallu, overí smoke test pilotu (bod 5 v `agentic-flow/PLAN.md`).
+Node 22 LTS a Git for Windows, príkazy rovnaké (`node bin\comms.mjs …`). PowerShell: najnovší tag `git checkout (git tag -l 'v*' --sort=-v:refname | Select-Object -First 1)`. Lokálny endpoint je named pipe `\\.\pipe\comms-<hash>`, nie port: dialóg firewallu sa neobjaví (overené na Windows 11, Node 24, v0.4.2: pri autoštarte služby, `wake run` ani pri samoreštarte nevzniklo pravidlo firewallu a node nepočúva na TCP porte).
 
 ## Rozhranie klienta
 
@@ -191,7 +191,7 @@ Pošta funguje úplne bez budenia: každá správa sa doručí pri najbližšom 
 
 Režim držiteľa (P-037) budenie nezastaví: `blocker` aj `assist` budia držiteľa aj v režime `operator` (pri `blocker` vznikne navyše oznam operátorovi); držiteľ v ťahu budenia odpovie a to, čo patrí operátorovi, mu ohlási. Odpoveď budí vždy. Zvonček na archivované alebo neexistujúce vlákno vráti `blocker`/`assist`/odpoveď odosielateľovi (`undelivered <id>`).
 
-Uzavretá téma (`register-topic --close`, robí ju `finish --topic`): nová správa aj odpoveď do nej dostane hneď 410 s časom uzavretia (nikto ju nedrží); správy, ktoré v nej ešte čakajú, sa vrátia odosielateľom (`undelivered`). Adresa persony na uzavretú tému ide do hlavného vlákna persony. Nová registrácia bez `--close` tému znovu otvorí.
+Uzavretá téma (`register-topic --close`, robí ju `done --topic`): nová správa aj odpoveď do nej dostane hneď 410 s časom uzavretia (nikto ju nedrží); správy, ktoré v nej ešte čakajú, sa vrátia odosielateľom (`undelivered`). Adresa persony na uzavretú tému ide do hlavného vlákna persony. Nová registrácia bez `--close` tému znovu otvorí.
 
 **Pokračovanie (od 0.3.8, P-026).** Ťah zatvorený s ďalším krokom (`turn --state closed --next`, hook Stop workflow ho pošle, keď handover držanej témy má ďalší krok) budenie po 60 s (`continueDelayMs`) zazvoní textom `turn ended with a next step, continue from handover`, raz na zatvorený ťah, v každom režime držiteľa a nezávisle od `keepalive.since_command`. Prompt operátora v tej lehote otvorí nový ťah a má prednosť; bežiace vlákno sa nebudí. Keď vlákno po zazvonení skončí znova s rovnakým ďalším krokom (bez pokroku), budenie nezvoní a vytvorí jeden oznam `turn-stalled`. Slučku tak drží kód, nie agent.
 
@@ -202,7 +202,7 @@ Uzavretá téma (`register-topic --close`, robí ju `finish --topic`): nová spr
 
 ### Spustenie pre laika
 
-Modul musí bežať **na stroji, kde je T3 (`t3` CLI)**, lebo volá `t3 thread send <vlákno> "<šablóna>"`. Overte: `t3 thread send --help`.
+Modul musí bežať **na stroji, kde je T3 (`t3` CLI)**, lebo volá `t3 thread send <vlákno> "<šablóna>"`. Overte: `t3 thread send --help`. Windows: T3 dáva CLI ako `%USERPROFILE%\.t3\bin\t3.cmd` a nepridá ho do PATH; budenie ho od v0.4.3 nájde samo (`T3CODE_CLI_PATH`, potom tento súbor) a spustí cez `cmd.exe`, `command` vo `wake.json` netreba meniť. Ručné overenie: `& "$env:USERPROFILE\.t3\bin\t3.cmd" thread send --help`.
 
 **Lokálne (Linux, macOS, Windows), pošta na tom istom stroji:**
 
@@ -210,7 +210,7 @@ Modul musí bežať **na stroji, kde je T3 (`t3` CLI)**, lebo volá `t3 thread s
 node bin/wake.mjs run --instance pilot
 ```
 
-Kľúč netreba: modul si v `keys.json` inštancie nájde alebo vytvorí kľúč odosielateľa `wake`. Beží, kým ho neukončíte (Ctrl+C); každé zobudenie vypíše jeden riadok na stderr. Ak pošta nebeží, spustí ju (ako klient), pri jej výpadku sa pripája znova (1 s … 30 s). Stav je v `<data-dir>/client/wake/wake-state.json` (`node bin/wake.mjs status --instance pilot`).
+Kľúč netreba: modul si v `keys.json` inštancie nájde alebo vytvorí kľúč odosielateľa `wake`. Beží, kým ho neukončíte (Ctrl+C); každé zobudenie vypíše jeden riadok na stderr. Ak pošta nebeží, spustí ju (ako klient), pri jej výpadku sa pripája znova (1 s … 30 s). Stav je v `<data-dir>/client/wake/wake-state.json`, zámok bežiaceho budenia v `wake.lock` vedľa neho (`node bin/wake.mjs status --instance pilot`).
 
 Alternatíva: spustiť poštu spolu s budením jedným príkazom `node bin/comms.mjs serve --instance pilot --wake` (ukončenie služby ukončí aj budenie; samoreštart vrátane zmeny `wake.json` vtedy stráži služba).
 
@@ -232,7 +232,46 @@ WantedBy=default.target
 
 **Pošta na inom stroji (T3 lokálne):** `node bin/wake.mjs run --url https://posta.example/ --key <kľúč> --instance-id <id>` (alebo rovnaký `--config` JSON ako klient). Pri `--url` je kľúč povinný a modul poštu nespúšťa.
 
-**Windows:** rovnaký príkaz v PowerShell (`node bin\wake.mjs run --instance pilot`); trvalý beh cez Plánovač úloh (spustiť pri prihlásení) alebo ponechaný otvorený terminál.
+**Windows:** rovnaký príkaz v PowerShell (`node bin\wake.mjs run --instance pilot`) v otvorenom termináli, alebo trvalý beh cez Plánovač úloh nižšie.
+
+Na jednej inštancii beží vždy jedno budenie (od v0.4.3): druhé `wake run` vypíše `budenie tejto inštancie už beží (pid …); čakám, kým skončí` a prevezme prácu až po skončení prvého. Či budenie beží: `node bin\wake.mjs status --instance pilot`, pole `running` (pid a posledný heartbeat, obnovuje sa každých 30 s), `null` = nebeží.
+
+**Windows, trvalý beh (Plánovač úloh).** Samoreštart po aktualizácii (nový tag) alebo zmene `wake.json` ukončí proces s kódom 0 a Plánovač úloh ho sám znova nespustí; preto úloha spúšťa slučku. Mimo klonu, napr. `%LOCALAPPDATA%\comms\wake-loop.cmd`:
+
+```bat
+@echo off
+:loop
+if not exist "<klon agentic-comms>\bin\wake.mjs" exit /b 0
+node "<klon agentic-comms>\bin\wake.mjs" run --instance pilot >> "%LOCALAPPDATA%\comms\wake.log" 2>&1
+timeout /t 5 /nobreak >nul
+goto loop
+```
+
+Úloha (PowerShell, raz), pri prihlásení, bez okna, bez časového limitu (predvolený limit 72 h by budenie zastavil), jedna inštancia:
+
+```powershell
+$a = New-ScheduledTaskAction -Execute 'conhost.exe' -Argument "--headless cmd.exe /d /c `"$env:LOCALAPPDATA\comms\wake-loop.cmd`""
+$t = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName agentic-wake -Description 'agentic-comms: budenie vlákien T3 (wake-loop.cmd). Vypnutie: README agentic-comms, Budenie' -Action $a -Trigger $t -Settings $s
+```
+
+`Stop-ScheduledTask` ukončí iba vrchný proces úlohy, nie `node … wake.mjs run`. Zastavenie (a pred reštartom úlohy) preto:
+
+```powershell
+Stop-ScheduledTask -TaskName agentic-wake
+Get-CimInstance Win32_Process -Filter "Name='node.exe'" | Where-Object CommandLine -like '*wake.mjs*run*' | Invoke-CimMethod -MethodName Terminate
+Start-ScheduledTask -TaskName agentic-wake   # iba pri reštarte
+```
+
+Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpis je v `%LOCALAPPDATA%\comms\wake.log`. Zlyhaný zvonček (napr. presunutý T3) je iba v logu.
+
+**Odinštalovanie na Windowse** (čo inštalácia necháva mimo repozitárov):
+
+- úloha Plánovača: zastavenie podľa bodu vyššie, potom `Unregister-ScheduledTask -TaskName agentic-wake -Confirm:$false`;
+- `%LOCALAPPDATA%\comms\` (dáta inštancií `<instance>\` vrátane `keys.json` a `wake.json`, `wake-loop.cmd`, `wake.log`);
+- pravidlá v `~/.gitconfig`, ak ste ich pri inštalácii pridali (napr. `credential` pre GitHub, `core.autocrlf`);
+- klony `agentic-comms` a workflow (`%USERPROFILE%\.claude\skills\workflow`).
 
 ### Rozhranie a konfigurácia
 

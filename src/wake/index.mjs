@@ -163,7 +163,9 @@ export class Waker {
     if (ev.type === 'expired' && ev.message_id) {
       try {
         const st = await this.client.message(ev.message_id);
-        if (st.replied || st.state !== 'pending' || st.picked_at) return skip('answered');
+        // Interim `otázka` of origin `code` (the recipient waits for the operator's dialog): the ring tells the sender so.
+        const byCode = st.answer_origin === 'code' && st.answer_state === 'otázka';
+        if (byCode ? st.state !== 'pending' : (st.replied || st.state !== 'pending' || st.picked_at)) return skip('answered');
       } catch (e) {
         this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
       }

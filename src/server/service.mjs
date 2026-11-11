@@ -31,6 +31,10 @@ export const NOTICE_OPTIONS = {
   'turn-stalled': [
     { id: 'ack', label: 'Beriem na vedomie' },
   ],
+  // A question to the operator (answer state `otázka`) has waited QUESTION_NOTICE_MS without a final reply (P-061).
+  'question-open': [
+    { id: 'ack', label: 'Beriem na vedomie' },
+  ],
 };
 
 /** Notice kinds that a client (the wake module) may create through POST /notice. */
@@ -44,6 +48,9 @@ export const TTL_LEVELS = ['blocker', 'steer', 'assist'];
 /** Urgency order: a reply is at least as urgent as the message it answers. */
 export const LEVEL_RANK = { assist: 1, steer: 2, blocker: 3 };
 export const EXPIRY_INTERVAL_MS = 30_000;
+/** An answer in state `otázka` without a final reply after this long: one operator notice (P-061 risk: an endless question). */
+const SYSTEM_NOTICE_BY = 'comms-service';
+export const QUESTION_NOTICE_MS = 24 * 3600 * 1000;
 export const TURN_STATES = ['open', 'closed'];
 /** Longest stored next step of a closed turn (characters). */
 export const MAX_NEXT = 300;
@@ -79,7 +86,10 @@ export class Service {
   /** Deadline check every 30 s; also once at start (deadlines survive a restart, nothing is re-armed). */
   startTimers(intervalMs = EXPIRY_INTERVAL_MS) {
     this.stopTimers();
-    const tick = () => { try { this.checkExpired(); } catch (e) { this.log(`expiry check failed: ${e.message}`); } };
+    const tick = () => {
+      try { this.checkExpired(); } catch (e) { this.log(`expiry check failed: ${e.message}`); }
+      try { this.checkOpenQuestions(); } catch (e) { this.log(`open question check failed: ${e.message}`); }
+    };
     tick();
     this.timer = setInterval(tick, intervalMs);
     this.timer.unref?.();
@@ -241,12 +251,12 @@ export class Service {
 
   /** Answer of a message from its replies: the final one if any, else the latest interim one; null without a reply. */
   answerOf(m) {
-    if (m.answer_state) return { state: m.answer_state, at: m.answer_at || null, id: m.answer_id || null };
+    if (m.answer_state) return { state: m.answer_state, at: m.answer_at || null, id: m.answer_id || null, origin: m.answer_origin || 'reply' };
     // Data from before reply states: a reply without a state is final.
     const replies = this.store.messages((x) => x.reply_to === m.id).sort((a, b) => a.created_at.localeCompare(b.created_at));
     if (!replies.length) return null;
     const pick = replies.find((r) => replyStateOf(r) === FINAL_REPLY_STATE) || replies[replies.length - 1];
-    return { state: replyStateOf(pick), at: pick.created_at, id: pick.id };
+    return { state: replyStateOf(pick), at: pick.created_at, id: pick.id, origin: 'reply' };
   }
 
   deliver(sender, body) {
@@ -528,7 +538,7 @@ export class Service {
     const replied = !!answer;
     return {
       id: m.id, state: m.state, level: levelOf(m), reply_to: m.reply_to || null, reply_state: m.reply_to ? replyStateOf(m) : null,
-      answer_state: answer ? answer.state : null, answer_at: answer ? answer.at : null, answer_id: answer ? answer.id : null,
+      answer_state: answer ? answer.state : null, answer_at: answer ? answer.at : null, answer_id: answer ? answer.id : null, answer_origin: answer ? answer.origin : null,
       cancels: m.cancels || null, cancelled_by: m.cancelled_by || null, project: m.project || null, topic: m.topic || null, to: addressOf(m),
       outcome: outcomeOf(m), replied, expires_at: m.expires_at || null, ttl_s: m.ttl_s || null, picked_at: m.picked_at || null,
       undelivered_holder: m.undelivered_holder || null, undelivered_reason: m.undelivered_reason || null,
@@ -549,11 +559,11 @@ export class Service {
   }
 
   /** Event for the sender about its own message (`expired` / `undelivered`); none without a way back. */
-  emitOutcome(type, m) {
+  emitOutcome(type, m, extra = {}) {
     const h = this.senderHolder(m);
     if (!h) return null;
     return this.emitEvent({
-      type, message_id: m.id, level: m.level, project: m.project, topic: m.topic, ...h,
+      ...extra, type, message_id: m.id, level: m.level, project: m.project, topic: m.topic, ...h,
       sender: m.sender, thread_id: m.thread_id, from_project: m.from_project, from_topic: m.from_topic,
     });
   }
@@ -572,15 +582,63 @@ export class Service {
     const replied = new Set(all.filter((m) => m.reply_to).map((m) => m.reply_to));
     const out = [];
     for (const m of all) {
-      if ((m.state !== 'pending' && m.state !== 'held') || !m.expires_at || m.expired_at || outcomeOf(m) || replied.has(m.id)) continue;
+      if ((m.state !== 'pending' && m.state !== 'held') || !m.expires_at || m.expired_at || outcomeOf(m) || replied.has(m.id) || m.answer_state) continue;
       if (Date.parse(m.expires_at) > now) continue;
       // Picked up within the deadline: it was read in time, so no `no reply` bell.
       if (m.picked_at && Date.parse(m.picked_at) <= Date.parse(m.expires_at)) continue;
+      // The recipient thread's open turn waits for the operator's dialog (P-061, `waiting_operator`): it cannot pick up, but it
+      // lives. The answer is `otázka` of origin `code`; the sender is rung as for a reply (no `no reply`).
+      if (this.recipientWaitsForOperator(m)) {
+        m.answer_state = 'otázka';
+        m.answer_at = new Date(now).toISOString();
+        m.answer_id = null;
+        m.answer_origin = 'code';
+        this.store.saveMessage(m);
+        const ev = this.emitOutcome('expired', m, { answer_state: 'otázka' });
+        this.log(`answer otázka (code) ${m.id} (${m.level}) ${m.project}/${m.topic}: recipient waits for the operator${ev ? `, event ${ev.seq} → ${ev.holder}` : ', no way back (log only)'}`);
+        continue;
+      }
       m.expired_at = new Date(now).toISOString();
       m.outcome = 'expired';
       this.store.saveMessage(m);
       const ev = this.emitOutcome('expired', m);
       this.log(`expired ${m.id} (${m.level}) ${m.project}/${m.topic}${ev ? `, event ${ev.seq} → ${ev.holder}` : ', no way back (log only)'}`);
+      out.push(m.id);
+    }
+    return out;
+  }
+
+  /** Thread that receives a message: the thread it is addressed to, else the holder of its topic. */
+  recipientThread(m) {
+    if (m.to_thread) return m.to_thread;
+    const t = m.project && m.topic ? this.store.topic(m.project, m.topic) : null;
+    return t && t.holder ? t.holder : null;
+  }
+
+  /** The recipient's turn is open and waits for the operator's dialog (flag `waiting_operator` of the turn record). */
+  recipientWaitsForOperator(m) {
+    const thread = this.recipientThread(m);
+    const turn = thread ? this.store.turn(thread) : null;
+    return !!(turn && turn.state === 'open' && turn.waiting_operator);
+  }
+
+  /**
+   * One operator notice per message whose answer has stayed `otázka` (no final reply) for QUESTION_NOTICE_MS (P-061:
+   * an endless question). Once: the message keeps `question_notice_id`; the notice has `dedupe_key`.
+   * Returns the ids of the messages noticed.
+   */
+  checkOpenQuestions(now = Date.now()) {
+    const out = [];
+    for (const m of this.store.messages((x) => x.answer_state === 'otázka' && !x.question_notice_id && x.answer_at)) {
+      if (m.reply_to || now - Date.parse(m.answer_at) < QUESTION_NOTICE_MS) continue;
+      const dedupe_key = `question:${m.id}`;
+      const open = this.store.notices((n) => n.state === 'open' && n.kind === 'question-open' && n.dedupe_key === dedupe_key);
+      const n = open[0] || this.createNotice({
+        kind: 'question-open', title: `Otázka čaká na operátora viac ako 24 h: ${addressOf(m)}`, message: m, extra: { created_by: SYSTEM_NOTICE_BY, dedupe_key, detail: `odpoveď „otázka“ od ${m.answer_at}, správa ${m.id}, bez konečnej odpovede` },
+      });
+      m.question_notice_id = n.id;
+      this.store.saveMessage(m);
+      this.log(`question open ${m.id}: notice ${n.id}`);
       out.push(m.id);
     }
     return out;
@@ -620,10 +678,22 @@ export class Service {
    * of an older turn leaves the current record as it is (`stale: true`). `next` (closed only): the next step left in the
    * handover of the held topic; wake rings the thread to continue it (continuation, P-026).
    */
-  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null } = {}) {
+  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null, waiting_operator = undefined } = {}) {
     requireThread(thread);
     const prev = this.store.turn(thread);
     const now = nowIso();
+    // `waiting_operator` without a state (P-061, hook PreToolUse/PostToolUse around AskUserQuestion): a flag of the OPEN turn
+    // record, so the record's end (Stop, keepalive close, new turn) clears it. `opened_at` binds it to that very turn.
+    if (!state && !attempt && waiting_operator !== undefined) {
+      if (!prev || prev.state !== 'open' || (opened_at != null && opened_at !== '' && prev.opened_at !== opened_at)) {
+        this.log(`waiting_operator of ${thread} ignored: no such open turn`);
+        return { ok: true, ignored: true };
+      }
+      prev.waiting_operator = waiting_operator === true || waiting_operator === 'true' || waiting_operator === 1;
+      prev.waiting_operator_at = prev.waiting_operator ? now : null;
+      this.store.saveTurn(prev);
+      return { ok: true, turn: prev };
+    }
     if (attempt) {
       if (!prev) throw new HttpError(404, `ťah vlákna ${thread} neexistuje`);
       prev.keepalive = { count: ((prev.keepalive && prev.keepalive.count) || 0) + 1, last_at: now };
@@ -645,7 +715,7 @@ export class Service {
         this.log(`stale close of ${thread} (opened_at ${opened_at}, current ${prev ? prev.opened_at : 'none'})`);
         return { ok: true, stale: true };
       }
-      rec = { ...(prev || { thread, machine: normalizeMachine(machine), project, topic, holder_mode, opened_at: null, keepalive: { count: 0, last_at: null } }), state: 'closed', closed_at: now, close_reason: reason || null, next: next ? String(next).slice(0, MAX_NEXT) : null, resume_at: resumeAt(resume_at, now) };
+      rec = { ...(prev || { thread, machine: normalizeMachine(machine), project, topic, holder_mode, opened_at: null, keepalive: { count: 0, last_at: null } }), state: 'closed', closed_at: now, close_reason: reason || null, waiting_operator: false, waiting_operator_at: null, next: next ? String(next).slice(0, MAX_NEXT) : null, resume_at: resumeAt(resume_at, now) };
     }
     this.store.saveTurn(rec);
     return { ok: true, turn: rec };

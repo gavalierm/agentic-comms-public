@@ -46,6 +46,9 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
        [--opened-at <iso>] [--next <krok>]        záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;
                                                   closed s --next: ďalší krok z handoveru, budenie vlákno zobudí na pokračovanie;
                                                   pri výpadku { ok:false, unavailable:true[, queued:true] }, kód 0 (closed ide do outboxu)
+  turn --waiting-operator true|false [--thread <id>] [--opened-at <iso>]
+                                                  príznak otvoreného ťahu: vlákno čaká na dialóg operátora (P-061); pošta správu preň po lehote
+                                                  neoznačí „no reply“, ale odosielateľovi zapíše odpoveď „otázka“ (pôvod code); koniec ťahu príznak zruší
   notices [--all]
   decide --notice <id> --decision <id> [--target <project/topic>]
   register-topic --project <p> --topic <t> --subject <text> [--persona <meno>] [--visibility public|private]
@@ -64,7 +67,7 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
   'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'wait-for', 'cancels', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
-  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at']);
+  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator']);
 const BOOL_FLAGS = new Set(['no-start', 'all', 'ack', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close']);
 
 export function parseArgs(argv) {
@@ -237,14 +240,17 @@ async function run(cmd, args, cfg, io) {
       if (args.id.length > 1) throw new CommsError('USAGE', 'message zisťuje stav jednej správy: zadajte jedno --id');
       return client.message(args.id[0]);
     case 'turn': {
-      need('state');
+      // `--waiting-operator true|false` without --state: the flag of the open turn (the thread waits for the operator's dialog).
+      if (args.state == null && args.waitingOperator != null) {
+        if (!['true', 'false'].includes(args.waitingOperator)) throw new CommsError('USAGE', '--waiting-operator je true alebo false');
+      } else need('state');
       const thread = args.thread || cfg.threadId;
       if (!thread) throw new CommsError('USAGE', 'chýba voľba --thread (alebo COMMS_THREAD_ID / T3CODE_THREAD_ID)');
       // Short deadline; on outage only `closed` is queued (the service drops it when `opened_at` no longer matches).
       const quick = new Client({ ...cfg, timeout: Math.min(cfg.timeout, TURN_TIMEOUT) });
       return quick.turn({
-        thread, state: args.state, machine: cfg.machine || null, project: args.project || null, topic: args.topic || null,
-        holder_mode: args.holderMode || null, ...(args.openedAt ? { opened_at: args.openedAt } : {}), ...(args.next ? { next: args.next } : {}), ...(args.resumeAt ? { resume_at: args.resumeAt } : {}),
+        thread, ...(args.state != null ? { state: args.state } : {}), machine: cfg.machine || null, project: args.project || null, topic: args.topic || null,
+        holder_mode: args.holderMode || null, ...(args.waitingOperator != null ? { waiting_operator: args.waitingOperator === 'true' } : {}), ...(args.openedAt ? { opened_at: args.openedAt } : {}), ...(args.next ? { next: args.next } : {}), ...(args.resumeAt ? { resume_at: args.resumeAt } : {}),
       });
     }
     case 'receive': {

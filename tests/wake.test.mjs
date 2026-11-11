@@ -684,3 +684,16 @@ test('timer (P-061): a turn closed with resume_at is rung at that time, also wit
   assert.equal((await client.notices()).notices.filter((n) => n.kind === 'turn-stalled').length, 0);
   await assert.rejects(client.turn({ thread: 'thr-1', state: 'closed', next: 'x', resume_at: 'soon' }), /resume_at/);
 });
+
+test('expired event with answer `otázka` by code (recipient waits for the operator) is rung to the sender, not skipped as answered', async (t) => {
+  const { inst, client, waker, adapter, svc } = await setup(t);
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });
+  const o = await bob.turn({ thread: 'thr-1', state: 'open' });
+  await bob.turn({ thread: 'thr-1', waiting_operator: true, opened_at: o.turn.opened_at });
+  const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'decide?', ttl: '60s', thread_id: 'thr-a' });
+  assert.equal(await waker.pollOnce(500), 1);
+  adapter.calls.length = 0;
+  svc.checkExpired(Date.now() + 61_000);
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the bell stays; the hook reads the state `otázka` from `message`');
+});

@@ -1,6 +1,6 @@
 {
   "name": "agentic-comms",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "private": true,
   "type": "module",
   "description": "Mail (comms) and wake-up module for agentic topics. No runtime dependencies.",

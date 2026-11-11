@@ -2,7 +2,7 @@
 // register-topic / wake events / message deadlines (TTL) / turns (keepalive).
 // Independent of HTTP.
 import { EventEmitter } from 'node:events';
-import { LEVELS, LEVEL_REMOVED_TEXT, DEFAULT_TTL, MAX_TTL, isValidName, isValidThread, newId, nowIso, textHash, HttpError, PERSONA_MAIN_TOPIC, personaProject, normalizeMachine, parseDuration } from '../common/util.mjs';
+import { LEVELS, REPLY_STATES, FINAL_REPLY_STATE, LEVEL_REMOVED_TEXT, DEFAULT_TTL, MAX_TTL, isValidName, isValidThread, newId, nowIso, textHash, HttpError, PERSONA_MAIN_TOPIC, personaProject, normalizeMachine, parseDuration } from '../common/util.mjs';
 import { notifyOperator } from '../notify/index.mjs';
 
 export const NOTICE_OPTIONS = {
@@ -215,7 +215,46 @@ export class Service {
   // --- send ----------------------------------------------------------------------
   send(sender, body) {
     if (!sender) throw new HttpError(401, 'neplatný kľúč');
-    const { project = null, topic = null, persona = null, level: rawLevel = null, text, reply_to = null, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null } = body || {};
+    // `cancels`: a new message that withdraws the sender's own final reply (checked before anything is stored).
+    const cancelled = this.cancelTarget(sender, body || {});
+    const out = this.deliver(sender, body);
+    if (cancelled) {
+      cancelled.cancelled_by = out.id;
+      cancelled.cancelled_at = nowIso();
+      this.store.saveMessage(cancelled);
+      this.log(`reply ${cancelled.id} cancelled by ${out.id}`);
+    }
+    return out;
+  }
+
+  /** The reply a message with `cancels` withdraws: a final reply sent by the same sender, not cancelled yet. */
+  cancelTarget(sender, { cancels = null, reply_to = null }) {
+    if (!present(cancels)) return null;
+    if (reply_to) throw new HttpError(400, 'cancels patrí novej správe s úrovňou a adresou, nie odpovedi (reply_to)');
+    const target = this.store.message(String(cancels));
+    if (!target) throw new HttpError(404, `rušená odpoveď ${cancels} neexistuje`);
+    if (!target.reply_to || replyStateOf(target) !== FINAL_REPLY_STATE) throw new HttpError(400, `správa ${cancels} nie je konečná odpoveď (hotovo): zrušiť sa dá iba konečná odpoveď`);
+    if (target.sender !== sender) throw new HttpError(403, `odpoveď ${cancels} poslal niekto iný: zrušiť ju smie iba jej odosielateľ`);
+    if (target.cancelled_by) throw new HttpError(409, `odpoveď ${cancels} je už zrušená správou ${target.cancelled_by}`, { cancelled_by: target.cancelled_by });
+    return target;
+  }
+
+  /** Answer of a message from its replies: the final one if any, else the latest interim one; null without a reply. */
+  answerOf(m) {
+    if (m.answer_state) return { state: m.answer_state, at: m.answer_at || null, id: m.answer_id || null };
+    // Data from before reply states: a reply without a state is final.
+    const replies = this.store.messages((x) => x.reply_to === m.id).sort((a, b) => a.created_at.localeCompare(b.created_at));
+    if (!replies.length) return null;
+    const pick = replies.find((r) => replyStateOf(r) === FINAL_REPLY_STATE) || replies[replies.length - 1];
+    return { state: replyStateOf(pick), at: pick.created_at, id: pick.id };
+  }
+
+  deliver(sender, body) {
+    const { project = null, topic = null, persona = null, level: rawLevel = null, text, reply_to = null, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null, reply_state: rawState = null, wait_for = null, cancels = null } = body || {};
+    // A reply carries a state; a client from before states sends none and means a final answer.
+    if (!reply_to && present(rawState)) throw new HttpError(400, 'stav (reply_state) patrí iba odpovedi (reply_to)');
+    if (reply_to && present(rawState) && !REPLY_STATES.includes(rawState)) throw new HttpError(400, `neznámy stav odpovede „${rawState}“; platné stavy: ${REPLY_STATES.join('|')}`);
+    const reply_state = reply_to ? (present(rawState) ? rawState : FINAL_REPLY_STATE) : null;
     if (rawLevel === 'info') throw new HttpError(400, LEVEL_REMOVED_TEXT);
     // Level is required, except for a reply: it inherits the level of the message it answers (see below).
     if (rawLevel == null || rawLevel === '') {
@@ -225,18 +264,20 @@ export class Service {
     }
     const level = rawLevel || null;
     if (typeof text !== 'string' || !text.trim()) throw new HttpError(400, 'text správy je povinný');
-    // A reply has no deadline: it answers, nothing waits for it.
+    // A reply has no pickup deadline; what still waits after it is told by its state (`otázka`, `čakám`).
     const ttl_s = reply_to ? 0 : this.resolveTtl(level, ttl);
     const created_at = nowIso();
 
     const msg = {
       id: newId(), project: null, topic: null, persona: null, ref_project: null, ref_topic: null, to_thread: null,
       level, text, sender, thread_id, thread_machine: normalizeMachine(thread_machine), from_project, from_topic, reply_to,
+      reply_state, wait_for: reply_to && present(wait_for) ? String(wait_for) : null, cancels: present(cancels) ? String(cancels) : null,
       created_at, state: 'pending', acked_at: null, notice_id: null,
       ttl_s: ttl_s || null, expires_at: ttl_s ? new Date(Date.parse(created_at) + ttl_s * 1000).toISOString() : null, expired_at: null, outcome: null,
     };
 
     let original = null;
+    let rings = true;
     if (reply_to) {
       // A reply goes to the original's sender: an address in the body would be ignored, so refuse it.
       if (present(persona) || present(project) || present(topic)) throw new HttpError(400, 'odpoveď (reply_to) nemôže mať persona, project ani topic: adresát je odosielateľ pôvodnej správy');
@@ -247,6 +288,15 @@ export class Service {
       const ownBySource = !thread_id && original.sender === sender && present(from_project) && present(from_topic)
         && original.from_project === from_project && original.from_topic === from_topic;
       if (ownByThread || ownBySource) throw new HttpError(400, `správa ${reply_to} je vaša vlastná: odpoveď by sa vrátila do toho istého vlákna; pošlite novú správu adresátovi a ID uveďte v texte`);
+      // No chain of replies: a reply ends the exchange, a new request is a message with a level and a deadline.
+      if (original.reply_to) throw new HttpError(400, `správa ${reply_to} je odpoveď: na odpoveď sa neodpovedá; novú požiadavku pošli novou správou s úrovňou (ID uveď v texte)`);
+      // One final reply per message: nothing follows `hotovo`; a change is a new message that cancels it.
+      const answer = this.answerOf(original);
+      if (answer && answer.state === FINAL_REPLY_STATE) {
+        throw new HttpError(409, `správa ${reply_to} má konečnú odpoveď ${answer.id}; zmena = nová správa s úrovňou a --cancels ${answer.id}`, { answer_id: answer.id, answer_at: answer.at });
+      }
+      // The first interim state and the final answer ring the sender; a move between interim states does not.
+      rings = !answer || reply_state === FINAL_REPLY_STATE;
       // A reply never lowers the urgency of what it answers (operator 2026-11-02: a blocker waits for an answer
       // as urgent as itself): a lower level is raised to the original's.
       const originalLevel = levelOf(original);
@@ -301,8 +351,14 @@ export class Service {
     }
 
     this.store.saveMessage(msg);
-    this.afterDelivery(msg, original);
-    return { id: msg.id, state: msg.state, level: msg.level, ...(msg.level_raised_from ? { level_raised_from: msg.level_raised_from } : {}), notice_id: msg.notice_id, expires_at: msg.expires_at };
+    if (original) {
+      original.answer_state = reply_state;
+      original.answer_at = created_at;
+      original.answer_id = msg.id;
+      this.store.saveMessage(original);
+    }
+    if (rings) this.afterDelivery(msg, original);
+    return { id: msg.id, state: msg.state, level: msg.level, ...(reply_state ? { reply_state } : {}), ...(msg.level_raised_from ? { level_raised_from: msg.level_raised_from } : {}), notice_id: msg.notice_id, expires_at: msg.expires_at };
   }
 
   /** A closed topic takes no mail: 410 with the time it was closed and where to write instead. */
@@ -369,7 +425,7 @@ export class Service {
     if (original) {
       const t = msg.project && msg.topic ? this.store.topic(msg.project, msg.topic) : null;
       this.emitEvent({
-        type: 'reply', ...base, reply_to: original.id, original_level: levelOf(original),
+        type: 'reply', ...base, reply_to: original.id, reply_state: msg.reply_state || null, original_level: levelOf(original),
         holder: original.thread_id || (t ? t.holder : null), holder_mode: original.thread_id ? null : (t ? t.holder_mode || null : null),
         holder_machine: original.thread_id ? original.thread_machine || null : (t ? t.holder_machine || null : null),
       });
@@ -435,7 +491,10 @@ export class Service {
     const list = this.pending(q);
     return {
       total: list.length, blocker: list.filter((m) => levelOf(m) === 'blocker').length, ids: list.map((m) => m.id),
-      items: list.map((m) => ({ id: m.id, level: levelOf(m), reply_to: m.reply_to || null, to_thread: m.to_thread || null, sender: m.sender || null, created_at: m.created_at })),
+      items: list.map((m) => ({
+        id: m.id, level: levelOf(m), reply_to: m.reply_to || null, reply_state: m.reply_to ? replyStateOf(m) : null, cancels: m.cancels || null,
+        answer_state: m.answer_state || null, answer_at: m.answer_at || null, to_thread: m.to_thread || null, sender: m.sender || null, created_at: m.created_at,
+      })),
     };
   }
 
@@ -465,9 +524,12 @@ export class Service {
   messageState(id) {
     const m = this.store.message(id || '');
     if (!m) throw new HttpError(404, `správa ${id} neexistuje`);
-    const replied = this.store.messages((x) => x.reply_to === m.id).length > 0;
+    const answer = this.answerOf(m);
+    const replied = !!answer;
     return {
-      id: m.id, state: m.state, level: levelOf(m), reply_to: m.reply_to || null, project: m.project || null, topic: m.topic || null, to: addressOf(m),
+      id: m.id, state: m.state, level: levelOf(m), reply_to: m.reply_to || null, reply_state: m.reply_to ? replyStateOf(m) : null,
+      answer_state: answer ? answer.state : null, answer_at: answer ? answer.at : null, answer_id: answer ? answer.id : null,
+      cancels: m.cancels || null, cancelled_by: m.cancelled_by || null, project: m.project || null, topic: m.topic || null, to: addressOf(m),
       outcome: outcomeOf(m), replied, expires_at: m.expires_at || null, ttl_s: m.ttl_s || null, picked_at: m.picked_at || null,
       undelivered_holder: m.undelivered_holder || null, undelivered_reason: m.undelivered_reason || null,
     };
@@ -781,6 +843,12 @@ export function publicMessage(m) {
     id: m.id, project: m.project, topic: m.topic, persona: m.persona || null, ref_project: m.ref_project || null, ref_topic: m.ref_topic || null,
     to_thread: m.to_thread, level: levelOf(m), text: m.text, picked_at: m.picked_at || null,
     sender: m.sender, thread_id: m.thread_id, from_project: m.from_project, from_topic: m.from_topic,
-    reply_to: m.reply_to, created_at: m.created_at, state: m.state,
+    reply_to: m.reply_to, reply_state: m.reply_to ? replyStateOf(m) : null, wait_for: m.wait_for || null,
+    cancels: m.cancels || null, cancelled_by: m.cancelled_by || null, created_at: m.created_at, state: m.state,
   };
+}
+
+/** State of a reply; one stored before reply states (or sent by an old client) is final. */
+export function replyStateOf(m) {
+  return m.reply_state || FINAL_REPLY_STATE;
 }

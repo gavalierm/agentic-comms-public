@@ -2,7 +2,7 @@
 // stdout; errors are JSON on stderr. Exit codes: 0 ok, 1 rejected/usage,
 // 2 comms unavailable, 3 instance mismatch.
 import { Client, CommsError, resolveConfig, TURN_TIMEOUT } from './index.mjs';
-import { parseDuration, readJson, LEVELS, LEVEL_REMOVED_TEXT, MAX_TTL } from '../common/util.mjs';
+import { parseDuration, readJson, LEVELS, REPLY_STATES, LEVEL_REMOVED_TEXT, MAX_TTL } from '../common/util.mjs';
 import { Store } from '../server/store.mjs';
 import { startServer, probe } from '../server/index.mjs';
 import { socketPath } from '../common/paths.mjs';
@@ -29,11 +29,14 @@ Služba:
 
 Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
   send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]]
-       --level blocker|steer|assist --text <text|-> [--reply-to <id>] [--from-project <p> --from-topic <t>] [--ttl <dĺžka>]
+       --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--cancels <id>]
+  send --reply-to <id> --state hotovo|otázka|čakám [--wait-for <čo>] --text <text|->
                                                   adresa: projekt+téma, alebo persona (+projekt, +téma); persona bez
                                                   témy, ktorú vlastní, ide do hlavného vlákna persony (@<persona>/main)
                                                   --ttl: lehota na prevzatie správy (90s, 5m, 30m, sekundy; skracuje, nie predlžuje; blocker a steer najviac 5m, assist 30m)
-                                                  predvolené ttl: blocker a steer 5m, assist 30m (instance.json ttl.<úroveň>). Odpoveď (--reply-to) nemá lehotu a úroveň zdedí
+                                                  predvolené ttl: blocker a steer 5m, assist 30m (instance.json ttl.<úroveň>). Odpoveď (--reply-to) nemá lehotu, úroveň zdedí
+                                                  a nesie stav: hotovo je konečná (jedna na správu, po nej 409), otázka a čakám sú priebežné; bez --state platí hotovo.
+                                                  Na odpoveď sa neodpovedá (400). --cancels <id>: nová správa ruší tvoju konečnú odpoveď <id>
   receive --project <p> --topic <t> | --persona <meno> | --thread <id> [--id <id> ...] [--ack]
                                                   čítanie tela = prevzatie (picked_at); --id číta iba zadané správy
   ack --id <id> [--id <id> ...]
@@ -60,7 +63,7 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 `;
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
-  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
+  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'wait-for', 'cancels', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
   'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at']);
 const BOOL_FLAGS = new Set(['no-start', 'all', 'ack', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close']);
 
@@ -208,6 +211,9 @@ async function run(cmd, args, cfg, io) {
       if (args.level == null && !args.replyTo) throw new CommsError('USAGE', `chýba voľba --level (${LEVELS.join('|')})`);
       if (args.level != null && !LEVELS.includes(args.level)) throw new CommsError('REJECTED', `neznáma úroveň „${args.level}“; platné úrovne: ${LEVELS.join('|')}`, { status: 400 });
       if (!args.replyTo && !args.persona) need('project', 'topic');
+      if (args.state != null && !args.replyTo) throw new CommsError('USAGE', '--state patrí iba odpovedi (--reply-to)');
+      if (args.state != null && !REPLY_STATES.includes(args.state)) throw new CommsError('REJECTED', `neznámy stav odpovede „${args.state}“; platné stavy: ${REPLY_STATES.join('|')}`, { status: 400 });
+      if (args.cancels != null && args.replyTo) throw new CommsError('USAGE', '--cancels patrí novej správe s úrovňou a adresou, nie odpovedi (--reply-to)');
       if (args.ttl != null && !args.replyTo) {
         // Checked here too, so that a message queued during an outage is not rejected later (the server checks the same).
         const s = parseDuration(args.ttl);
@@ -221,6 +227,9 @@ async function run(cmd, args, cfg, io) {
         project: args.project || null, topic: args.topic || null, persona: args.persona || null, level: args.level, text,
         reply_to: args.replyTo || null, from_project: args.fromProject || null, from_topic: args.fromTopic || null,
         ...(args.ttl != null ? { ttl: args.ttl } : {}),
+        ...(args.replyTo && args.state != null ? { reply_state: args.state } : {}),
+        ...(args.replyTo && args.waitFor != null ? { wait_for: args.waitFor } : {}),
+        ...(args.cancels != null ? { cancels: args.cancels } : {}),
       });
     }
     case 'message':

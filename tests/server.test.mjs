@@ -287,7 +287,7 @@ test('expiry: no mail, no notice; outcome expired and one expired event for the 
   const { picked_at: lateRead, ...lonelyState } = await alice.message(lonely.id);
   assert.ok(lateRead, 'the late read is recorded as pickup');
   assert.deepEqual(lonelyState, {
-    id: lonely.id, state: 'pending', level: 'assist', reply_to: null, project: 'p', topic: 't', to: 'p/t', outcome: 'expired', replied: false,
+    id: lonely.id, state: 'pending', level: 'assist', reply_to: null, reply_state: null, answer_state: null, answer_at: null, answer_id: null, cancels: null, cancelled_by: null, project: 'p', topic: 't', to: 'p/t', outcome: 'expired', replied: false,
     expires_at: lonely.expires_at, ttl_s: 60, undelivered_holder: null, undelivered_reason: null,
   });
   const stored = JSON.parse(fs.readFileSync(path.join(a.dir, 'messages', `${lonely.id}.json`), 'utf8'));

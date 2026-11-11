@@ -32,7 +32,9 @@ test('reply inherits the level of its original; a lower explicit level is raised
   const raised = await asBob.send({ reply_to: blocker.id, level: 'assist', text: 'on it' });
   assert.deepEqual([raised.level, raised.level_raised_from], ['blocker', 'assist']);
 
-  const higher = await asBob.send({ reply_to: steer.id, level: 'blocker', text: 'urgent' });
+  // one final reply per message: the higher level is tried on another original
+  const steer2 = await alice.send({ project: 'p', topic: 't', level: 'steer', text: 'stop again', thread_id: 'thr-alice', from_project: 'q', from_topic: 'u' });
+  const higher = await asBob.send({ reply_to: steer2.id, level: 'blocker', text: 'urgent' });
   assert.equal(higher.level, 'blocker', 'an explicit higher level is kept');
   assert.equal(higher.level_raised_from, undefined);
 });

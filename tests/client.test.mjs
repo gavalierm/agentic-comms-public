@@ -226,7 +226,7 @@ test('CLI send: info is refused with the valid levels; --ttl max 5m (blocker/ste
   const msg = cli(['message', ...base, '--id', sent.json.id]);
   assert.equal(msg.code, 0, msg.err);
   assert.deepEqual(msg.json, {
-    id: sent.json.id, state: 'pending', level: 'assist', reply_to: null, project: 'p', topic: 't', to: 'p/t', outcome: null, replied: false,
+    id: sent.json.id, state: 'pending', level: 'assist', reply_to: null, reply_state: null, answer_state: null, answer_at: null, answer_id: null, cancels: null, cancelled_by: null, project: 'p', topic: 't', to: 'p/t', outcome: null, replied: false,
     expires_at: sent.json.expires_at, ttl_s: 90, picked_at: null, undelivered_holder: null, undelivered_reason: null,
   });
 

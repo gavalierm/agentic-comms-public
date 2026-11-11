@@ -3,9 +3,12 @@ import path from 'node:path';
 import { randomBytes, createHash } from 'node:crypto';
 
 export const LEVELS = ['blocker', 'steer', 'assist'];
+/** State a reply carries (workflow P-061): one final `hotovo` per message; `otázka` and `čakám` are interim. */
+export const REPLY_STATES = ['hotovo', 'otázka', 'čakám'];
+export const FINAL_REPLY_STATE = 'hotovo';
 /** Level removed (operator 2026-11-02): refused with this text, pointing to the valid levels. */
 export const LEVEL_REMOVED_TEXT = 'úroveň „info“ bola zrušená; použi assist (nečakáš, príjemca prečíta pri voľnom bode), steer (príjemca rieši hneď) alebo blocker (čakáš na odpoveď). Platné úrovne: ' + 'blocker|steer|assist';
-/** Deadline for PICKUP (the body is read), not for the answer. `ttl` may shorten it, never extend it. Replies have none. */
+/** Deadline for PICKUP (the body is read), not for the answer. `ttl` may shorten it, never extend it. A reply has none; it carries a state (REPLY_STATES). */
 export const DEFAULT_TTL = { blocker: '5m', steer: '5m', assist: '30m' };
 export const MAX_TTL = { blocker: '5m', steer: '5m', assist: '30m' };
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;

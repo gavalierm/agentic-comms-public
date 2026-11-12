@@ -165,7 +165,10 @@ export class Waker {
         const st = await this.client.message(ev.message_id);
         // Interim `otázka` of origin `code` (the recipient waits for the operator's dialog): the ring tells the sender so.
         const byCode = st.answer_origin === 'code' && st.answer_state === 'otázka';
-        if (byCode ? st.state !== 'pending' : (st.replied || st.state !== 'pending' || st.picked_at)) return skip('answered');
+        // A held message (unregistered topic, persona without a main thread) is open as a pending one: its expiry tells the
+        // sender nobody got it (4 silent expiries, audit M5 2026-11-11).
+        const open = st.state === 'pending' || st.state === 'held';
+        if (byCode ? !open : (st.replied || !open || st.picked_at)) return skip('answered');
       } catch (e) {
         this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
       }

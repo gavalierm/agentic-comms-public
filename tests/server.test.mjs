@@ -534,6 +534,18 @@ test('4: ack with an unknown id is 404 naming it (nothing acked); already-acked 
   assert.match(r.err, /nope-2/);
 });
 
+test('`<persona>/main` without `@` goes to the main thread of the persona; without one it stays held (audit M5 2026-11-11)', async (t) => {
+  const a = makeInstance('a');
+  const sa = await startInstance(a);
+  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const c = makeClient(a);
+  await c.registerTopic({ persona: 'bob', main: true, holder: 'thr-m' });
+  const r = await c.send({ project: 'bob', topic: 'main', level: 'assist', text: 'hi' });
+  assert.equal(r.state, 'pending');
+  assert.equal((await c.receive({ project: '@bob', topic: 'main' })).messages.length, 1);
+  assert.equal((await c.send({ project: 'carol', topic: 'main', level: 'assist', text: 'x' })).state, 'held', 'no persona main: held as before');
+});
+
 test('register-topic close bounces thread mail only when the closing thread holds no other topic (fable audit M3)', async (t) => {
   const a = makeInstance('a');
   const sa = await startInstance(a);

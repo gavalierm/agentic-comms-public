@@ -343,6 +343,11 @@ export class Service {
       msg.topic = topic;
       const t = this.store.topic(project, topic);
       this.refuseClosed(t, 'téma je uzavretá');
+      // `<persona>/main` without `@` means the persona's main thread when the persona has one and no such topic exists
+      // (6 messages held, audit M5 2026-11-11).
+      if (!t && topic === PERSONA_MAIN_TOPIC && isValidName(project) && this.store.topic(personaProject(project), PERSONA_MAIN_TOPIC)) {
+        return this.toPersonaMain(msg, project);
+      }
       if (!t || (t.visibility === 'private' && sender !== t.persona)) {
         // Unregistered topic, or a private topic addressed by someone else than its owner: the same
         // answer as for an unknown topic (no oracle), hold + notice, never create the topic (P-045).

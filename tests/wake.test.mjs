@@ -326,6 +326,15 @@ test('expired deadline: rings the sender with `no reply <id>`, never the recipie
   assert.ok(logs.some((l) => /skip 99 \(answered\)/.test(l)));
 });
 
+test('expired held message (unregistered topic) rings the sender with `no reply <id>`, not skipped as answered (audit M5 2026-11-11)', async (t) => {
+  const { client, waker, adapter, svc } = await setup(t);
+  const m = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'lost?', ttl: '60s', thread_id: 'thr-a' });
+  assert.equal(m.state, 'held');
+  svc.checkExpired(Date.now() + 61_000);
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-a'), [{ holder: 'thr-a', text: `no reply ${m.id}` }]);
+});
+
 test('one queued ring per open turn of a busy holder; a new turn may be rung again; state persisted and pruned', async (t) => {
   const { client, waker, adapter } = await setup(t);
   const o1 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });

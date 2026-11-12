@@ -6,7 +6,8 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, cleanup, sleep, killPid, tmpDir, runCli } from './helpers.mjs';
-import { startServer } from '../src/server/index.mjs';
+import { startServer, probe } from '../src/server/index.mjs';
+import { socketPath } from '../src/common/paths.mjs';
 import { Client, resolveConfig } from '../src/client/index.mjs';
 
 const BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
@@ -308,8 +309,15 @@ test('8: serve forwards --config/--machine to the wake child; --wake on a runnin
   t.after(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } });
   const until = Date.now() + 10000;
   while (!/stroj cfg-box/.test(err) && Date.now() < until) await sleep(50);
-  child.kill('SIGTERM');
   assert.match(err, /stroj cfg-box/, err);
+  // Stopping the service ends wake too (README): serve waits for its child, and the child does not start a service of
+  // its own when this one goes away (four wake processes from this test ran for hours, 2026-11-12).
+  const exited = new Promise((r) => child.once('exit', r));
+  child.kill('SIGTERM');
+  await Promise.race([exited, sleep(8000)]);
+  assert.match(err, /wake skončil/, err);
+  await sleep(1000);
+  assert.equal(await probe(socketPath(b.dir)), null, 'no service runs after the stop');
 });
 
 test('9: each call has its own timeout; a client created long ago still makes calls', async (t) => {

@@ -29,7 +29,7 @@ Služba:
 
 Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
   send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]]
-       --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--cancels <id>]
+       --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--cancels <id>] [--supersede-key <kľúč>]
   send --reply-to <id> --state hotovo|otázka|čakám [--wait-for <čo>] --text <text|->
                                                   adresa: projekt+téma, alebo persona (+projekt, +téma); persona bez
                                                   témy, ktorú vlastní, ide do hlavného vlákna persony (@<persona>/main)
@@ -37,6 +37,8 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
                                                   predvolené ttl: blocker a steer 5m, assist 30m (instance.json ttl.<úroveň>). Odpoveď (--reply-to) nemá lehotu, úroveň zdedí
                                                   a nesie stav: hotovo je konečná (jedna na správu, po nej 409), otázka a čakám sú priebežné; bez --state platí hotovo.
                                                   Na odpoveď sa neodpovedá (400). --cancels <id>: nová správa ruší tvoju konečnú odpoveď <id>
+                                                  --supersede-key <kľúč>: nová správa s rovnakým kľúčom od toho istého odosielateľa na tú istú adresu nahradí ešte neprevzatú
+                                                  (blocker s kľúčom vytvorí oznam až po neprevzatí v lehote). Konečná odpoveď (hotovo) sa pri prevzatí (receive) potvrdí sama.
   receive --project <p> --topic <t> | --persona <meno> | --thread <id> [--id <id> ...] [--ack]
                                                   čítanie tela = prevzatie (picked_at); --id číta iba zadané správy
   ack --id <id> [--id <id> ...]
@@ -66,7 +68,7 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 `;
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
-  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'wait-for', 'cancels', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
+  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
   'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator']);
 const BOOL_FLAGS = new Set(['no-start', 'all', 'ack', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close']);
 
@@ -173,12 +175,25 @@ async function run(cmd, args, cfg, io) {
         // Optional: run the wake module (P-043) next to the service; it stays a separate process.
         // The child does not self-restart; this process watches for it (revision and wake.json).
         // Mail options are forwarded so that the child talks to the same instance and key as this process.
+        // --no-start: the service is this process; a child that starts its own when it goes away outlives the stop.
         const forward = [];
         for (const name of ['config', 'machine', 'instance', 'key']) if (args[name] != null) forward.push(`--${name}`, String(args[name]));
-        wake = spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', cfg.dataDir, ...forward, '--no-self-restart'], { stdio: ['ignore', 'ignore', 'inherit'], windowsHide: true });
+        wake = spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', cfg.dataDir, ...forward, '--no-self-restart', '--no-start'], { stdio: ['ignore', 'ignore', 'inherit'], windowsHide: true });
         wake.on('exit', (code) => { log(`wake skončil (${code})`); wake = null; });
       }
-      const stop = () => { if (wake) wake.kill('SIGTERM'); srv.close().then(() => process.exit(0)); };
+      // Stopping the service ends wake too: wait for the child (SIGKILL after 5 s), then exit.
+      let stopping = false;
+      const stop = () => {
+        if (stopping) return;
+        stopping = true;
+        const w = wake;
+        const ended = w ? new Promise((done) => {
+          const t = setTimeout(() => { try { w.kill('SIGKILL'); } catch { /* gone */ } }, 5000);
+          w.once('exit', () => { clearTimeout(t); done(); });
+          w.kill('SIGTERM');
+        }) : null;
+        Promise.all([ended, srv.close()]).then(() => process.exit(0));
+      };
       const cfgPath = args.config || process.env.COMMS_CONFIG || null;
       if (selfRestartEnabled(args, process.env, cfgPath ? readJson(path.resolve(cfgPath), {}) : null, store.instance())) {
         const files = args.wake && !cfgPath ? [path.join(cfg.dataDir, 'wake.json')] : [];
@@ -217,6 +232,7 @@ async function run(cmd, args, cfg, io) {
       if (args.state != null && !args.replyTo) throw new CommsError('USAGE', '--state patrí iba odpovedi (--reply-to)');
       if (args.state != null && !REPLY_STATES.includes(args.state)) throw new CommsError('REJECTED', `neznámy stav odpovede „${args.state}“; platné stavy: ${REPLY_STATES.join('|')}`, { status: 400 });
       if (args.cancels != null && args.replyTo) throw new CommsError('USAGE', '--cancels patrí novej správe s úrovňou a adresou, nie odpovedi (--reply-to)');
+      if (args.supersedeKey != null && args.replyTo) throw new CommsError('USAGE', '--supersede-key patrí novej správe s úrovňou a adresou, nie odpovedi (--reply-to)');
       if (args.ttl != null && !args.replyTo) {
         // Checked here too, so that a message queued during an outage is not rejected later (the server checks the same).
         const s = parseDuration(args.ttl);
@@ -233,6 +249,7 @@ async function run(cmd, args, cfg, io) {
         ...(args.replyTo && args.state != null ? { reply_state: args.state } : {}),
         ...(args.replyTo && args.waitFor != null ? { wait_for: args.waitFor } : {}),
         ...(args.cancels != null ? { cancels: args.cancels } : {}),
+        ...(args.supersedeKey != null ? { supersede_key: args.supersedeKey } : {}),
       });
     }
     case 'message':

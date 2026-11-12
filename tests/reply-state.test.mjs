@@ -130,3 +130,78 @@ test('cli: send --reply-to --state / --wait-for / --cancels reach the service; a
   assert.equal(c.code, 0, c.err);
   assert.equal((await alice.message(fin.json.id)).cancelled_by, c.json.id);
 });
+
+// Audit 2.4 (2026-11-12): a cron sent the same blocker every 15 min (26 messages, 25 expired, 30 notices), and a final reply
+// needed a separate ack (33 ack calls). `supersede_key` replaces an unpicked message of the same sender, address and key; the notice
+// of a keyed blocker exists only when nobody picked it up; a final reply is acked by its pickup.
+
+async function supersedeSetup(t) {
+  const a = makeInstance('sup');
+  const bob = a.store.addKey('bob');
+  const sa = await startInstance(a);
+  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const alice = makeClient(a, { thread: 'thr-alice' });
+  const asBob = makeClient(a, { key: bob.key, thread: 'thr-bob' });
+  await alice.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-bob' });
+  await alice.registerTopic({ project: 'p', topic: 'u', subject: 'U', holder: 'thr-bob' });
+  return { svc: sa.srv.service, alice, asBob };
+}
+
+const blockers = (svc) => svc.store.notices((n) => n.kind === 'blocker');
+
+test('supersede_key: a repeated blocker replaces the unpicked one; one message waits, one notice after the expiry', async (t) => {
+  const { svc, alice, asBob } = await supersedeSetup(t);
+  const m1 = await alice.send({ project: 'p', topic: 't', level: 'blocker', text: 'issue 25', supersede_key: 'k1' });
+  assert.equal(blockers(svc).length, 0, 'a keyed blocker has no notice at delivery');
+  assert.equal(svc.checkExpired(Date.now() + 6 * 60_000).length, 1, 'the first one expired unpicked');
+  assert.equal(blockers(svc).length, 1, 'the notice appears when it was not picked up');
+  const m2 = await alice.send({ project: 'p', topic: 't', level: 'blocker', text: 'issue 25 again', supersede_key: 'k1' });
+  const m3 = await alice.send({ project: 'p', topic: 't', level: 'blocker', text: 'issue 25 third', supersede_key: 'k1' });
+  const c = await asBob.count({ project: 'p', topic: 't' });
+  assert.deepEqual(c.ids, [m3.id], 'only the newest message waits');
+  assert.equal((await alice.message(m1.id)).outcome, 'expired');
+  assert.equal((await alice.message(m2.id)).outcome, 'superseded');
+  assert.equal(svc.store.message(m2.id).superseded_by, m3.id);
+  assert.equal(blockers(svc).length, 1, 'no further notice');
+  assert.equal(blockers(svc)[0].message_id, m3.id, 'the notice follows the newest message');
+  const got = await asBob.receive({ project: 'p', topic: 't' });
+  assert.deepEqual(got.messages.map((m) => m.text), ['issue 25 third']);
+});
+
+test('supersede_key: a picked message is not replaced and a picked blocker raises no notice', async (t) => {
+  const { svc, alice, asBob } = await supersedeSetup(t);
+  const m1 = await alice.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', supersede_key: 'k1' });
+  await asBob.receive({ project: 'p', topic: 't', ids: m1.id });
+  const m2 = await alice.send({ project: 'p', topic: 't', level: 'blocker', text: 'two', supersede_key: 'k1' });
+  assert.deepEqual((await asBob.count({ project: 'p', topic: 't' })).ids, [m1.id, m2.id]);
+  assert.ok(!svc.store.message(m1.id).outcome, 'the picked one is untouched');
+  svc.checkExpired(Date.now() + 6 * 60_000);
+  assert.equal(blockers(svc).length, 1, 'only the unpicked second one raised a notice');
+  assert.equal(blockers(svc)[0].message_id, m2.id);
+});
+
+test('supersede_key: other key, other topic or other sender is not replaced; without a key nothing changes', async (t) => {
+  const { alice, asBob } = await supersedeSetup(t);
+  const a = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'a', supersede_key: 'k1' });
+  const b = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'b', supersede_key: 'k2' });
+  const c = await alice.send({ project: 'p', topic: 'u', level: 'assist', text: 'c', supersede_key: 'k1' });
+  const d = await asBob.send({ project: 'p', topic: 't', level: 'assist', text: 'd', supersede_key: 'k1' });
+  const e = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'e' });
+  const f = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'f' });
+  assert.deepEqual((await asBob.count({ project: 'p', topic: 't' })).ids, [a.id, b.id, d.id, e.id, f.id]);
+  assert.deepEqual((await asBob.count({ project: 'p', topic: 'u' })).ids, [c.id]);
+});
+
+test('final reply is acked by its pickup; an interim reply waits for ack; a later ack is not an error', async (t) => {
+  const { alice, asBob } = await supersedeSetup(t);
+  const q1 = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'q1', thread_id: 'thr-alice' });
+  const q2 = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'q2', thread_id: 'thr-alice' });
+  const interim = await asBob.send({ reply_to: q1.id, reply_state: 'otázka', text: 'operator decides' });
+  const final = await asBob.send({ reply_to: q2.id, reply_state: 'hotovo', text: 'done' });
+  const got = await alice.receive({ thread: 'thr-alice' });
+  assert.equal(got.messages.length, 2);
+  const left = await alice.count({ thread: 'thr-alice' });
+  assert.deepEqual(left.ids, [interim.id], 'the final reply no longer waits, the interim one does');
+  const r = await alice.ack([final.id, interim.id]);
+  assert.deepEqual([r.acked, r.already], [[interim.id], [final.id]]);
+});

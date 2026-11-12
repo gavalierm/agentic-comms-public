@@ -260,7 +260,7 @@ export class Service {
   }
 
   deliver(sender, body) {
-    const { project = null, topic = null, persona = null, level: rawLevel = null, text, reply_to = null, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null, reply_state: rawState = null, wait_for = null, cancels = null } = body || {};
+    const { project = null, topic = null, persona = null, level: rawLevel = null, text, reply_to = null, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null, reply_state: rawState = null, wait_for = null, cancels = null, supersede_key = null } = body || {};
     // A reply carries a state; a client from before states sends none and means a final answer.
     if (!reply_to && present(rawState)) throw new HttpError(400, 'stav (reply_state) patrí iba odpovedi (reply_to)');
     if (reply_to && present(rawState) && !REPLY_STATES.includes(rawState)) throw new HttpError(400, `neznámy stav odpovede „${rawState}“; platné stavy: ${REPLY_STATES.join('|')}`);
@@ -282,6 +282,7 @@ export class Service {
       id: newId(), project: null, topic: null, persona: null, ref_project: null, ref_topic: null, to_thread: null,
       level, text, sender, thread_id, thread_machine: normalizeMachine(thread_machine), from_project, from_topic, reply_to,
       reply_state, wait_for: reply_to && present(wait_for) ? String(wait_for) : null, cancels: present(cancels) ? String(cancels) : null,
+      supersede_key: !reply_to && present(supersede_key) ? String(supersede_key).slice(0, 200) : null,
       created_at, state: 'pending', acked_at: null, notice_id: null,
       ttl_s: ttl_s || null, expires_at: ttl_s ? new Date(Date.parse(created_at) + ttl_s * 1000).toISOString() : null, expired_at: null, outcome: null,
     };
@@ -429,8 +430,33 @@ export class Service {
     return { id: msg.id, state: msg.state, notice_id: msg.notice_id, expires_at: msg.expires_at || null, ...(warning ? { warning } : {}) };
   }
 
+  /**
+   * `supersede_key` (audit 2.4: a cron sent the same blocker every 15 min, 26 messages for one issue): a new message of the same
+   * sender to the same address with the same key replaces the earlier one nobody picked up (also an expired one). The replaced one
+   * leaves the mailbox (`state: acked`, `outcome: superseded`, `superseded_by`); its open operator notice moves to the new message.
+   */
+  supersede(msg) {
+    const same = (m) => m.id !== msg.id && m.state === 'pending' && !m.picked_at && !m.reply_to && m.sender === msg.sender
+      && m.supersede_key === msg.supersede_key && m.project === msg.project && m.topic === msg.topic && (m.persona || null) === (msg.persona || null);
+    for (const old of this.store.messages(same)) {
+      const at = nowIso();
+      if (!outcomeOf(old)) old.outcome = 'superseded';
+      Object.assign(old, { superseded_by: msg.id, superseded_at: at, state: 'acked', acked_at: at });
+      this.store.saveMessage(old);
+      const notice = old.notice_id && !msg.notice_id ? this.store.notice(old.notice_id) : null;
+      if (notice && notice.state === 'open') {
+        notice.message_id = msg.id;
+        this.store.saveNotice(notice);
+        msg.notice_id = notice.id;
+        this.store.saveMessage(msg);
+      }
+      this.log(`superseded ${old.id} by ${msg.id} (key ${msg.supersede_key})`);
+    }
+  }
+
   /** Wake events and operator notices once a message is pending in a mailbox. */
   afterDelivery(msg, original = null) {
+    if (!original && msg.supersede_key) this.supersede(msg);
     // Events never carry the body (P-043); `text_hash` lets the wake module detect repeats.
     const base = {
       message_id: msg.id, level: msg.level, project: msg.project, topic: msg.topic,
@@ -460,9 +486,12 @@ export class Service {
     if (msg.level === 'blocker') {
       const t = this.store.topic(msg.project, msg.topic);
       this.emitEvent({ type: 'blocker', ...base, holder: t ? t.holder : null, holder_mode: t ? t.holder_mode || null : null, holder_machine: t ? t.holder_machine || null : null });
-      const notice = this.createNotice({ kind: 'blocker', title: `Blocker pre tému ${msg.project}/${msg.topic}`, message: msg });
-      msg.notice_id = notice.id;
-      this.store.saveMessage(msg);
+      // A keyed blocker (repeated by a script) raises its notice only when nobody picked it up: checkExpired.
+      if (!msg.supersede_key) {
+        const notice = this.createNotice({ kind: 'blocker', title: `Blocker pre tému ${msg.project}/${msg.topic}`, message: msg });
+        msg.notice_id = notice.id;
+        this.store.saveMessage(msg);
+      }
     }
   }
 
@@ -494,9 +523,11 @@ export class Service {
     const list = this.pending({ project, topic, thread, persona }, ids);
     const now = nowIso();
     for (const m of list) {
-      if (m.picked_at) continue;
-      m.picked_at = now;
-      this.store.saveMessage(m);
+      let changed = false;
+      if (!m.picked_at) { m.picked_at = now; changed = true; }
+      // A final reply needs no `ack`: reading it settles it (audit 2.4: 33 ack calls). An interim reply (otázka, čakám) still waits for ack.
+      if (m.reply_to && replyStateOf(m) === FINAL_REPLY_STATE && m.state === 'pending') { m.state = 'acked'; m.acked_at = now; changed = true; }
+      if (changed) this.store.saveMessage(m);
     }
     return list.map(publicMessage);
   }
@@ -605,6 +636,10 @@ export class Service {
       }
       m.expired_at = new Date(now).toISOString();
       m.outcome = 'expired';
+      // Keyed blocker nobody picked up: the operator notice appears now (one per chain, the replaced messages passed it on).
+      if (m.level === 'blocker' && m.supersede_key && m.state === 'pending' && !m.notice_id) {
+        m.notice_id = this.createNotice({ kind: 'blocker', title: `Blocker pre tému ${m.project}/${m.topic}`, message: m }).id;
+      }
       this.store.saveMessage(m);
       const ev = this.emitOutcome('expired', m);
       this.log(`expired ${m.id} (${m.level}) ${m.project}/${m.topic}${ev ? `, event ${ev.seq} → ${ev.holder}` : ', no way back (log only)'}`);

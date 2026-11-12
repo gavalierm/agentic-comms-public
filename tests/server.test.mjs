@@ -2,7 +2,16 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeInstance, startInstance, makeClient, rawRequest, cleanup, sleep, runCli } from './helpers.mjs';
+import { makeInstance, startInstance, makeClient, rawRequest, cleanup, sleep, runCli, tmpDir } from './helpers.mjs';
+import { startServer } from '../src/server/index.mjs';
+
+// Starts a service for the test; stopping it and removing its data is registered for the end of the test.
+async function serviceUp(t) {
+  const a = makeInstance('a');
+  const sa = await startInstance(a);
+  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  return { a, sa };
+}
 
 test('two instances on one machine do not see each other', async (t) => {
   const a = makeInstance('a');
@@ -30,9 +39,7 @@ test('two instances on one machine do not see each other', async (t) => {
 });
 
 test('health returns instance_id; client rejects a different instance', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
 
   const h = await makeClient(a).ensureRunning();
   assert.equal(h.ok, true);
@@ -60,28 +67,8 @@ test('sender is derived from the key, never from the body', async (t) => {
   assert.equal(file.sender, 'bob');
 });
 
-test('send without level is rejected (400) and nothing is stored', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
-  await makeClient(a).registerTopic({ project: 'p', topic: 't', subject: 'S' });
-
-  const res = await rawRequest(a.socket, 'POST', '/send', {
-    body: { project: 'p', topic: 't', text: 'no level' }, headers: { Authorization: `Bearer ${a.key}` },
-  });
-  assert.equal(res.status, 400);
-  assert.match(res.json.error, /level/);
-  const bad = await rawRequest(a.socket, 'POST', '/send', {
-    body: { project: 'p', topic: 't', level: 'urgent', text: 'x' }, headers: { Authorization: `Bearer ${a.key}` },
-  });
-  assert.equal(bad.status, 400);
-  assert.equal(fs.readdirSync(path.join(a.dir, 'messages')).length, 0);
-});
-
 test('message to an unregistered topic creates a notice and does not create the topic', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
 
   const r = await c.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'lost?' });
@@ -104,9 +91,7 @@ test('message to an unregistered topic creates a notice and does not create the 
 });
 
 test('register-topic is idempotent and requires a subject', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   const r1 = await c.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-1' });
   const r2 = await c.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-2', takeover: true });
@@ -161,30 +146,38 @@ test('reply goes to the sender thread; blocker/assist replies emit wake events',
   assert.equal(ev3.events.length, 0);
 });
 
+test('startServer refuses a directory without an instance', async (t) => {
+  const d = tmpDir('comms-empty-');
+  t.after(() => cleanup(d));
+  await assert.rejects(startServer({ dataDir: d }), /comms init/);
+});
+
 test('second server for the same instance reports ALREADY_RUNNING', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   await assert.rejects(startInstance(a), (e) => e.code === 'ALREADY_RUNNING');
 });
 
 // --- hotfix 0.2.1: deadlines (TTL), expired, message state, count ids, turns ---------
 
-test('send: ttl defaults per level (blocker/steer 5m, assist 30m), explicit --ttl shortens; 0, over the maximum, info and an unknown level are 400', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('send: ttl defaults per level (blocker/steer 5m, assist 30m), explicit --ttl shortens; 0, over the maximum and an unparsable ttl are 400', async (t) => {
+  const { a } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
   const exp = (r) => (Date.parse(r.expires_at) - Date.parse(JSON.parse(fs.readFileSync(path.join(a.dir, 'messages', `${r.id}.json`), 'utf8')).created_at)) / 1000;
+  const send = (level, text, extra = {}) => c.send({ project: 'p', topic: 't', level, text, ...extra });
 
-  const assist = await c.send({ project: 'p', topic: 't', level: 'assist', text: 'a' });
+  const assist = await send('assist', 'a');
   assert.equal(exp(assist), 30 * 60);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'b' })), 5 * 60);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'steer', text: 's' })), 5 * 60);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'assist', text: 'c', ttl: '90s' })), 90);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'd', ttl: 120 })), 120);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'steer', text: 'e', ttl: '1m' })), 60);
+  const accepted = [
+    ['blocker default', 'blocker', undefined, 5 * 60],
+    ['steer default', 'steer', undefined, 5 * 60],
+    ['assist ttl 90s', 'assist', '90s', 90],
+    ['blocker numeric ttl', 'blocker', 120, 120],
+    ['steer ttl 1m', 'steer', '1m', 60],
+    ['blocker at its maximum', 'blocker', '5m', 300],
+    ['assist at its maximum', 'assist', '30m', 1800],
+  ];
+  for (const [name, level, ttl, seconds] of accepted) assert.equal(exp(await send(level, name, ttl === undefined ? {} : { ttl })), seconds, name);
   assert.equal((await c.send({ project: 'p', topic: 't', level: 'assist', text: 'f', reply_to: null })).expires_at !== null, true);
   const stored = JSON.parse(fs.readFileSync(path.join(a.dir, 'messages', `${assist.id}.json`), 'utf8'));
   assert.deepEqual([stored.ttl_s, stored.expired_at ?? null, stored.picked_at ?? null], [30 * 60, null, null]);
@@ -194,16 +187,17 @@ test('send: ttl defaults per level (blocker/steer 5m, assist 30m), explicit --tt
   assert.equal(info.status, 400);
   assert.match(info.json.error, /zrušená/);
   assert.match(info.json.error, /assist/);
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'info', text: 'x' }), (e) => e.status === 400 && /assist/.test(e.message));
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'urgent', text: 'x' }), (e) => e.status === 400 && /blocker\|steer\|assist/.test(e.message));
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'assist', text: 'x', ttl: 'soon' }), (e) => e.status === 400);
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'assist', text: 'x', ttl: '0' }), (e) => e.status === 400 && /kladná/.test(e.message));
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'blocker', text: 'x', ttl: '10m' }), (e) => e.status === 400 && /maximum 5m/.test(e.message));
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'steer', text: 'x', ttl: '6m' }), (e) => e.status === 400);
-  await assert.rejects(c.send({ project: 'p', topic: 't', level: 'assist', text: 'x', ttl: '31m' }), (e) => e.status === 400);
+  const refused = [
+    ['unparsable ttl', 'assist', 'soon', null],
+    ['zero ttl', 'assist', '0', /kladná/],
+    ['blocker over 5m', 'blocker', '10m', /maximum 5m/],
+    ['steer over 5m', 'steer', '6m', null],
+    ['assist over 30m', 'assist', '31m', null],
+  ];
+  for (const [name, level, ttl, re] of refused) {
+    await assert.rejects(send(level, 'x', { ttl }), (e) => e.status === 400 && (re === null || re.test(e.message)), name);
+  }
   assert.equal(fs.readdirSync(path.join(a.dir, 'messages')).length, before);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'g', ttl: '5m' })), 300);
-  assert.equal(exp(await c.send({ project: 'p', topic: 't', level: 'assist', text: 'h', ttl: '30m' })), 1800);
 });
 
 test('ttl defaults come from instance.json (ttl.blocker / ttl.assist); 0 falls back to the default, over the maximum to the maximum', async (t) => {
@@ -228,9 +222,7 @@ test('ttl defaults come from instance.json (ttl.blocker / ttl.assist); 0 falls b
 });
 
 test('a held message expires like a pending one: the sender learns, the notice stays decidable (fable audit M2)', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a, { thread: 'thr-a' });
   const held = await c.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'q', ttl: '60s' });
   assert.equal(held.state, 'held');
@@ -306,9 +298,7 @@ test('expiry: no mail, no notice; outcome expired and one expired event for the 
 });
 
 test('bounce: outcome undelivered and one undelivered event for the sender; once; no mail, no notice; old comms mail never bounces', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a, { thread: 'thr-s', machine: 'box-s' });
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-gone' });
   const m = await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'x' });
@@ -361,9 +351,7 @@ test('deadlines survive a restart: the check runs at start and on the 30 s inter
 });
 
 test('count returns ids of pending messages in created_at order', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
   const ids = [];
@@ -373,9 +361,7 @@ test('count returns ids of pending messages in created_at order', async (t) => {
 });
 
 test('turns: POST /turn open|closed|attempt, GET /turns?open=1; turn-interrupted notice deduplicated per thread', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   const o1 = await c.turn({ thread: 'thr-1', state: 'open', machine: 'Box-A', project: 'p', topic: 't', holder_mode: 'auto' });
   assert.equal(o1.ok, true);
@@ -413,9 +399,7 @@ test('turns: POST /turn open|closed|attempt, GET /turns?open=1; turn-interrupted
 });
 
 test('turn: closed with opened_at closes only that turn (stale otherwise); open returns opened_at', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   const o1 = await c.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
   assert.ok(o1.turn.opened_at);
@@ -430,20 +414,8 @@ test('turn: closed with opened_at closes only that turn (stale otherwise); open 
   assert.equal((await c.turns(true)).turns.length, 0);
 });
 
-test('legacy no-reply notice (0.2.x data) stays decidable', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
-  const svc = sa.srv.service;
-  svc.store.saveNotice({ id: 'old-n', kind: 'no-reply', title: 'old', state: 'open', message_id: null, options: [{ id: 'ack', label: 'ok', needs_target: false }], created_at: '2026-01-01T00:00:00Z' });
-  const c = makeClient(a);
-  assert.equal((await c.decide({ notice_id: 'old-n', decision: 'ack' })).decision, 'ack');
-});
-
-test('register-topic 1a: a holder change needs takeover (409); same holder is idempotent; release clears only its own holder (CLI too)', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('register-topic: a holder change needs takeover (409); same holder is idempotent; release clears only its own holder (CLI too)', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   const base = { project: 'p', topic: 't', subject: 'S' };
   await c.registerTopic({ ...base, holder: 'thr-1', holder_machine: 'box-1' });
@@ -468,10 +440,8 @@ test('register-topic 1a: a holder change needs takeover (409); same holder is id
   assert.deepEqual([cr.code, cr.json.topic.holder], [0, null]);
 });
 
-test('register-topic 1b: fields not passed keep their stored values', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('register-topic: fields not passed keep their stored values', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'Old', holder: 'thr-1', holder_mode: 'auto', holder_machine: 'box-1', persona: 'bob', visibility: 'private' });
   // Re-registration with the same holder and only the holder: everything else stays.
@@ -483,10 +453,8 @@ test('register-topic 1b: fields not passed keep their stored values', async (t) 
   assert.deepEqual([t2.topic.holder, t2.topic.holder_mode, t2.topic.holder_machine, t2.topic.subject], ['thr-2', null, null, 'Old']);
 });
 
-test('2: "a"/"x__y" and "a__x"/"y" (same file name) do not share a record; the foreign topic is refused, not overwritten', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('register-topic: "a"/"x__y" and "a__x"/"y" (same file name) do not share a record; the foreign topic is refused, not overwritten', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'a', topic: 'x__y', subject: 'One' });
   assert.equal(a.store.topicFile('a', 'x__y'), a.store.topicFile('a__x', 'y'), 'the premise: both names map to one file');
@@ -499,10 +467,8 @@ test('2: "a"/"x__y" and "a__x"/"y" (same file name) do not share a record; the f
   assert.equal((await c.receive({ project: 'a', topic: 'x__y' })).messages.length, 0);
 });
 
-test('3: reply_to with persona/project/topic is 400; a self-reply without thread id is refused', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('send: reply_to with persona/project/topic is 400; a self-reply without thread id is refused', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   const bob = a.store.addKey('bob');
   const cBob = makeClient(a, { key: bob.key });
@@ -517,10 +483,8 @@ test('3: reply_to with persona/project/topic is 400; a self-reply without thread
   assert.equal(ok.state, 'pending');
 });
 
-test('4: ack with an unknown id is 404 naming it (nothing acked); already-acked ids are listed in `already`', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('ack: an unknown id is 404 naming it (nothing acked); already-acked ids are listed in `already`', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
   const m1 = await c.send({ project: 'p', topic: 't', level: 'assist', text: '1' });
@@ -535,9 +499,7 @@ test('4: ack with an unknown id is 404 naming it (nothing acked); already-acked 
 });
 
 test('`<persona>/main` without `@` goes to the main thread of the persona; without one it stays held (audit M5 2026-11-11)', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ persona: 'bob', main: true, holder: 'thr-m' });
   const r = await c.send({ project: 'bob', topic: 'main', level: 'assist', text: 'hi' });
@@ -547,9 +509,7 @@ test('`<persona>/main` without `@` goes to the main thread of the persona; witho
 });
 
 test('register-topic close bounces thread mail only when the closing thread holds no other topic (fable audit M3)', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ persona: 'p', main: true, holder: 'thr-m' });
   await c.registerTopic({ project: 'p', topic: 'work', subject: 'Work', holder: 'thr-m' });
@@ -562,9 +522,7 @@ test('register-topic close bounces thread mail only when the closing thread hold
 });
 
 test('register-topic close: a closed topic takes no mail (410), pending mail bounces to its senders, re-registration reopens (alice 2026-11-02)', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 'done', subject: 'Done', holder: 'thr-d' });
   await c.registerTopic({ project: 'p', topic: 'src', subject: 'Src', holder: 'thr-s' });

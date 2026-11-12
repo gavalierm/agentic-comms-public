@@ -6,7 +6,7 @@ import http from 'node:http';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, cleanup, sleep, killPid, tmpDir, runCli } from './helpers.mjs';
-import { startServer, probe } from '../src/server/index.mjs';
+import { probe } from '../src/server/index.mjs';
 import { socketPath } from '../src/common/paths.mjs';
 import { Client, resolveConfig } from '../src/client/index.mjs';
 
@@ -22,10 +22,16 @@ const tryJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
 // Servers used together with spawnSync must run in their own process: spawnSync blocks the event loop.
 const serverInfo = (dir) => { try { return tryJson(fs.readFileSync(path.join(dir, 'server.json'), 'utf8')); } catch { return null; } };
 
-test('client talks over socketPath and verifies instance_id', async (t) => {
+// Starts a service for the test; stopping it and removing its data is registered for the end of the test.
+async function serviceUp(t) {
   const a = makeInstance('a');
   const sa = await startInstance(a);
   t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  return { a, sa };
+}
+
+test('client talks over socketPath and verifies instance_id', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   assert.equal(c.cfg.socket, a.socket);
   assert.equal(c.cfg.url, null);
@@ -93,11 +99,6 @@ test('client starts the service on demand (CLI) and a second start is a no-op', 
   assert.equal(again.json.already_running, true);
   assert.equal(again.json.pid, pid);
 
-  // CLI send without --level is a usage error (exit 1), nothing sent.
-  const bad = cli(['send', '--data-dir', a.dir, '--key', a.key, '--project', 'p', '--topic', 't', '--text', 'x']);
-  assert.equal(bad.code, 1);
-  assert.match(bad.err, /level/);
-
   const stop = cli(['stop', '--data-dir', a.dir]);
   assert.equal(stop.json.stopped, true);
   await sleep(100);
@@ -144,12 +145,6 @@ test('config file supplies key, instance_id and outbox', async (t) => {
   fs.writeFileSync(cfgFile, JSON.stringify({ data_dir: a.dir, key: a.key, instance_id: 'other' }));
   const bad = cli(['health', '--config', cfgFile, '--no-start']);
   assert.equal(bad.code, 3);
-});
-
-test('startServer refuses a directory without an instance', async (t) => {
-  const d = tmpDir('comms-empty-');
-  t.after(() => cleanup(d));
-  await assert.rejects(startServer({ dataDir: d }), /comms init/);
 });
 
 test('queued closed turn: flushed by the next turn record, before the new open', async (t) => {
@@ -246,9 +241,7 @@ test('CLI send: info is refused with the valid levels; --ttl max 5m (blocker/ste
 });
 
 test('count keeps ids for an outage; an old service without ids gives none', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
   const m = await c.send({ project: 'p', topic: 't', level: 'assist', text: 'a' });
@@ -273,7 +266,7 @@ test('count keeps ids for an outage; an old service without ids gives none', asy
   assert.deepEqual([r.total, 'ids' in r], [2, false]);
 });
 
-test('5: a 2xx answer that is not JSON is an error (BAD_RESPONSE); the outbox item is kept', async (t) => {
+test('client: a 2xx answer that is not JSON is an error (BAD_RESPONSE); the outbox item is kept', async (t) => {
   const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>proxy page</html>'); });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   t.after(() => srv.close());
@@ -287,10 +280,8 @@ test('5: a 2xx answer that is not JSON is an error (BAD_RESPONSE); the outbox it
   assert.equal(fs.existsSync(file), true, 'the queued message is not deleted');
 });
 
-test('8: serve forwards --config/--machine to the wake child; --wake on a running service exits non-zero', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('CLI: serve forwards --config/--machine to the wake child; --wake on a running service exits non-zero', async (t) => {
+  const { a, sa } = await serviceUp(t);
   // A service is already running (in this process): --wake cannot start and says so.
   const busy = await runCli(['serve', '--data-dir', a.dir, '--wake']);
   assert.notEqual(busy.code, 0);
@@ -320,10 +311,8 @@ test('8: serve forwards --config/--machine to the wake child; --wake on a runnin
   assert.equal(await probe(socketPath(b.dir)), null, 'no service runs after the stop');
 });
 
-test('9: each call has its own timeout; a client created long ago still makes calls', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+test('client: each call has its own timeout; a client created long ago still makes calls', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a, { timeout: 100 });
   await sleep(250);
   assert.equal((await c.ensureRunning()).instance_id, a.instanceId);
@@ -334,7 +323,7 @@ test('9: each call has its own timeout; a client created long ago still makes ca
   assert.equal((await c.events(0, 0)).events.length, 0);
 });
 
-test('10: message with several --id, config set-notify without argument and key remove of an unknown sender are errors', async (t) => {
+test('CLI: message with several --id, config set-notify without argument and key remove of an unknown sender are errors', async (t) => {
   const a = makeInstance('a');
   t.after(() => cleanup(a.dir));
   const base = ['--data-dir', a.dir, '--key', a.key];

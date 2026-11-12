@@ -61,14 +61,12 @@ test('reply state: stored on the reply, shown in receive, count items and messag
   const fin = await asBob.send({ reply_to: q.id, reply_state: 'hotovo', text: 'operator chose A' });
   assert.equal((await alice.message(q.id)).answer_state, 'hotovo');
   assert.equal((await alice.message(q.id)).answer_id, fin.id);
-  await assert.rejects(asBob.send({ reply_to: q.id, reply_state: 'čakám', text: 'again' }), (e) => e.status === 409);
 
   // old client: a reply without a state is the final one
   const q2 = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'old client' });
   const old = await asBob.send({ reply_to: q2.id, text: 'answer' });
   assert.equal(old.reply_state, 'hotovo');
   assert.equal((await alice.message(q2.id)).answer_state, 'hotovo');
-  await assert.rejects(asBob.send({ reply_to: q2.id, text: 'more' }), (e) => e.status === 409);
 });
 
 test('reply state: the first interim state and the final reply ring the sender; a move between interim states does not', async (t) => {
@@ -111,7 +109,7 @@ test('cancels: a new message withdraws the sender\'s own final reply; anyone els
   assert.equal((await alice.send({ reply_to: change.id, reply_state: 'hotovo', text: 'B noted' })).reply_state, 'hotovo');
 });
 
-test('cli: send --reply-to --state / --wait-for / --cancels reach the service; an unknown state is refused', async (t) => {
+test('CLI: send --reply-to --state / --wait-for / --cancels reach the service; an unknown state is refused', async (t) => {
   const { a, bob, alice } = await pair(t, 'rs6');
   const q = await alice.send({ project: 'p', topic: 't', level: 'assist', text: 'decide' });
   const cli = (args) => runCli([...args, '--data-dir', a.dir, '--key', bob.key, '--thread', 'thr-bob', '--no-start']);

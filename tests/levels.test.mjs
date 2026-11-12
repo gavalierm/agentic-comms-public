@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeInstance, startInstance, makeClient, cleanup } from './helpers.mjs';
+import { makeInstance, startInstance, makeClient, rawRequest, cleanup } from './helpers.mjs';
 
 // Levels (operator 2026-11-02): blocker | steer | assist; a reply inherits the level of its original; the TTL is the
 // deadline for the PICKUP (the body is read), not for the answer; a read in time means no `no reply` bell.
@@ -39,8 +39,18 @@ test('reply inherits the level of its original; a lower explicit level is raised
   assert.equal(higher.level_raised_from, undefined);
 });
 
-test('send: level is required except for a reply; info and unknown levels are refused with the valid list', async (t) => {
-  const { alice, asBob } = await setupPair(t);
+test('send: level is required except for a reply; info and unknown levels are refused with the valid list; nothing is stored', async (t) => {
+  const { a, alice, asBob } = await setupPair(t);
+  const res = await rawRequest(a.socket, 'POST', '/send', {
+    body: { project: 'p', topic: 't', text: 'no level' }, headers: { Authorization: `Bearer ${a.key}` },
+  });
+  assert.equal(res.status, 400);
+  assert.match(res.json.error, /level/);
+  const bad = await rawRequest(a.socket, 'POST', '/send', {
+    body: { project: 'p', topic: 't', level: 'urgent', text: 'x' }, headers: { Authorization: `Bearer ${a.key}` },
+  });
+  assert.equal(bad.status, 400);
+  assert.equal(fs.readdirSync(path.join(a.dir, 'messages')).length, 0);
   await assert.rejects(alice.send({ project: 'p', topic: 't', text: 'x' }), (e) => e.status === 400 && /blocker\|steer\|assist/.test(e.message));
   await assert.rejects(alice.send({ project: 'p', topic: 't', level: 'info', text: 'x' }), (e) => e.status === 400 && /zrušená/.test(e.message) && /assist/.test(e.message));
   await assert.rejects(alice.send({ project: 'p', topic: 't', level: 'urgent', text: 'x' }), (e) => e.status === 400 && /platné úrovne: blocker\|steer\|assist/.test(e.message));

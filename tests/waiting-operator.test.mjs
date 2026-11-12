@@ -34,7 +34,7 @@ test('waiting_operator on the open turn: the unpicked message is answered `otáz
   assert.equal(ev[0].holder, 'thr-alice');
 });
 
-test('control: without the flag the same message expires; the flag ends with the turn (Stop or keepalive close)', async (t) => {
+test('without the flag the same message expires; the flag ends with the turn (Stop or keepalive close)', async (t) => {
   const { alice, bob, svc } = await setup(t);
   const m1 = await send(alice);
   assert.deepEqual(svc.checkExpired(Date.now() + 120_000), [m1.id]);

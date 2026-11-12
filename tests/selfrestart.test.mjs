@@ -1,4 +1,4 @@
-// Self-restart after deployment (0.2.2) and wake configuration from <dataDir>/wake.json.
+// Self-restart after deployment (0.2.2).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -6,7 +6,6 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { readRevision, selfRestartEnabled } from '../src/common/selfrestart.mjs';
-import { resolveWakeConfig } from '../src/wake/index.mjs';
 import { needsSupervisor } from '../src/wake/supervise.mjs';
 import { makeInstance, startInstance, tmpDir, cleanup, sleep } from './helpers.mjs';
 
@@ -142,23 +141,4 @@ test('wake run without a service manager: HEAD change restarts wake on the new r
   p.child.kill('SIGTERM');
   const r = await p.exited;
   assert.equal(r.code, 0, p.err);
-});
-
-test('resolveWakeConfig: wake.json from the data dir; env and --config take precedence', () => {
-  const inst = makeInstance('wakejson');
-  fs.writeFileSync(path.join(inst.dir, 'wake.json'), JSON.stringify({ limit_per_hour: 3, keepalive: { since_command: 'echo 0' }, self_restart: false }));
-  const c = resolveWakeConfig({ dataDir: inst.dir }, {});
-  assert.equal(c.limitPerHour, 3);
-  assert.equal(c.keepaliveSinceCommand, 'echo 0');
-  assert.equal(c.selfRestart, false);
-  assert.equal(c.wakeFile, path.join(inst.dir, 'wake.json'));
-  assert.equal(resolveWakeConfig({ dataDir: inst.dir }, { WAKE_LIMIT_PER_HOUR: '5' }).limitPerHour, 5);
-  assert.equal(resolveWakeConfig({ dataDir: inst.dir, limitPerHour: '7' }, {}).limitPerHour, 7);
-  const cfgFile = path.join(inst.dir, 'cfg.json');
-  fs.writeFileSync(cfgFile, JSON.stringify({ wake: { limit_per_hour: 9 } }));
-  const d = resolveWakeConfig({ dataDir: inst.dir, config: cfgFile }, {});
-  assert.equal(d.limitPerHour, 9);
-  assert.equal(d.keepaliveSinceCommand, null);
-  assert.equal(d.wakeFile, null);
-  cleanup(inst.dir);
 });

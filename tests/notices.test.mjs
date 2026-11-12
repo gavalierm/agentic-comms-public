@@ -4,10 +4,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeInstance, startInstance, makeClient, rawRequest, cleanup, sleep, tmpDir } from './helpers.mjs';
 
-test('blocker creates a notice; decide is executed by the service without a model', async (t) => {
+// Starts a service for the test; stopping it and removing its data is registered for the end of the test.
+async function serviceUp(t) {
   const a = makeInstance('a');
   const sa = await startInstance(a);
   t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  return { a, sa };
+}
+
+test('blocker creates a notice; decide is executed by the service without a model', async (t) => {
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
   const sent = await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'stuck' });
@@ -31,10 +37,16 @@ test('blocker creates a notice; decide is executed by the service without a mode
   await assert.rejects(c.decide({ notice_id: 'nope', decision: 'ack' }), (e) => e.status === 404);
 });
 
+test('legacy no-reply notice (0.2.x data) stays decidable', async (t) => {
+  const { a, sa } = await serviceUp(t);
+  const svc = sa.srv.service;
+  svc.store.saveNotice({ id: 'old-n', kind: 'no-reply', title: 'old', state: 'open', message_id: null, options: [{ id: 'ack', label: 'ok', needs_target: false }], created_at: '2026-01-01T00:00:00Z' });
+  const c = makeClient(a);
+  assert.equal((await c.decide({ notice_id: 'old-n', decision: 'ack' })).decision, 'ack');
+});
+
 test('decide redirect moves a held message to a registered topic; discard drops it', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 'real', subject: 'S' });
 
@@ -56,9 +68,7 @@ test('decide redirect moves a held message to a registered topic; discard drops 
 });
 
 test('HTML page lists notices with decision buttons and accepts form decisions', async (t) => {
-  const a = makeInstance('a');
-  const sa = await startInstance(a);
-  t.after(async () => { await sa.stop(); cleanup(a.dir); });
+  const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
   const sent = await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'Potrebujem <prístup>' });

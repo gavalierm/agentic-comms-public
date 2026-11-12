@@ -4,12 +4,14 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, cleanup, sleep, tmpDir } from './helpers.mjs';
 import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, wakeText, ringText, pairKey, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
+import { acquireWakeLock, readWakeLock, lockHeld, lockFile } from '../src/wake/lock.mjs';
 import { parseTimestamp, parseDuration } from '../src/common/util.mjs';
-import { createT3Adapter, parseCommand } from '../src/adapters/t3/index.mjs';
+import { createT3Adapter, parseCommand, platformCommand } from '../src/adapters/t3/index.mjs';
 
 const FAKE_T3 = fileURLToPath(new URL('./fixtures/fake-t3.mjs', import.meta.url));
 const WAKE_BIN = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url));
@@ -68,7 +70,8 @@ test('blocker rings the topic holder with the fixed template, never the body', a
   assert.equal(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).cursor, 1);
 });
 
-test('assist and steer wake the holder (bob 2026-11-02); a reply to any level wakes the sender thread', async (t) => {
+// bob 2026-11-02: assist and steer wake the holder too, not only blocker.
+test('assist and steer wake the holder; a reply to any level wakes the sender thread', async (t) => {
   const { inst, client, waker, adapter } = await setup(t);
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
   await client.registerTopic({ project: 'q', topic: 'u', subject: 'S2', holder: 'thr-q' });
@@ -152,7 +155,8 @@ test('the same message twice in a row stops waking; a different one resumes', as
   assert.equal(adapter.calls.length, 3);
 });
 
-test('holder mode operator: blocker rings the holder and creates the notice (bob 2026-11-02), reply wakes the sender', async (t) => {
+// bob 2026-11-02: operator mode still rings the holder, besides creating the notice.
+test('holder mode operator: blocker rings the holder and creates the notice, reply wakes the sender', async (t) => {
   const { inst, client, waker, adapter } = await setup(t, { holderMode: 'operator' });
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
   const b = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'need you', thread_id: 'thr-a' });
@@ -208,6 +212,25 @@ test('adapter t3 runs the configured command with <threadId> <text>; failure is 
   assert.deepEqual(createT3Adapter().command, ['t3', 'thread', 'send']);
 });
 
+// Windows fixes reported from another machine (comms-public #1, #2): the T3 CLI is a .cmd outside PATH, and a restart of
+// the scheduled task left a second wake running.
+test('platformCommand: argv unchanged off Windows; on win32 t3 resolves to t3.cmd and runs through cmd.exe, quoted', () => {
+  const argv = ['t3', 'thread', 'send', 'th-1', 'you have mail in topic app/fix'];
+  assert.deepEqual(platformCommand(argv, { platform: 'linux' }), { file: 't3', args: argv.slice(1), verbatim: false });
+  assert.deepEqual(platformCommand(argv, { platform: 'darwin' }).file, 't3');
+  const cli = 'C:\\Users\\u x\\.t3\\bin\\t3.cmd';
+  const env = { USERPROFILE: 'C:\\Users\\u x', ComSpec: 'C:\\Windows\\system32\\cmd.exe' };
+  const w = platformCommand(argv, { platform: 'win32', env, exists: (f) => f === cli });
+  assert.equal(w.file, 'C:\\Windows\\system32\\cmd.exe');
+  assert.equal(w.verbatim, true);
+  assert.deepEqual(w.args, ['/d', '/s', '/c', `""${cli}" "thread" "send" "th-1" "you have mail in topic app/fix""`]);
+  const viaEnv = platformCommand(argv, { platform: 'win32', env: { ...env, T3CODE_CLI_PATH: 'D:\\t3\\t3.cmd' }, exists: () => true });
+  assert.match(viaEnv.args[3], /^""D:\\t3\\t3\.cmd" /, 'T3CODE_CLI_PATH first');
+  assert.equal(platformCommand(['C:\\t3\\t3.exe', 'x'], { platform: 'win32', env, exists: () => true }).file, 'C:\\t3\\t3.exe', 'an .exe runs directly');
+  assert.equal(platformCommand(argv, { platform: 'win32', env, exists: () => false }).file, 't3', 'no CLI found: unchanged (the ring fails and is logged)');
+  assert.match(platformCommand([cli, 'send', '100%'], { platform: 'win32', env }).error, /cmd\.exe rozvinie/);
+});
+
 test('wake config: flags > env > config file > defaults', (t) => {
   const dir = tmpDir('comms-wakecfg-');
   t.after(() => cleanup(dir));
@@ -227,15 +250,35 @@ test('wake config: flags > env > config file > defaults', (t) => {
   assert.equal(c3.stateFile, path.join(dir, 'client', 'wake', 'wake-state.json'));
 });
 
+test('resolveWakeConfig: wake.json from the data dir; env and --config take precedence', () => {
+  const inst = makeInstance('wakejson');
+  fs.writeFileSync(path.join(inst.dir, 'wake.json'), JSON.stringify({ limit_per_hour: 3, keepalive: { since_command: 'echo 0' }, self_restart: false }));
+  const c = resolveWakeConfig({ dataDir: inst.dir }, {});
+  assert.equal(c.limitPerHour, 3);
+  assert.equal(c.keepaliveSinceCommand, 'echo 0');
+  assert.equal(c.selfRestart, false);
+  assert.equal(c.wakeFile, path.join(inst.dir, 'wake.json'));
+  assert.equal(resolveWakeConfig({ dataDir: inst.dir }, { WAKE_LIMIT_PER_HOUR: '5' }).limitPerHour, 5);
+  assert.equal(resolveWakeConfig({ dataDir: inst.dir, limitPerHour: '7' }, {}).limitPerHour, 7);
+  const cfgFile = path.join(inst.dir, 'cfg.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ wake: { limit_per_hour: 9 } }));
+  const d = resolveWakeConfig({ dataDir: inst.dir, config: cfgFile }, {});
+  assert.equal(d.limitPerHour, 9);
+  assert.equal(d.keepaliveSinceCommand, null);
+  assert.equal(d.wakeFile, null);
+  cleanup(inst.dir);
+});
+
 test('bin/wake.mjs run: rings through the command, survives a mail restart, stops on SIGTERM', async (t) => {
   const inst = makeInstance('wakeproc');
   const dir = tmpDir('comms-wakeproc-');
   const logFile = path.join(dir, 'calls.log');
   let srv = await startInstance(inst);
-  const child = spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', inst.dir, '--no-start', '--command', `${process.execPath} ${FAKE_T3}`,
+  const spawnWake = (extraEnv = {}) => spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', inst.dir, '--no-start', '--command', `${process.execPath} ${FAKE_T3}`,
     '--wait-ms', '300', '--reconnect-ms', '100', '--state-dir', dir], {
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_T3_LOG: logFile, COMMS_SELF_RESTART: '0' }, stdio: ['ignore', 'pipe', 'pipe'],
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_T3_LOG: logFile, COMMS_SELF_RESTART: '0', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const child = spawnWake();
   let out = '';
   let err = '';
   child.stdout.on('data', (d) => { out += d; });
@@ -269,10 +312,7 @@ test('bin/wake.mjs run: rings through the command, survives a mail restart, stop
 
   // A second run of the same instance waits for the first (comms-public#1: a restarted scheduled task) and takes over
   // when it ends.
-  const second = spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', inst.dir, '--no-start', '--command', `${process.execPath} ${FAKE_T3}`,
-    '--wait-ms', '300', '--reconnect-ms', '100', '--state-dir', dir], {
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_T3_LOG: logFile, COMMS_SELF_RESTART: '0', WAKE_LOCK_POLL_MS: '100' }, stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const second = spawnWake({ WAKE_LOCK_POLL_MS: '100' });
   let err2 = '';
   second.stderr.on('data', (d) => { err2 += d; });
   const exited2 = new Promise((r) => second.on('exit', (code) => r(code)));
@@ -287,6 +327,32 @@ test('bin/wake.mjs run: rings through the command, survives a mail restart, stop
   await waitFor(() => err2.includes('zámok budenia prevzatý'));
   second.kill('SIGTERM');
   assert.equal(await exited2, 0);
+});
+
+test('wake lock: a second run waits while the first holds a fresh lock; a dead holder is replaced; release frees it', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wake-lock-'));
+  try {
+    const a = await acquireWakeLock(dir, { heartbeatMs: 50 });
+    assert.equal(readWakeLock(dir).pid, process.pid);
+    a.release();
+    assert.equal(readWakeLock(dir), null);
+    // Another live process (the parent) holds it: a second run waits and logs once.
+    fs.writeFileSync(lockFile(dir), JSON.stringify({ pid: process.ppid, heartbeat_at: new Date().toISOString() }));
+    assert.equal(lockHeld(readWakeLock(dir)), true);
+    const logs = [];
+    const ac = new AbortController();
+    const waiting = acquireWakeLock(dir, { log: (m) => logs.push(m), signal: ac.signal, pollMs: 20 });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.match(logs.join('\n'), new RegExp(`už beží \\(pid ${process.ppid}\\)`));
+    ac.abort();
+    assert.equal(await waiting, null, 'aborted while waiting');
+    // A stale heartbeat (holder hung or pid reused) does not block.
+    fs.writeFileSync(lockFile(dir), JSON.stringify({ pid: process.ppid, heartbeat_at: '2020-01-01T00:00:00Z' }));
+    const b = await acquireWakeLock(dir, { pollMs: 20 });
+    assert.equal(readWakeLock(dir).pid, process.pid);
+    b.release();
+    assert.equal(readWakeLock(dir), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 // --- hotfix 0.2.1 / 0.3.0: expired deadline (`no reply <id>`) and keepalive ----------------
@@ -326,7 +392,8 @@ test('expired deadline: rings the sender with `no reply <id>`, never the recipie
   assert.ok(logs.some((l) => /skip 99 \(answered\)/.test(l)));
 });
 
-test('expired held message (unregistered topic) rings the sender with `no reply <id>`, not skipped as answered (audit M5 2026-11-11)', async (t) => {
+// Audit M5 2026-11-11.
+test('expired held message (unregistered topic) rings the sender with `no reply <id>`, not skipped as answered', async (t) => {
   const { client, waker, adapter, svc } = await setup(t);
   const m = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'lost?', ttl: '60s', thread_id: 'thr-a' });
   assert.equal(m.state, 'held');
@@ -361,7 +428,8 @@ test('one queued ring per open turn of a busy holder; a new turn may be rung aga
   assert.deepEqual(waker.state.queued, {});
 });
 
-test('idle holder: the same bell again before its turn opens is skipped; after the turn opened it rings (fable audit M1)', async (t) => {
+// Fable audit M1.
+test('idle holder: the same bell again before its turn opens is skipped; after the turn opened it rings', async (t) => {
   const { client, waker, adapter } = await setup(t, { idleDedupeMs: 120_000 });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
   await client.send({ project: 'p', topic: 't', level: 'assist', text: 'two', thread_id: 'thr-s2' });
@@ -381,6 +449,7 @@ async function kaSetup(t, extra = {}) {
   const adapter = keepaliveAdapter();
   const t3 = { since: null };
   const ctx = await setup(t, { adapter, machine: 'm1', keepaliveSince: async () => t3.since, ...extra });
+  t3.restart = async () => { await sleep(5); t3.since = Date.now(); };
   return { ...ctx, t3 };
 }
 
@@ -392,8 +461,7 @@ test('keepalive: interrupted turn is rung once and closed; the next turn (after 
   await client.turn({ thread: 'thr-done', state: 'open', machine: 'm1' });
   await client.turn({ thread: 'thr-done', state: 'closed' });
   adapter.running['thr-run'] = true;
-  await sleep(5);
-  t3.since = Date.now(); // T3 restarted after these turns opened
+  await t3.restart(); // T3 restarted after these turns opened
 
   const r1 = await waker.keepaliveOnce();
   assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: KEEPALIVE_TEMPLATE }]);
@@ -417,8 +485,7 @@ test('keepalive: interrupted turn is rung once and closed; the next turn (after 
 test('keepalive: operator mode only creates a turn-interrupted notice and closes the turn', async (t) => {
   const { client, waker, adapter, t3 } = await kaSetup(t);
   await client.turn({ thread: 'thr-op', state: 'open', machine: 'm1', project: 'p', topic: 't', holder_mode: 'operator' });
-  await sleep(5);
-  t3.since = Date.now();
+  await t3.restart();
   const r = await waker.keepaliveOnce();
   assert.deepEqual(r.map((x) => [x.action, x.reason]), [['notified', 'operator-mode']]);
   assert.equal(adapter.calls.length, 0);
@@ -433,8 +500,7 @@ test('keepalive: at most 3 attempts per hour, ≥ 60 s apart; after the 3rd fail
   const { client, waker, adapter, t3, clock } = await kaSetup(t);
   adapter.ok = false;
   await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', project: 'p', topic: 't' });
-  await sleep(5);
-  t3.since = Date.now();
+  await t3.restart();
   const step = async () => (await waker.keepaliveOnce()).find((x) => x.thread === 'thr-1');
   assert.deepEqual([(await step()).action, adapter.calls.length], ['rang', 1]);
   clock.t += 30_000;
@@ -450,15 +516,13 @@ test('keepalive: at most 3 attempts per hour, ≥ 60 s apart; after the 3rd fail
 
   // Within the same hour a new interrupted turn of the same thread is not rung again.
   await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
-  await sleep(5);
-  t3.since = Date.now();
+  await t3.restart();
   clock.t += 10 * 60_000;
   assert.deepEqual([(await step()).reason, adapter.calls.length], ['limit', 3]);
   assert.equal((await client.notices()).notices.filter((n) => n.kind === 'turn-interrupted').length, 1, 'deduplicated per thread');
   // After an hour the window is free again.
   await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
-  await sleep(5);
-  t3.since = Date.now();
+  await t3.restart();
   clock.t += 61 * 60_000;
   adapter.ok = true;
   assert.deepEqual([(await step()).action, adapter.calls.length], ['rang', 4]);
@@ -516,8 +580,7 @@ test('T3 start time parsing (ISO, epoch, @epoch, systemctl) and since_command; a
 test('run(): the keepalive loop runs next to the long-poll and stops with the signal', async (t) => {
   const { client, waker, adapter, t3 } = await kaSetup(t, { keepaliveIntervalMs: 50, waitMs: 100 });
   await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
-  await sleep(5);
-  t3.since = Date.now();
+  await t3.restart();
   const ac = new AbortController();
   const running = waker.run({ signal: ac.signal });
   await waitFor(() => adapter.calls.length >= 1);
@@ -578,26 +641,23 @@ test('turn records accept T3 thread ids (mcp:<uuid>) and keepalive rings them', 
   const r = await client.turn({ thread, state: 'open', machine: 'm1' });
   assert.equal(r.ok, true);
   assert.equal((await client.turns(true)).turns.map((x) => x.thread).join(), thread);
-  await sleep(5);
-  t3.since = Date.now();
+  await t3.restart();
   const out = await waker.keepaliveOnce();
   assert.deepEqual(out.map((x) => x.action), ['rang']);
   assert.equal(adapter.calls[0].holder, thread);
   await assert.rejects(client.turn({ thread: '../x', state: 'open' }), /thread/);
 });
 
-test('6: t3 status: exit 0 JSON without a thread object is an unknown state (ok:false), never running:false', async () => {
+// The ok:true running/completed shapes and `not json` are asserted in the T3 start time / adapter status test.
+test('t3 status: exit 0 JSON without a thread object is an unknown state (ok:false), never running:false', async () => {
   const status = (script) => createT3Adapter({ statusCommand: [process.execPath, '-e', script] }).status('thr-1');
   const noThread = await status('console.log(JSON.stringify({ id: "x" }))');
   assert.equal(noThread.ok, false);
   assert.notEqual(noThread.running, false);
   assert.equal((await status('console.log(JSON.stringify({ thread: "x" }))')).ok, false, 'thread must be an object');
-  assert.equal((await status('console.log("not json")')).ok, false);
-  assert.deepEqual(await status('console.log(JSON.stringify({ thread: { status: "running", activeRunId: "r1" } }))'), { ok: true, running: true, status: 'running' });
-  assert.deepEqual(await status('console.log(JSON.stringify({ thread: { status: "completed", activeRunId: null } }))'), { ok: true, running: false, status: 'completed' });
 });
 
-test('7: closing a keepalive turn closes only that turn; a newer open turn of the same thread stays open', async (t) => {
+test('keepalive: closing a turn closes only that turn; a newer open turn of the same thread stays open', async (t) => {
   const { client, waker } = await setup(t);
   const old = (await client.turn({ thread: 'thr-k', state: 'open', machine: 'm1' })).turn;
   await sleep(5);
@@ -608,7 +668,8 @@ test('7: closing a keepalive turn closes only that turn; a newer open turn of th
   assert.deepEqual(open.map((x) => x.opened_at), [fresh.opened_at], 'the current turn is not closed by a close of the old one');
 });
 
-test('bob 2026-11-02 scenario: blocker into an operator-mode topic rings the holder; assist to a main thread held by an archived thread bounces to the sender at once', async (t) => {
+// bob 2026-11-02 scenario.
+test('operator-mode topic: blocker rings the holder; assist to a main thread held by an archived thread bounces to the sender at once', async (t) => {
   const adapter = fakeAdapter();
   adapter.ring = async (holder, text) => {
     adapter.calls.push({ holder, text });
@@ -671,7 +732,8 @@ test('continuation: a closed turn with a next step is rung once after the delay;
   assert.equal(adapter.calls.length, 2);
 });
 
-test('timer (P-061): a turn closed with resume_at is rung at that time, also with the same step again', async (t) => {
+// P-061.
+test('timer: a turn closed with resume_at is rung at that time, also with the same step again', async (t) => {
   const { client, waker, adapter, clock } = await kaSetup(t);
   const at = new Date(Date.now() + 10 * 60_000).toISOString();
   await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', project: 'p', topic: 't' });

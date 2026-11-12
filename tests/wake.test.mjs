@@ -768,3 +768,45 @@ test('expired event with answer `otázka` by code (recipient waits for the opera
   assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the bell stays; the hook reads the state `otázka` from `message`');
 });
+
+// D-0015, D-0022: no steer/assist ring into an open discussion with the operator; a blocker passes; the held ring goes
+// out when the discussion closes.
+test('discussion with the operator: steer and assist are held, a blocker rings; the held mail rings when it closes', async (t) => {
+  const { client, waker, adapter } = await setup(t);
+  const o = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', thread_id: 'thr-s' });
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 2);
+  assert.deepEqual(adapter.calls, [], 'no ring into the discussion');
+  assert.equal(Object.keys(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).held).length, 2, 'held, persisted');
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'urgent', thread_id: 'thr-s3' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }], 'a blocker passes');
+  adapter.calls.length = 0;
+  // The turn ends with a question to the operator: the discussion stays open, nothing rings.
+  await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o.turn.opened_at, discussion: 'open' });
+  assert.equal(await waker.pollOnce(100), 0);
+  assert.deepEqual(adapter.calls, []);
+  // The operator answers; that turn ends with hotovo: the discussion closes and the held mail rings.
+  const o2 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
+  await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o2.turn.opened_at, discussion: 'closed' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }, { holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }]);
+  assert.deepEqual(waker.state.held, {});
+});
+
+test('held ring: dropped when picked up meanwhile; released by the next poll without a `discussion-closed` event', async (t) => {
+  const { inst, client, waker, adapter } = await setup(t);
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });
+  const o = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
+  const picked = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'read me', thread_id: 'thr-s' });
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'later', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 2);
+  await bob.receive({ project: 'p', topic: 't', ids: picked.id });
+  await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o.turn.opened_at, discussion: 'closed' });
+  // the event is missed (older service): the poll after it still releases the held ring
+  waker.state.cursor = (await client.events('latest', 0)).next;
+  assert.equal(await waker.pollOnce(100), 0);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }], 'only the message not picked up rings');
+  assert.deepEqual(waker.state.held, {});
+});

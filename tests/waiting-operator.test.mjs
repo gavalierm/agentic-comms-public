@@ -95,3 +95,61 @@ test('an answer left `otázka` for 24 h: exactly one operator notice with a dedu
   assert.equal((await alice.message(q.id)).answer_id, done.id);
   assert.deepEqual(svc.checkOpenQuestions(Date.now() + 3 * QUESTION_NOTICE_MS), [], 'final reply: no notice');
 });
+
+// D-0015, D-0022: while the recipient discusses with the operator (turn `discussion`), a steer/assist it cannot pick up
+// is answered `otázka` by code, as in the dialog; a blocker passes the discussion and expires as before.
+test('discussion with the operator: an unpicked steer/assist is answered `otázka` by code, a blocker expires', async (t) => {
+  const { alice, bob, svc } = await setup(t);
+  const o = await bob.turn({ thread: 'thr-bob', state: 'open', discussion: 'open' });
+  assert.equal(o.turn.discussion, true);
+  const steer = await alice.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', ttl: '60s' });
+  const assist = await send(alice);
+  const blocker = await alice.send({ project: 'p', topic: 't', level: 'blocker', text: 'now', ttl: '60s' });
+  assert.deepEqual(svc.checkExpired(Date.now() + 120_000), [blocker.id], 'only the blocker expires');
+  for (const m of [steer, assist]) {
+    const st = await alice.message(m.id);
+    assert.deepEqual([st.outcome, st.answer_state, st.answer_origin], [null, 'otázka', 'code'], m.level);
+  }
+  const ev = (await alice.events(0, 0)).events.filter((e) => e.type === 'expired');
+  assert.deepEqual(ev.map((e) => [e.message_id, e.answer_state || null]), [[steer.id, 'otázka'], [assist.id, 'otázka'], [blocker.id, null]]);
+
+  // The turn ends with a question to the operator: the discussion stays open over the closed turn.
+  const c = await bob.turn({ thread: 'thr-bob', state: 'closed', opened_at: o.turn.opened_at, discussion: 'open' });
+  assert.equal(c.turn.discussion, true);
+  const m2 = await send(alice);
+  assert.deepEqual(svc.checkExpired(Date.now() + 120_000), []);
+  assert.equal((await alice.message(m2.id)).answer_state, 'otázka');
+  // A turn without the field (older workflow) does not discuss: the message expires as before.
+  await bob.turn({ thread: 'thr-bob', state: 'open' });
+  const m3 = await send(alice);
+  assert.deepEqual(svc.checkExpired(Date.now() + 120_000), [m3.id]);
+  await assert.rejects(bob.turn({ thread: 'thr-bob', state: 'open', discussion: 'maybe' }), /discussion/);
+});
+
+test('discussion end emits one `discussion-closed` event; a keepalive close keeps the discussion; CLI --discussion', async (t) => {
+  const { a, alice, bob, svc } = await setup(t);
+  const closedEvents = async () => (await alice.events(0, 0)).events.filter((e) => e.type === 'discussion-closed');
+  const base = ['--data-dir', a.dir, '--key', a.key, '--thread', 'thr-bob', '--no-start'];
+  const open = await runCli(['turn', '--state', 'open', '--discussion', 'open', ...base]);
+  assert.equal(open.code, 0, open.err);
+  assert.equal(svc.store.turn('thr-bob').discussion, true);
+  const openedAt = svc.store.turn('thr-bob').opened_at;
+  // interrupted turn: the wake module's close keeps the discussion, no event
+  await bob.turn({ thread: 'thr-bob', state: 'closed', reason: 'keepalive', opened_at: openedAt });
+  assert.equal(svc.store.turn('thr-bob').discussion, true);
+  assert.equal((await closedEvents()).length, 0);
+  // the turn ends with hotovo: the discussion is closed, one event for the holder
+  const o2 = await bob.turn({ thread: 'thr-bob', state: 'open', discussion: 'open' });
+  const close = await runCli(['turn', '--state', 'closed', '--opened-at', o2.turn.opened_at, '--discussion', 'closed', ...base]);
+  assert.equal(close.code, 0, close.err);
+  assert.equal(svc.store.turn('thr-bob').discussion, false);
+  const ev = await closedEvents();
+  assert.equal(ev.length, 1);
+  assert.deepEqual([ev[0].holder, ev[0].project], ['thr-bob', null]);
+  // the dialog alone (older workflow): its end closes the discussion too
+  const o3 = await bob.turn({ thread: 'thr-bob', state: 'open' });
+  await bob.turn({ thread: 'thr-bob', waiting_operator: true, opened_at: o3.turn.opened_at });
+  await bob.turn({ thread: 'thr-bob', waiting_operator: false, opened_at: o3.turn.opened_at });
+  assert.equal((await closedEvents()).length, 2);
+  assert.notEqual((await runCli(['turn', '--state', 'open', '--discussion', 'maybe', ...base])).code, 0);
+});

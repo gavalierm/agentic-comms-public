@@ -45,8 +45,11 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
   count --project <p> --topic <t> | --persona <meno> | --thread <id>  počet a ids čakajúcich správ (vždy živo; po výpadku nový pokus najskôr po 60 s)
   message --id <id>                               stav správy bez tela (state, to, outcome, replied, expires_at, ttl_s, undelivered_*)
   turn --state open|closed [--thread <id>] [--machine <stroj>] [--project <p> --topic <t>] [--holder-mode operator|auto]
-       [--opened-at <iso>] [--next <krok>]        záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;
+       [--opened-at <iso>] [--next <krok>] [--discussion open|closed]
+                                                  záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;
                                                   closed s --next: ďalší krok z handoveru, budenie vlákno zobudí na pokračovanie;
+                                                  --discussion open: vlákno diskutuje s operátorom (D-0015), budenie steer/assist
+                                                  pozdrží do zatvorenia diskusie, po lehote odosielateľ dostane „otázka“; blocker prejde;
                                                   pri výpadku { ok:false, unavailable:true[, queued:true] }, kód 0 (closed ide do outboxu)
   turn --waiting-operator true|false [--thread <id>] [--opened-at <iso>]
                                                   príznak otvoreného ťahu: vlákno čaká na dialóg operátora (P-061); pošta správu preň po lehote
@@ -69,7 +72,7 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
   'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
-  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator']);
+  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator', 'discussion']);
 const BOOL_FLAGS = new Set(['no-start', 'all', 'ack', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close']);
 
 export function parseArgs(argv) {
@@ -261,6 +264,7 @@ async function run(cmd, args, cfg, io) {
       if (args.state == null && args.waitingOperator != null) {
         if (!['true', 'false'].includes(args.waitingOperator)) throw new CommsError('USAGE', '--waiting-operator je true alebo false');
       } else need('state');
+      if (args.discussion != null && !['open', 'closed'].includes(args.discussion)) throw new CommsError('USAGE', '--discussion je open alebo closed');
       const thread = args.thread || cfg.threadId;
       if (!thread) throw new CommsError('USAGE', 'chýba voľba --thread (alebo COMMS_THREAD_ID / T3CODE_THREAD_ID)');
       // Short deadline; on outage only `closed` is queued (the service drops it when `opened_at` no longer matches).
@@ -268,6 +272,7 @@ async function run(cmd, args, cfg, io) {
       return quick.turn({
         thread, ...(args.state != null ? { state: args.state } : {}), machine: cfg.machine || null, project: args.project || null, topic: args.topic || null,
         holder_mode: args.holderMode || null, ...(args.waitingOperator != null ? { waiting_operator: args.waitingOperator === 'true' } : {}), ...(args.openedAt ? { opened_at: args.openedAt } : {}), ...(args.next ? { next: args.next } : {}), ...(args.resumeAt ? { resume_at: args.resumeAt } : {}),
+        ...(args.discussion != null ? { discussion: args.discussion } : {}),
       });
     }
     case 'receive': {

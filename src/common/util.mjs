@@ -34,6 +34,19 @@ export function nowIso() {
   return new Date().toISOString();
 }
 
+/** Levels the recipient's open discussion with the operator holds back (D-0015, D-0022); a blocker passes. */
+export const DISCUSSION_HELD_LEVELS = ['steer', 'assist'];
+/**
+ * The thread of a turn record discusses with the operator (D-0015): its open turn says so (`discussion`, set by the
+ * workflow hook) or waits for the operator's dialog (`waiting_operator`), or its last turn ended with a question to the
+ * operator (closed with `discussion`). A record without the field (older workflow) discusses only in the dialog.
+ */
+export function discussionOpen(turn) {
+  if (!turn) return false;
+  if (turn.state === 'open') return !!(turn.discussion || turn.waiting_operator);
+  return turn.state === 'closed' && !!turn.discussion;
+}
+
 /**
  * Time-sortable id: 20261101T001234567Z-00a1b2c3. Ids created in the same
  * millisecond by one process stay in creation order (monotonic counter).

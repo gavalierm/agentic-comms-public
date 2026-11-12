@@ -16,10 +16,13 @@
 // before the last T3 start whose thread no longer runs are rung with
 // KEEPALIVE_TEMPLATE (at most 3 attempts per hour per thread, ≥ 60 s apart) or, in
 // operator mode / after the 3rd failure, reported as `turn-interrupted`.
+// Discussion (D-0015, D-0022): a steer/assist to a holder that discusses with the operator (turn record, `discussionOpen`)
+// is held (wake-state `held`) and rung when the discussion ends (event `discussion-closed`, else the next poll); a
+// blocker passes.
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { readJson, writeJson, nowIso, normalizeMachine, parseTimestamp } from '../common/util.mjs';
+import { readJson, writeJson, nowIso, normalizeMachine, parseTimestamp, discussionOpen, DISCUSSION_HELD_LEVELS } from '../common/util.mjs';
 import { resolveConfig, Client } from '../client/index.mjs';
 import { Store } from '../server/store.mjs';
 import { selfRestartEnabled } from '../common/selfrestart.mjs';
@@ -33,6 +36,11 @@ export const UNDELIVERED_TEMPLATE = 'undelivered';
 /** Event types the module rings; only `blocker`/`steer`/`assist`/`reply` bounce on a permanent failure. */
 export const WAKE_TYPES = ['blocker', 'steer', 'assist', 'reply', 'expired', 'undelivered'];
 const BOUNCE_TYPES = ['blocker', 'steer', 'assist', 'reply'];
+/** The service's event when a thread's discussion with the operator ends: the held rings of that holder go out. */
+export const DISCUSSION_CLOSED = 'discussion-closed';
+/** Held rings at most this long and this many (the message itself waits in the mailbox anyway). */
+const HELD_MAX_MS = 24 * 60 * 60 * 1000;
+const HELD_MAX = 200;
 /** Fixed keepalive template (policy `prompt.keepalive_template` in the workflow). */
 export const KEEPALIVE_TEMPLATE = 'turn interrupted, continue from handover';
 /** Continuation (P-026): a turn closed with a next step left in the handover is rung once per step. */
@@ -98,11 +106,14 @@ export class WakeState {
     this.queued = d.queued || {};
     // holder → { at, text }: the last ring of a thread without an open turn (its turn opens seconds later).
     this.idle = d.idle || {};
+    // message id → event of a steer/assist held while its holder discusses with the operator (D-0015).
+    this.held = d.held || {};
     this.updated_at = d.updated_at || null;
   }
 
   prune(now) {
     for (const [k, v] of Object.entries(this.idle)) if (!v || now - v.at >= HOUR) delete this.idle[k];
+    for (const [k, v] of Object.entries(this.held)) if (!v || !(now - Date.parse(v.held_at) < HELD_MAX_MS)) delete this.held[k];
     for (const map of [this.rings, this.keepalive]) {
       for (const [k, list] of Object.entries(map)) {
         const kept = list.filter((t) => now - t < HOUR);
@@ -119,7 +130,7 @@ export class WakeState {
 
   save() {
     this.updated_at = nowIso();
-    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, idle: this.idle, updated_at: this.updated_at });
+    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, idle: this.idle, held: this.held, updated_at: this.updated_at });
   }
 }
 
@@ -148,6 +159,11 @@ export class Waker {
   async handle(ev) {
     this.stats.seen += 1;
     const skip = (reason) => { this.stats.skipped += 1; this.log(`skip ${ev.seq} (${reason}) ${ev.type} ${topicLabel(ev)}`); return { action: 'skipped', reason }; };
+    if (ev.type === DISCUSSION_CLOSED) {
+      if (!ev.holder) return skip('no-holder');
+      if (ev.holder_machine && this.opts.machine && normalizeMachine(ev.holder_machine) !== normalizeMachine(this.opts.machine)) return skip('other-machine');
+      return { action: 'released', count: await this.releaseHeld(String(ev.holder)) };
+    }
     if (!WAKE_TYPES.includes(ev.type)) return skip('unknown-type');
     if (!ev.holder) return skip('no-holder');
     // Every wake module sees every event; only the one on the holder's machine rings (P-043).
@@ -187,6 +203,12 @@ export class Waker {
       turnsKnown = true;
     } catch (e) {
       this.log(`turns: ${e.message}; bez kontroly zaradeného zvončeka`);
+    }
+    // The holder discusses with the operator (D-0015, D-0022): a steer/assist waits for the end of the discussion; a
+    // blocker passes. Without known turn records it rings, as before.
+    if (turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record)) {
+      this.hold(ev, now);
+      return skip('discussion');
     }
     if (openTurn && this.state.queued[String(ev.holder)] === openTurn.opened_at) {
       this.state.save();
@@ -255,6 +277,54 @@ export class Waker {
       }
     }
     return { action: 'rang', ok: !!(result && result.ok), holder: String(ev.holder), text, result };
+  }
+
+  /** Keep a steer/assist event until its holder's discussion ends (newest HELD_MAX). */
+  hold(ev, now = this.now()) {
+    const key = ev.message_id || `seq:${ev.seq}`;
+    this.state.held[key] = { ...ev, held_at: new Date(now).toISOString() };
+    const keys = Object.keys(this.state.held);
+    for (const k of keys.slice(0, Math.max(0, keys.length - HELD_MAX))) delete this.state.held[k];
+    this.state.save();
+  }
+
+  /**
+   * Ring the held steer/assist events (of one holder, else all) whose holder no longer discusses with the operator.
+   * A message picked up, answered or gone meanwhile is dropped without a ring. Returns the number rung.
+   */
+  async releaseHeld(holder = null) {
+    this.state.prune(this.now());
+    const entries = Object.entries(this.state.held).filter(([, ev]) => !holder || String(ev.holder) === holder);
+    if (!entries.length) return 0;
+    let turns;
+    try {
+      ({ turns } = await this.client.turns(false));
+    } catch (e) {
+      this.log(`turns: ${e.message}; pozdržané správy čakajú`);
+      return 0;
+    }
+    let released = 0;
+    for (const [key, ev] of entries) {
+      if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) continue;
+      delete this.state.held[key];
+      this.state.save();
+      if (ev.message_id) {
+        try {
+          const st = await this.client.message(ev.message_id);
+          const answered = st.replied && st.answer_origin !== 'code';
+          if (st.state !== 'pending' || st.picked_at || answered || st.outcome === 'undelivered') {
+            this.log(`held ${ev.message_id}: ${st.state}${st.picked_at ? ', prevzatá' : ''}${answered ? ', zodpovedaná' : ''}; nezvoní sa`);
+            continue;
+          }
+        } catch (e) {
+          this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
+        }
+      }
+      this.log(`release ${ev.message_id || key} → ${ev.holder}: diskusia s operátorom skončila`);
+      released += 1;
+      await this.handle({ ...ev, created_at: new Date(this.now()).toISOString(), released: true });
+    }
+    return released;
   }
 
   async notifyLimit(ev, limit) {
@@ -453,6 +523,10 @@ export class Waker {
       await this.handle(ev);
       this.state.cursor = ev.seq;
       this.state.save();
+    }
+    // Held rings whose discussion ended without a `discussion-closed` event (older service, missed event).
+    if (Object.keys(this.state.held).length) {
+      try { await this.releaseHeld(); } catch (e) { this.log(`release: ${e.message}`); }
     }
     return r.events.length;
   }

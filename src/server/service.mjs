@@ -2,7 +2,7 @@
 // register-topic / wake events / message deadlines (TTL) / turns (keepalive).
 // Independent of HTTP.
 import { EventEmitter } from 'node:events';
-import { LEVELS, REPLY_STATES, FINAL_REPLY_STATE, LEVEL_REMOVED_TEXT, DEFAULT_TTL, MAX_TTL, isValidName, isValidThread, newId, nowIso, textHash, HttpError, PERSONA_MAIN_TOPIC, personaProject, normalizeMachine, parseDuration } from '../common/util.mjs';
+import { LEVELS, REPLY_STATES, FINAL_REPLY_STATE, LEVEL_REMOVED_TEXT, DEFAULT_TTL, MAX_TTL, isValidName, isValidThread, newId, nowIso, textHash, HttpError, PERSONA_MAIN_TOPIC, personaProject, normalizeMachine, parseDuration, discussionOpen, DISCUSSION_HELD_LEVELS } from '../common/util.mjs';
 import { notifyOperator } from '../notify/index.mjs';
 
 export const NOTICE_OPTIONS = {
@@ -70,6 +70,14 @@ export function resumeAt(value, now = new Date().toISOString()) {
   if (!Number.isFinite(t)) throw new HttpError(400, 'resume_at musí byť čas ISO 8601');
   const base = Date.parse(now);
   return new Date(Math.min(Math.max(t, base), base + MAX_RESUME_MS)).toISOString();
+}
+
+/** Discussion with the operator of a turn (D-0015): open|closed (or a boolean); absent → undefined. */
+export function discussionFlag(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (value === true || value === 'open' || value === 'true') return true;
+  if (value === false || value === 'closed' || value === 'false') return false;
+  throw new HttpError(400, 'diskusia ťahu (discussion) musí byť open|closed');
 }
 
 export class Service {
@@ -655,11 +663,16 @@ export class Service {
     return t && t.holder ? t.holder : null;
   }
 
-  /** The recipient's turn is open and waits for the operator's dialog (flag `waiting_operator` of the turn record). */
+  /**
+   * The recipient's turn is open and waits for the operator's dialog (flag `waiting_operator` of the turn record), or the
+   * recipient discusses with the operator and the message is a steer/assist it holds back (D-0015, D-0022); a blocker
+   * passes the discussion, so its expiry stays `no reply`.
+   */
   recipientWaitsForOperator(m) {
     const thread = this.recipientThread(m);
     const turn = thread ? this.store.turn(thread) : null;
-    return !!(turn && turn.state === 'open' && turn.waiting_operator);
+    if (turn && turn.state === 'open' && turn.waiting_operator) return true;
+    return DISCUSSION_HELD_LEVELS.includes(levelOf(m)) && discussionOpen(turn);
   }
 
   /**
@@ -718,10 +731,11 @@ export class Service {
    * of an older turn leaves the current record as it is (`stale: true`). `next` (closed only): the next step left in the
    * handover of the held topic; wake rings the thread to continue it (continuation, P-026).
    */
-  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null, waiting_operator = undefined } = {}) {
+  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null, waiting_operator = undefined, discussion = undefined } = {}) {
     requireThread(thread);
     const prev = this.store.turn(thread);
     const now = nowIso();
+    const wasDiscussing = discussionOpen(prev);
     // `waiting_operator` without a state (P-061, hook PreToolUse/PostToolUse around AskUserQuestion): a flag of the OPEN turn
     // record, so the record's end (Stop, keepalive close, new turn) clears it. `opened_at` binds it to that very turn.
     if (!state && !attempt && waiting_operator !== undefined) {
@@ -732,6 +746,7 @@ export class Service {
       prev.waiting_operator = waiting_operator === true || waiting_operator === 'true' || waiting_operator === 1;
       prev.waiting_operator_at = prev.waiting_operator ? now : null;
       this.store.saveTurn(prev);
+      this.discussionChanged(wasDiscussing, prev);
       return { ok: true, turn: prev };
     }
     if (attempt) {
@@ -744,21 +759,35 @@ export class Service {
     if (holder_mode != null && !HOLDER_MODES.includes(holder_mode)) throw new HttpError(400, `režim držiteľa (holder_mode) musí byť ${HOLDER_MODES.join('|')}`);
     if (project != null) requireName(project, 'project');
     if (topic != null) requireName(topic, 'topic');
+    const disc = discussionFlag(discussion);
     let rec;
     if (state === 'open') {
       rec = {
         thread, machine: normalizeMachine(machine), project: project || null, topic: topic || null, holder_mode: holder_mode || null,
         state: 'open', opened_at: now, closed_at: null, close_reason: null, keepalive: { count: 0, last_at: null },
+        ...(disc !== undefined ? { discussion: disc, discussion_at: disc ? now : null } : {}),
       };
     } else {
       if (opened_at != null && opened_at !== '' && (!prev || prev.opened_at !== opened_at)) {
         this.log(`stale close of ${thread} (opened_at ${opened_at}, current ${prev ? prev.opened_at : 'none'})`);
         return { ok: true, stale: true };
       }
-      rec = { ...(prev || { thread, machine: normalizeMachine(machine), project, topic, holder_mode, opened_at: null, keepalive: { count: 0, last_at: null } }), state: 'closed', closed_at: now, close_reason: reason || null, waiting_operator: false, waiting_operator_at: null, next: next ? String(next).slice(0, MAX_NEXT) : null, resume_at: resumeAt(resume_at, now) };
+      // Closed with an open discussion: the turn ended with a question to the operator (D-0015). The wake module's close
+      // of an interrupted turn (keepalive, no flag) keeps the discussion of that turn.
+      const keep = disc === undefined && reason === 'keepalive' && prev ? !!prev.discussion : !!disc;
+      rec = { ...(prev || { thread, machine: normalizeMachine(machine), project, topic, holder_mode, opened_at: null, keepalive: { count: 0, last_at: null } }), state: 'closed', closed_at: now, close_reason: reason || null, waiting_operator: false, waiting_operator_at: null, next: next ? String(next).slice(0, MAX_NEXT) : null, resume_at: resumeAt(resume_at, now), discussion: keep, discussion_at: keep ? (prev && prev.discussion && prev.discussion_at) || now : null };
     }
     this.store.saveTurn(rec);
+    this.discussionChanged(wasDiscussing, rec);
     return { ok: true, turn: rec };
+  }
+
+  /** The thread's discussion with the operator ended (D-0015): one event, the wake module rings the steer/assist it held. */
+  discussionChanged(wasDiscussing, rec) {
+    if (!wasDiscussing || discussionOpen(rec)) return null;
+    const ev = this.emitEvent({ type: 'discussion-closed', holder: rec.thread, holder_machine: rec.machine || null, project: rec.project || null, topic: rec.topic || null });
+    this.log(`discussion closed ${rec.thread}: event ${ev.seq}`);
+    return ev;
   }
 
   /* resume_at (closed only, P-061): the thread's timer; wake rings the thread at that time with its next step. */

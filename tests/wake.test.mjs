@@ -403,7 +403,7 @@ test('expired held message (unregistered topic) rings the sender with `no reply 
 });
 
 test('one queued ring per open turn of a busy holder; a new turn may be rung again; state persisted and pruned', async (t) => {
-  const { client, waker, adapter } = await setup(t);
+  const { client, waker, adapter, clock } = await setup(t);
   const o1 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'two', thread_id: 'thr-s2' });
@@ -413,19 +413,52 @@ test('one queued ring per open turn of a busy holder; a new turn may be rung aga
   assert.deepEqual(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).queued, { 'thr-1': o1.turn.opened_at });
   assert.equal(Object.keys(waker.state.rings).length, 1, 'a queued skip does not count against the limit');
 
-  // The queued ring started a new turn: the next event rings again.
+  // The run ended and the queued ring started a new run: the next event rings again.
+  await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o1.turn.opened_at });
   await sleep(5);
   const o2 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'three', thread_id: 'thr-s3' });
   assert.equal(await waker.pollOnce(500), 1);
   assert.equal(adapter.calls.length, 2);
   assert.deepEqual(waker.state.queued, { 'thr-1': o2.turn.opened_at });
-  // Closed turn: no queue mark, rings; the old mark is pruned.
+  // Closed run whose queued ring has not started for longer than queuedStartMs: the ring was lost, it rings; mark pruned.
   await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o2.turn.opened_at });
+  clock.t = Date.now() + waker.opts.queuedStartMs + 1000;
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'four', thread_id: 'thr-s4' });
   assert.equal(await waker.pollOnce(500), 1);
   assert.equal(adapter.calls.length, 3);
   assert.deepEqual(waker.state.queued, {});
+});
+
+// wake-stale-ring 2026-11-13: a ring queued behind a long run; the operator's prompts steered into that run opened new turn
+// records, the mark was dropped and a second bell queued; at the run's close a third bell went out before the queued turn
+// opened. Both later bells hit mail the first queued turn had picked up ("wake: no new mail", "blocked by hook" in T3).
+test('a ring queued behind a run: no second bell after a prompt steered into the run, nor right after the run closed', async (t) => {
+  const { client, waker, adapter } = await setup(t);
+  const o1 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(adapter.calls.length, 1, 'rung into the busy thread, queued');
+  // The operator types into the running turn: UserPromptSubmit opens a new record without a Stop, same run.
+  await sleep(5);
+  const steer = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  assert.notEqual(steer.turn.opened_at, o1.turn.opened_at);
+  assert.equal(steer.turn.run_at, o1.turn.opened_at, 'a steered prompt keeps the run');
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'two', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(adapter.calls.length, 1, 'the queued ring has not started yet: no second bell');
+  // The run ends; the queued ring starts in T3 but its UserPromptSubmit has not opened the record yet.
+  await client.turn({ thread: 'thr-1', state: 'closed', opened_at: steer.turn.opened_at });
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'three', thread_id: 'thr-s3' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(adapter.calls.length, 1, 'the queued ring is starting: no third bell');
+  // The queued ring's turn opens (a new run): later mail rings again.
+  await sleep(5);
+  const o2 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  assert.equal(o2.turn.run_at, o2.turn.opened_at, 'a prompt after a Stop starts a new run');
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'four', thread_id: 'thr-s4' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(adapter.calls.length, 2);
 });
 
 // Fable audit M1.

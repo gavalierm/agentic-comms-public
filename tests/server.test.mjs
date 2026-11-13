@@ -370,7 +370,7 @@ test('turns: POST /turn open|closed|attempt, GET /turns?open=1; turn-interrupted
   await c.turn({ thread: 'thr-2', state: 'closed' });
   const open = (await c.turns(true)).turns;
   assert.deepEqual(open.map((x) => x.thread), ['thr-1']);
-  assert.deepEqual(Object.keys(open[0]).sort(), ['close_reason', 'closed_at', 'holder_mode', 'keepalive', 'machine', 'opened_at', 'project', 'state', 'thread', 'topic']);
+  assert.deepEqual(Object.keys(open[0]).sort(), ['close_reason', 'closed_at', 'holder_mode', 'keepalive', 'machine', 'opened_at', 'project', 'run_at', 'state', 'thread', 'topic']);
   assert.equal((await c.turns(false)).turns.length, 2);
 
   const at = await c.turn({ thread: 'thr-1', attempt: true });

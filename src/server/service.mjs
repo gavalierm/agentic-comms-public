@@ -807,6 +807,9 @@ export class Service {
       rec = {
         thread, machine: normalizeMachine(machine), project: project || null, topic: topic || null, holder_mode: holder_mode || null,
         state: 'open', opened_at: now, closed_at: null, close_reason: null, keepalive: { count: 0, last_at: null },
+        // The run (one T3 turn of the provider): a prompt steered into the running turn opens without a Stop in between
+        // and keeps the run; wake keeps a ring queued behind the run until the next run starts (wake-stale-ring).
+        run_at: prev && prev.state === 'open' ? prev.run_at || prev.opened_at || now : now,
         ...(disc !== undefined ? { discussion: disc, discussion_at: disc ? now : null } : {}),
       };
     } else {

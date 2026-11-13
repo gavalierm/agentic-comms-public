@@ -11,7 +11,10 @@
 // A blocker/steer/assist/reply ring that fails for good (thread archived or gone) bounces: the service
 // marks the message undelivered and the sender gets an `undelivered` event, rung with
 // `undelivered <id>`; those two never bounce. A busy thread gets a ring as its next turn
-// (T3): at most one queued ring per open turn of the holder (`turns`, wake-state `queued`).
+// (T3): at most one queued ring per run of the holder (`turns`, wake-state `queued`). A run is the turn record's `run_at`:
+// a prompt steered into the running turn (UserPromptSubmit without a Stop) opens a new record of the same run, and the
+// queued ring still waits behind it; after the run's close the queued ring starts within `queuedStartMs`, and that
+// starting turn sees all the mail (two stale bells on picked-up mail, wake-stale-ring 2026-11-13).
 // Keepalive (optional, `keepalive.since_command`): open turns of this machine opened
 // before the last T3 start whose thread no longer runs are rung with
 // KEEPALIVE_TEMPLATE (at most 3 attempts per hour per thread, ≥ 60 s apart) or, in
@@ -50,7 +53,13 @@ export const CONTINUE_TEMPLATE = 'turn ended with a next step, continue from han
 export const DEFAULTS = {
   limitPerHour: 6, stopOnRepeat: 2, maxEventAgeMs: 60 * 60 * 1000, waitMs: 25_000, reconnectMs: 1000, maxReconnectMs: 30_000,
   keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 60_000, idleDedupeMs: 120_000,
+  queuedStartMs: 120_000,
 };
+
+/** The run of a turn record: `run_at` (kept across prompts steered into a running turn), else `opened_at` (older mail). */
+export function runOf(rec) {
+  return rec ? rec.run_at || rec.opened_at || null : null;
+}
 const HOUR = 60 * 60 * 1000;
 /** Periodic jobs: shortest interval (a smaller one is raised), default interval and time limit of one run. */
 export const JOB_MIN_INTERVAL_MS = 60_000;
@@ -113,7 +122,7 @@ export class WakeState {
     this.keepalive = d.keepalive || {};
     // thread → { next, closed_at, at, stalled }: the last continuation ring (one per next step).
     this.continued = d.continued || {};
-    // holder → opened_at of the open turn that already has one ring queued.
+    // holder → run (`runOf`) of the turn that already has one ring queued behind it.
     this.queued = d.queued || {};
     // holder → { at, text }: the last ring of a thread without an open turn (its turn opens seconds later).
     this.idle = d.idle || {};
@@ -135,10 +144,19 @@ export class WakeState {
     }
   }
 
-  /** Keep only the queued marks whose open turn is still the current one. */
-  pruneQueued(openTurns) {
-    const cur = new Map(openTurns.map((t) => [t.thread, t.opened_at]));
-    for (const [holder, at] of Object.entries(this.queued)) if (cur.get(holder) !== at) delete this.queued[holder];
+  /**
+   * Keep only the queued marks whose ring has not started yet: the holder's run is still the one rung into (open, also
+   * with prompts steered into it), or that run closed less than `startMs` ago (the queued ring is starting now). A new
+   * run is the queued ring's turn (or a later one): it sees all the mail.
+   */
+  pruneQueued(turns, now, startMs) {
+    const cur = new Map(turns.map((t) => [t.thread, t]));
+    for (const [holder, run] of Object.entries(this.queued)) {
+      const rec = cur.get(holder);
+      const same = !!rec && runOf(rec) === run;
+      const waiting = same && (rec.state === 'open' || (rec.closed_at && now - Date.parse(rec.closed_at) < startMs));
+      if (!waiting) delete this.queued[holder];
+    }
   }
 
   save() {
@@ -205,14 +223,14 @@ export class Waker {
       }
     }
 
-    // A busy thread gets the ring as its next turn: at most one queued ring per open turn.
+    // A busy thread gets the ring as its next turn: at most one queued ring per run.
     let openTurn = null;
     let record = null;
     let turnsKnown = false;
     try {
       const { turns } = await this.client.turns(false);
       const open = turns.filter((x) => x.state === 'open');
-      this.state.pruneQueued(open);
+      this.state.pruneQueued(turns, now, this.opts.queuedStartMs);
       record = turns.find((x) => x.thread === String(ev.holder)) || null;
       openTurn = open.find((x) => x.thread === String(ev.holder) && x.opened_at) || null;
       turnsKnown = true;
@@ -225,7 +243,8 @@ export class Waker {
       this.hold(ev, now);
       return skip('discussion');
     }
-    if (openTurn && this.state.queued[String(ev.holder)] === openTurn.opened_at) {
+    // A ring queued behind this run (pruned above) has not started yet: its turn will see this mail too.
+    if (turnsKnown && this.state.queued[String(ev.holder)]) {
       this.state.save();
       return skip('queued');
     }
@@ -270,7 +289,7 @@ export class Waker {
     }
     if (result && result.ok) {
       this.stats.rang += 1;
-      if (openTurn) this.state.queued[String(ev.holder)] = openTurn.opened_at;
+      if (openTurn) this.state.queued[String(ev.holder)] = runOf(openTurn);
       else this.state.idle[String(ev.holder)] = { at: now, text };
       this.state.save();
       this.log(`rang ${ev.seq} ${ev.type} → ${ev.holder}: "${text}" (${recent.length}/${this.opts.limitPerHour} za hodinu, ${pair})${openTurn ? '; vlákno má otvorený ťah, zvonček zaradený' : ''}`);

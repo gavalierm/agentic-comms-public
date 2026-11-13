@@ -30,7 +30,9 @@ Keepalive (vypnutý, kým nie je zadaný príkaz štartu T3):
 Premenné: WAKE_MACHINE, WAKE_ADAPTER, WAKE_COMMAND, WAKE_STATUS_COMMAND, WAKE_STATE_DIR, WAKE_LIMIT_PER_HOUR, WAKE_STOP_ON_REPEAT, WAKE_MAX_EVENT_AGE_MS,
           WAKE_WAIT_MS, WAKE_RECONNECT_MS, WAKE_KEEPALIVE_SINCE_COMMAND, WAKE_KEEPALIVE_INTERVAL_MS
 Súbor --config: kľúče pošty (instance, data_dir, url, key, instance_id, client_dir, machine) a "wake": { machine, adapter, command, status_command,
-          limit_per_hour, stop_on_repeat, max_event_age_ms, state_dir, wait_ms, reconnect_ms, keepalive: { since_command, interval_ms } }
+          limit_per_hour, stop_on_repeat, max_event_age_ms, state_dir, wait_ms, reconnect_ms, keepalive: { since_command, interval_ms },
+          jobs: [{ name, command, interval_ms (900000, najmenej 60000), timeout_ms (300000, najviac interval) }] }
+Úlohy (jobs): run spúšťa každú úlohu cez shell v jej intervale, jeden beh naraz; zlyhanie sa iba zapíše do logu.
 Bez --config/COMMS_CONFIG sa sekcia "wake" číta z <data-dir>/wake.json (rovnaké kľúče, bez obalu "wake"), iba pri štarte.
 Samoreštart: run sa každých 30 s pozrie na revíziu inštalácie (.git/HEAD) a mtime wake.json; pri zmene skončí s kódom 0.
           Vypnutie: --no-self-restart | COMMS_SELF_RESTART=0 | "self_restart": false
@@ -88,7 +90,8 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         const keepalive = Object.fromEntries(Object.entries(st.keepalive).map(([k, v]) => [k, v.length]));
         const lock = readWakeLock(cfg.stateDir);
         const running = lockHeld(lock, { pid: -1 }) ? { pid: lock.pid, started_at: lock.started_at, heartbeat_at: lock.heartbeat_at } : null;
-        stdout.write(JSON.stringify({ running, state_file: cfg.stateFile, cursor: st.cursor, updated_at: st.updated_at, rings_last_hour: rings, keepalive_attempts_last_hour: keepalive, adapter: cfg.adapter, command: cfg.command, keepalive_since_command: cfg.keepaliveSinceCommand }, null, 2) + '\n');
+        const jobs = Object.fromEntries(cfg.jobs.map((j) => [j.name, { command: j.command, interval_ms: j.interval_ms, last: st.jobs[j.name] || null }]));
+        stdout.write(JSON.stringify({ running, state_file: cfg.stateFile, cursor: st.cursor, updated_at: st.updated_at, rings_last_hour: rings, keepalive_attempts_last_hour: keepalive, adapter: cfg.adapter, command: cfg.command, keepalive_since_command: cfg.keepaliveSinceCommand, jobs }, null, 2) + '\n');
         return 0;
       }
       case 'run': {
@@ -101,6 +104,9 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
         log(`stroj ${cfg.machine}, adaptér ${waker.adapter ? `${waker.adapter.name} (${waker.adapter.command.join(' ')})` : 'žiadny (nič sa nebudí)'}, limit ${cfg.limitPerHour}/h, stop pri ${cfg.stopOnRepeat} rovnakých, stav ${cfg.stateFile}`);
         log(`pošta: ${cfg.comms.url || cfg.comms.socket}`);
         log(cfg.keepaliveSinceCommand ? `keepalive: každých ${cfg.keepaliveIntervalMs} ms, štart T3 z „${cfg.keepaliveSinceCommand}“` : 'keepalive vypnutý (bez keepalive.since_command)');
+        for (const p of cfg.jobProblems) log(`úlohy: ${p}`);
+        if (!cfg.jobs.length) log('úlohy: žiadne');
+        for (const j of cfg.jobs) log(`úloha ${j.name}: každých ${j.interval_ms} ms (limit ${j.timeout_ms} ms) „${j.command}“`);
         // Self-restart: a new installation revision or a changed wake.json ends the process: with 0 under systemd
         // (Restart=always), with RESTART_EXIT under the supervisor of bin/wake.mjs (terminal, macOS, Windows).
         let restart = false;

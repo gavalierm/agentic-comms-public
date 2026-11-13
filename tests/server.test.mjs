@@ -549,3 +549,121 @@ test('register-topic close: a closed topic takes no mail (410), pending mail bou
   const cr = await runCli(['register-topic', '--data-dir', a.dir, '--key', a.key, '--project', 'p', '--topic', 'done', '--close']);
   assert.deepEqual([cr.code, cr.json.topic.state], [0, 'closed']);
 });
+
+// D-0024 (etapa 3b): the answer to a message held for an unregistered topic says whether its project is known (has an
+// open registered topic), so the sender can tell a new topic of a known project from a wrong project. It depends on the
+// project only: a private topic and an unknown topic of the same project get the same answer (no oracle, P-045).
+test('held message: project_known is true for a project with an open topic, false otherwise; the CLI passes it through', async (t) => {
+  const { a } = await serviceUp(t);
+  const c = makeClient(a);
+  const empty = await c.send({ project: 'p', topic: 'report-1', level: 'assist', text: 'x' });
+  assert.deepEqual([empty.state, empty.project_known], ['held', false]);
+
+  await c.registerTopic({ project: 'p', topic: 'main-work', subject: 'S' });
+  const known = await c.send({ project: 'p', topic: 'report-2', level: 'assist', text: 'x' });
+  assert.deepEqual([known.state, known.project_known], ['held', true]);
+  const other = await c.send({ project: 'q', topic: 'report-3', level: 'assist', text: 'x' });
+  assert.deepEqual([other.state, other.project_known], ['held', false]);
+
+  // A private topic of persona zed in project v, addressed by someone else, and an unknown topic of v: the same answer.
+  await c.registerTopic({ project: 'v', topic: 'secret', subject: 'S', persona: 'zed', visibility: 'private' });
+  const priv = await c.send({ project: 'v', topic: 'secret', level: 'assist', text: 'x' });
+  const unknown = await c.send({ project: 'v', topic: 'nothing-here', level: 'assist', text: 'x' });
+  assert.deepEqual([priv.state, priv.project_known], ['held', true]);
+  assert.deepEqual(Object.keys(priv).sort(), Object.keys(unknown).sort());
+  assert.equal(unknown.project_known, true);
+
+  // A project whose only topic is closed is not known.
+  await c.registerTopic({ project: 'w', topic: 'old', subject: 'S' });
+  await c.registerTopic({ project: 'w', topic: 'old', close: true });
+  const closed = await c.send({ project: 'w', topic: 'new-one', level: 'assist', text: 'x' });
+  assert.deepEqual([closed.state, closed.project_known], ['held', false]);
+
+  // A delivered message has no such field (only a held one answers it).
+  assert.equal('project_known' in (await c.send({ project: 'p', topic: 'main-work', level: 'assist', text: 'x' })), false);
+
+  const cli = await runCli(['send', '--data-dir', a.dir, '--key', a.key, '--project', 'p', '--topic', 'report-4', '--level', 'assist', '--text', 'x']);
+  assert.equal(cli.code, 0, cli.err);
+  assert.deepEqual([cli.json.state, cli.json.project_known], ['held', true]);
+});
+
+// D-0024: deliver of a held message whose pickup deadline passed would duplicate it (the sender already got
+// `no reply <id>` and sends anew): refused with 409; discard still settles the notice.
+test('decide deliver refuses an expired held message; the notice keeps project and topic; discard works', async (t) => {
+  const { a, sa } = await serviceUp(t);
+  const c = makeClient(a, { thread: 'thr-a' });
+  const held = await c.send({ project: 'p', topic: 'later', level: 'assist', text: 'q', ttl: '60s' });
+  assert.equal(held.state, 'held');
+  await c.registerTopic({ project: 'p', topic: 'later', subject: 'Now exists' });
+  assert.deepEqual(sa.srv.service.checkExpired(Date.now() + 120_000), [held.id]);
+
+  const n = (await c.notices()).notices.find((x) => x.message_id === held.id);
+  assert.deepEqual([n.kind, n.project, n.topic, n.state], ['unregistered-topic', 'p', 'later', 'open']);
+  await assert.rejects(c.decide({ notice_id: held.notice_id, decision: 'deliver' }), (e) => e.status === 409 && /vypršala/.test(e.message) && /discard/.test(e.message));
+  assert.equal((await c.receive({ project: 'p', topic: 'later' })).messages.length, 0);
+  assert.equal((await c.message(held.id)).state, 'held');
+  assert.equal((await c.notices()).notices.find((x) => x.id === held.notice_id).state, 'open');
+  await c.decide({ notice_id: held.notice_id, decision: 'discard' });
+  assert.equal((await c.message(held.id)).state, 'discarded');
+
+  // Past expires_at before the 30 s check marked it: refused the same way.
+  const quick = await c.send({ project: 'p', topic: 'later-2', level: 'assist', text: 'q', ttl: '1s' });
+  await c.registerTopic({ project: 'p', topic: 'later-2', subject: 'S' });
+  await sleep(1100);
+  await assert.rejects(c.decide({ notice_id: quick.notice_id, decision: 'deliver' }), (e) => e.status === 409);
+  assert.equal((await c.receive({ project: 'p', topic: 'later-2' })).messages.length, 0);
+
+  // A held message within its deadline is still delivered.
+  const fresh = await c.send({ project: 'p', topic: 'later-3', level: 'assist', text: 'q' });
+  await c.registerTopic({ project: 'p', topic: 'later-3', subject: 'S' });
+  await c.decide({ notice_id: fresh.notice_id, decision: 'deliver' });
+  assert.equal((await c.receive({ project: 'p', topic: 'later-3' })).messages.length, 1);
+});
+
+// D-0024, review of etapa 3b: redirect puts the held message into a mailbox too, so after its deadline it would double
+// what the sender already sent anew or reported another way (an issue). Refused like deliver: 409, the notice stays
+// open, discard works; the CLI passes the error through (exit 1, status 409, details).
+test('decide redirect refuses an expired held message like deliver; a private deliver too; within the deadline it redirects', async (t) => {
+  const { a, sa } = await serviceUp(t);
+  const c = makeClient(a, { thread: 'thr-a' });
+  await c.registerTopic({ project: 'p', topic: 'target', subject: 'Redirect target' });
+  const held = await c.send({ project: 'p', topic: 'typo', level: 'assist', text: 'q', ttl: '60s' });
+  assert.equal(held.state, 'held');
+  assert.deepEqual(sa.srv.service.checkExpired(Date.now() + 120_000), [held.id]);
+
+  await assert.rejects(c.decide({ notice_id: held.notice_id, decision: 'redirect', target: 'p/target' }),
+    (e) => e.status === 409 && /vypršala/.test(e.message) && /presmerovanie/.test(e.message) && /discard/.test(e.message));
+  assert.equal((await c.receive({ project: 'p', topic: 'target' })).messages.length, 0);
+  const kept = await c.message(held.id);
+  assert.deepEqual([kept.state, kept.project, kept.topic], ['held', 'p', 'typo']);
+  assert.equal((await c.notices()).notices.find((x) => x.id === held.notice_id).state, 'open');
+
+  const cli = await runCli(['decide', '--data-dir', a.dir, '--key', a.key, '--notice', held.notice_id, '--decision', 'redirect', '--target', 'p/target']);
+  assert.equal(cli.code, 1, cli.out);
+  const err = JSON.parse(cli.err.split('\n')[0]);
+  assert.deepEqual([err.status, err.details.message_id, err.details.decision], [409, held.id, 'redirect']);
+  assert.equal((await c.receive({ project: 'p', topic: 'target' })).messages.length, 0);
+
+  await c.decide({ notice_id: held.notice_id, decision: 'discard' });
+  assert.equal((await c.message(held.id)).state, 'discarded');
+
+  // Past expires_at before the 30 s check marked it: refused the same way.
+  const quick = await c.send({ project: 'p', topic: 'typo-2', level: 'assist', text: 'q', ttl: '1s' });
+  await sleep(1100);
+  await assert.rejects(c.decide({ notice_id: quick.notice_id, decision: 'redirect', target: 'p/target' }), (e) => e.status === 409);
+  assert.equal((await c.receive({ project: 'p', topic: 'target' })).messages.length, 0);
+
+  // A held message for a foreign private topic: deliver (to the owner's main thread) is refused after the deadline as well.
+  await c.registerTopic({ project: 'v', topic: 'secret', subject: 'S', persona: 'zed', visibility: 'private' });
+  const priv = await c.send({ project: 'v', topic: 'secret', level: 'assist', text: 'q', ttl: '60s' });
+  assert.equal(priv.state, 'held');
+  assert.ok(sa.srv.service.checkExpired(Date.now() + 120_000).includes(priv.id));
+  await assert.rejects(c.decide({ notice_id: priv.notice_id, decision: 'deliver' }), (e) => e.status === 409 && /doručenie/.test(e.message));
+  assert.equal((await c.message(priv.id)).state, 'held');
+
+  // Within its deadline a held message is still redirected.
+  const fresh = await c.send({ project: 'p', topic: 'typo-3', level: 'assist', text: 'q' });
+  const r = await c.decide({ notice_id: fresh.notice_id, decision: 'redirect', target: 'p/target' });
+  assert.deepEqual(r.delivered_to, { project: 'p', topic: 'target' });
+  assert.equal((await c.receive({ project: 'p', topic: 'target' })).messages.length, 1);
+});

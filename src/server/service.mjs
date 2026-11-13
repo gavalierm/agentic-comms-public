@@ -370,7 +370,7 @@ export class Service {
         msg.notice_id = notice.id;
         this.store.saveMessage(msg);
         this.log(`held ${msg.id} for ${t ? 'private' : 'unregistered'} ${project}/${topic}`);
-        return { id: msg.id, state: msg.state, notice_id: notice.id, expires_at: msg.expires_at };
+        return { id: msg.id, state: msg.state, notice_id: notice.id, expires_at: msg.expires_at, project_known: this.projectKnown(project) };
       }
     }
 
@@ -383,6 +383,16 @@ export class Service {
     }
     if (rings) this.afterDelivery(msg, original);
     return { id: msg.id, state: msg.state, level: msg.level, ...(reply_state ? { reply_state } : {}), ...(msg.level_raised_from ? { level_raised_from: msg.level_raised_from } : {}), notice_id: msg.notice_id, expires_at: msg.expires_at };
+  }
+
+  /**
+   * The project has at least one open registered topic (D-0024: the sender of a held message learns that someone serves
+   * the project, so it may wait for the topic to be set up instead of falling back at once). It depends on the project
+   * only, never on the addressed topic: an unknown and a foreign private topic of the same project answer alike (no
+   * oracle, P-045).
+   */
+  projectKnown(project) {
+    return this.store.topics().some((t) => t && t.project === project && t.state !== 'closed');
   }
 
   /** A closed topic takes no mail: 410 with the time it was closed and where to write instead. */
@@ -863,6 +873,8 @@ export class Service {
       if (decision === 'discard') {
         msg.state = 'discarded';
       } else {
+        // Every decision but discard (deliver, redirect) puts the message into a mailbox: one check for all of them.
+        refuseExpiredHeld(msg, decision);
         let dest = { project: msg.project, topic: msg.topic };
         if (decision === 'deliver' && msg.private_owner) {
           // Private topic: deliver to the owner's main thread, which handles it itself.
@@ -949,6 +961,25 @@ function outcomeOf(m) {
   if (m.bounced_at) return 'undelivered';
   if (m.expired_at) return 'expired';
   return null;
+}
+
+/** A held message past its pickup deadline: marked by checkExpired, or past `expires_at` before the next 30 s check. */
+function heldExpired(m, now = Date.now()) {
+  const outcome = outcomeOf(m);
+  if (outcome) return outcome === 'expired';
+  return !m.answer_state && !!m.expires_at && Date.parse(m.expires_at) <= now;
+}
+
+/**
+ * A held message past its deadline is not put into any mailbox (decide deliver or redirect): its sender already got
+ * `no reply <id>` and may have sent it anew or reported it another way (an issue), so delivering or redirecting it would
+ * double it (D-0024). 409 with the id and the time; the notice stays open for discard.
+ */
+function refuseExpiredHeld(m, decision) {
+  if (!heldExpired(m)) return;
+  const at = m.expired_at || m.expires_at;
+  const what = decision === 'redirect' ? 'presmerovanie' : 'doručenie';
+  throw new HttpError(409, `správa ${m.id} vypršala ${at} bez doručenia; odosielateľ už dostal no reply a mohol ju poslať znova alebo inak, ${what} by ju zdvojilo. Zahoď ju (discard)`, { message_id: m.id, expired_at: at, decision });
 }
 
 /** Address of the recipient: `<project>/<topic>`, else `thread:<id>`. */

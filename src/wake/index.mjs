@@ -19,6 +19,8 @@
 // Discussion (D-0015, D-0022): a steer/assist to a holder that discusses with the operator (turn record, `discussionOpen`)
 // is held (wake-state `held`) and rung when the discussion ends (event `discussion-closed`, else the next poll); a
 // blocker passes.
+// Jobs (D-0023, D-0024): `jobs` in wake.json are shell commands run periodically next to the long-poll (e.g. the reporter's
+// issue watch), one run of a job at a time, with a time limit; a failure is logged, it never stops the module.
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -50,6 +52,15 @@ export const DEFAULTS = {
   keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 60_000, idleDedupeMs: 120_000,
 };
 const HOUR = 60 * 60 * 1000;
+/** Periodic jobs: shortest interval (a smaller one is raised), default interval and time limit of one run. */
+export const JOB_MIN_INTERVAL_MS = 60_000;
+export const JOB_DEFAULT_INTERVAL_MS = 900_000;
+export const JOB_DEFAULT_TIMEOUT_MS = 300_000;
+const JOB_NAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+/** Characters of a job's output kept for the log line of a failed run. */
+const JOB_OUTPUT_MAX = 2000;
+/** Longest single timer (setTimeout overflows above it); longer waits are slept in parts. */
+const MAX_TIMER_MS = 2_147_483_647;
 export const WAKE_SENDER = 'wake';
 /** Ring errors after which no later turn of the thread will come (the sender gets a bounce). */
 export const PERMANENT_RING_FAILURE = /archived|not found|does not exist|no such thread|unknown thread/i;
@@ -108,6 +119,8 @@ export class WakeState {
     this.idle = d.idle || {};
     // message id → event of a steer/assist held while its holder discusses with the operator (D-0015).
     this.held = d.held || {};
+    // job name → { started_at, finished_at, ok, code, ms, error }: the last run of a periodic job (its next run survives a restart).
+    this.jobs = d.jobs || {};
     this.updated_at = d.updated_at || null;
   }
 
@@ -130,7 +143,7 @@ export class WakeState {
 
   save() {
     this.updated_at = nowIso();
-    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, idle: this.idle, held: this.held, updated_at: this.updated_at });
+    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, idle: this.idle, held: this.held, jobs: this.jobs, updated_at: this.updated_at });
   }
 }
 
@@ -142,6 +155,7 @@ export class Waker {
    * @param {string|null} o.stateFile
    * @param {(() => Promise<number|null>)|null} o.keepaliveSince  last T3 start (epoch ms); null → keepalive off
    * @param {Client} [o.keepaliveClient]  separate client for keepalive (its own connection state next to the long-poll)
+   * @param {{name:string, command:string, interval_ms:number, timeout_ms?:number}[]} [o.jobs]  periodic jobs (normalizeJobs)
    */
   constructor({ client, adapter = null, stateFile = null, log = () => {}, now = Date.now, keepaliveSince = null, keepaliveClient = null, ...opts }) {
     this.client = client;
@@ -152,7 +166,8 @@ export class Waker {
     this.now = now;
     this.opts = { ...DEFAULTS, ...opts };
     this.state = new WakeState(stateFile);
-    this.stats = { seen: 0, rang: 0, limited: 0, skipped: 0, failed: 0, keepalive_rang: 0, keepalive_notified: 0, continue_rang: 0, continue_stalled: 0 };
+    this.stats = { seen: 0, rang: 0, limited: 0, skipped: 0, failed: 0, keepalive_rang: 0, keepalive_notified: 0, continue_rang: 0, continue_stalled: 0, jobs_ok: 0, jobs_failed: 0 };
+    this.jobsRunning = new Set();
   }
 
   /** Decide and act on one event. Returns { action: 'rang'|'limited'|'skipped', reason, ... }. */
@@ -505,6 +520,76 @@ export class Waker {
     }
   }
 
+  /**
+   * One run of a periodic job (`jobs` in wake.json). A second run of the same job does not start while the first one
+   * runs; a failure (exit code, time limit, spawn error) is logged and counted, it never throws.
+   */
+  async runJobOnce(job, signal) {
+    if (this.jobsRunning.has(job.name)) {
+      this.log(`úloha ${job.name}: predchádzajúci beh ešte beží, ďalší sa nespúšťa`);
+      return { action: 'skipped', reason: 'running' };
+    }
+    this.jobsRunning.add(job.name);
+    try {
+      const prev = this.state.jobs[job.name];
+      this.state.jobs[job.name] = { ...(prev && typeof prev === 'object' ? prev : {}), started_at: new Date().toISOString() };
+      this.state.save();
+      const r = await runJob(job.command, { timeout: job.timeout_ms, signal });
+      const failure = r.ok ? null : jobFailure(r);
+      this.state.jobs[job.name] = { started_at: this.state.jobs[job.name].started_at, finished_at: new Date().toISOString(), ok: r.ok, code: r.code, ms: r.ms, error: failure };
+      this.state.save();
+      if (r.ok) {
+        this.stats.jobs_ok += 1;
+        this.log(`úloha ${job.name}: ok (${r.ms} ms)`);
+        return { action: 'ok', ms: r.ms };
+      }
+      if (r.aborted) {
+        this.log(`úloha ${job.name}: prerušená pri ukončení budenia`);
+        return { action: 'aborted' };
+      }
+      this.stats.jobs_failed += 1;
+      const tail = r.output ? r.output.split(/\r?\n/).filter(Boolean).join(' | ').slice(-300) : '';
+      this.log(`úloha ${job.name}: zlyhala (${failure})${tail ? `: ${tail}` : ''}`);
+      return { action: 'failed', reason: failure, code: r.code };
+    } finally {
+      this.jobsRunning.delete(job.name);
+    }
+  }
+
+  /**
+   * When the job runs next (epoch ms, wall clock): never run → now; else the last start + interval, after a run longer
+   * than the interval its end + interval. Never later than now + interval (a clock set back, a start in the future).
+   */
+  jobDue(job, now = Date.now()) {
+    const st = this.state.jobs[job.name];
+    const started = st ? Date.parse(st.started_at) : NaN;
+    if (!Number.isFinite(started)) return now;
+    const finished = Date.parse(st.finished_at);
+    let due = started + job.interval_ms;
+    if (Number.isFinite(finished) && finished - started >= job.interval_ms) due = finished + job.interval_ms;
+    return Math.min(due, now + job.interval_ms);
+  }
+
+  /** Loop of one periodic job; it ends with the signal. Errors are logged and the job waits one interval. */
+  async jobLoop(job, signal) {
+    while (!signal || !signal.aborted) {
+      try {
+        const wait = this.jobDue(job) - Date.now();
+        if (wait > 0) { await sleep(Math.min(wait, MAX_TIMER_MS), signal); continue; }
+        await this.runJobOnce(job, signal);
+      } catch (e) {
+        if (signal && signal.aborted) break;
+        this.log(`úloha ${job.name}: chyba: ${e.message}`);
+        await sleep(Math.min(job.interval_ms, MAX_TIMER_MS), signal);
+      }
+    }
+  }
+
+  /** All periodic jobs side by side (each in its own loop); ends when the signal aborts. */
+  async jobsLoop(signal) {
+    await Promise.all((this.opts.jobs || []).map((job) => this.jobLoop(job, signal)));
+  }
+
   /** Where to start: persisted cursor, else the current end of the stream (no replay of history). */
   async initCursor() {
     if (this.state.cursor != null) return this.state.cursor;
@@ -538,12 +623,15 @@ export class Waker {
     const onAbort = () => kac.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
     const keepalive = (this.keepaliveSince || this.adapter) ? this.keepaliveLoop(kac.signal) : null;
+    // Periodic jobs (wake.json `jobs`) run next to it, independent of the mail (a job runs also while the mail is down).
+    const jobs = this.opts.jobs?.length ? this.jobsLoop(kac.signal) : null;
     try {
       return await this.pollLoop(signal);
     } finally {
       kac.abort();
       signal?.removeEventListener('abort', onAbort);
       if (keepalive) await keepalive;
+      if (jobs) await jobs;
       this.state.save();
     }
   }
@@ -587,10 +675,110 @@ export function readSince(command, { timeout = 10_000, env = process.env } = {})
 }
 
 /**
+ * Run one periodic job command through the shell (like readSince) with a time limit; on the limit or the signal the
+ * whole process group is killed. Never rejects: { ok, code, signal, timedOut, aborted, error, output (tail), ms }.
+ */
+export function runJob(command, { timeout = JOB_DEFAULT_TIMEOUT_MS, env = process.env, signal = null } = {}) {
+  const t0 = Date.now();
+  return new Promise((resolve) => {
+    let child = null;
+    let out = '';
+    let settled = false;
+    let timedOut = false;
+    let aborted = false;
+    let timer = null;
+    const finish = ({ code = null, signal: sig = null, error = null } = {}) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve({ ok: !error && !timedOut && !aborted && code === 0, code, signal: sig, timedOut, aborted, error, output: out.trim(), ms: Date.now() - t0 });
+    };
+    // After the kill: `close` waits for the pipes; a grandchild that escaped the group would hold them, so finish anyway.
+    const kill = () => { killTree(child); const t = setTimeout(() => finish({ signal: 'SIGKILL' }), 2000); t.unref?.(); };
+    const onAbort = () => { aborted = true; kill(); };
+    try {
+      child = spawn(command, { shell: true, stdio: ['ignore', 'pipe', 'pipe'], env, windowsHide: true, detached: process.platform !== 'win32' });
+    } catch (e) {
+      return finish({ error: e.message });
+    }
+    const keep = (d) => { out = (out + d).slice(-JOB_OUTPUT_MAX); };
+    child.stdout.on('data', keep);
+    child.stderr.on('data', keep);
+    child.on('error', (e) => finish({ error: e.message }));
+    child.on('close', (code, sig) => finish({ code, signal: sig }));
+    timer = setTimeout(() => { timedOut = true; kill(); }, Math.min(timeout, MAX_TIMER_MS));
+    if (signal) { if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+  });
+}
+
+/** Kill a job with its children: the process group on POSIX (spawned detached), the tree on Windows. */
+function killTree(child) {
+  if (!child || child.pid == null) return;
+  try {
+    if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }).on('error', () => {});
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    try { child.kill('SIGKILL'); } catch { /* gone */ }
+  }
+}
+
+function jobFailure(r) {
+  if (r.error) return `nespustila sa: ${r.error}`;
+  if (r.aborted) return 'prerušená';
+  if (r.timedOut) return 'prekročila časový limit';
+  return r.code != null ? `kód ${r.code}` : `signál ${r.signal}`;
+}
+
+/**
+ * Periodic jobs from wake.json `jobs`: [{ name, command, interval_ms?, timeout_ms? }]. An invalid entry is skipped,
+ * an interval under the minimum is raised to it; each case gives one line in `problems` (logged at start).
+ * interval_ms defaults to 15 min, timeout_ms to 5 min and never exceeds the interval.
+ */
+export function normalizeJobs(raw, { minIntervalMs = JOB_MIN_INTERVAL_MS } = {}) {
+  const jobs = [];
+  const problems = [];
+  if (raw == null) return { jobs, problems };
+  if (!Array.isArray(raw)) {
+    problems.push('jobs: musí byť pole úloh; ignorované');
+    return { jobs, problems };
+  }
+  const toNum = (v) => (typeof v === 'number' ? v : typeof v === 'string' && v.trim() ? Number(v) : NaN);
+  const names = new Set();
+  raw.forEach((j, i) => {
+    const at = `jobs[${i}]`;
+    if (!j || typeof j !== 'object' || Array.isArray(j)) return problems.push(`${at}: nie je objekt; preskočená`);
+    const name = typeof j.name === 'string' ? j.name.trim() : '';
+    const label = name ? `${at} (${name})` : at;
+    if (!JOB_NAME_RE.test(name)) return problems.push(`${label}: chýba platné meno (písmená, číslice, „.“, „_“, „-“, najviac 64 znakov); preskočená`);
+    if (names.has(name)) return problems.push(`${label}: meno sa opakuje; preskočená`);
+    const command = typeof j.command === 'string' ? j.command.trim() : '';
+    if (!command) return problems.push(`${label}: chýba príkaz (command); preskočená`);
+    let interval = JOB_DEFAULT_INTERVAL_MS;
+    if (j.interval_ms != null) {
+      interval = toNum(j.interval_ms);
+      if (!Number.isFinite(interval) || interval <= 0) return problems.push(`${label}: neplatný interval_ms ${JSON.stringify(j.interval_ms)}; preskočená`);
+      if (interval < minIntervalMs) {
+        problems.push(`${label}: interval_ms ${interval} je pod minimom ${minIntervalMs}; použije sa ${minIntervalMs}`);
+        interval = minIntervalMs;
+      }
+    }
+    let timeout = JOB_DEFAULT_TIMEOUT_MS;
+    if (j.timeout_ms != null) {
+      timeout = toNum(j.timeout_ms);
+      if (!Number.isFinite(timeout) || timeout <= 0) return problems.push(`${label}: neplatný timeout_ms ${JSON.stringify(j.timeout_ms)}; preskočená`);
+    }
+    names.add(name);
+    jobs.push({ name, command, interval_ms: Math.round(interval), timeout_ms: Math.round(Math.min(timeout, interval, MAX_TIMER_MS)) });
+  });
+  return { jobs, problems };
+}
+
+/**
  * Resolve wake configuration: CLI options > environment > `--config` file (keys
  * `wake.adapter`, `wake.command`, `wake.limit_per_hour`, `wake.stop_on_repeat`,
  * `wake.max_event_age_ms`, `wake.state_dir`, `wake.wait_ms`, `wake.reconnect_ms`,
- * `wake.status_command`, `wake.keepalive.since_command`, `wake.keepalive.interval_ms`)
+ * `wake.status_command`, `wake.keepalive.since_command`, `wake.keepalive.interval_ms`, `wake.jobs`)
  * > `<dataDir>/wake.json` (only without --config/COMMS_CONFIG; same keys as `wake`)
  * > defaults. The mail part reuses the client configuration.
  */
@@ -604,6 +792,8 @@ export function resolveWakeConfig(opts = {}, env = process.env) {
   const ka = wake.keepalive || {};
   const num = (a, b, c, d) => { const v = a ?? b ?? c; const n = Number(v); return v == null || v === '' || Number.isNaN(n) ? d : n; };
   const stateDir = opts.stateDir || env.WAKE_STATE_DIR || wake.state_dir || path.join(comms.clientDir, 'wake');
+  // Periodic jobs come only from the file (no flag, no variable); invalid entries are reported in jobProblems.
+  const { jobs, problems: jobProblems } = normalizeJobs(wake.jobs);
   return {
     comms,
     machine: normalizeMachine(opts.machine || env.WAKE_MACHINE || wake.machine || comms.machine || os.hostname()),
@@ -622,6 +812,8 @@ export function resolveWakeConfig(opts = {}, env = process.env) {
     stateFile: path.join(stateDir, 'wake-state.json'),
     wakeFile,
     selfRestart: selfRestartEnabled(opts, env, file, wake),
+    jobs,
+    jobProblems,
   };
 }
 
@@ -659,6 +851,7 @@ export function createWaker(cfg, { log = () => {}, now } = {}) {
     limitPerHour: cfg.limitPerHour, stopOnRepeat: cfg.stopOnRepeat, maxEventAgeMs: cfg.maxEventAgeMs, waitMs: cfg.waitMs, reconnectMs: cfg.reconnectMs,
     machine: cfg.machine,
     keepaliveSince, keepaliveClient: keepaliveSince ? new Client(cfg.comms) : null, keepaliveIntervalMs: cfg.keepaliveIntervalMs,
+    jobs: cfg.jobs || [],
   });
 }
 

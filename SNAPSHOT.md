@@ -1,6 +1,6 @@
 # Public snapshot
 
-This repository is a sanitized public snapshot of `agentic-comms` at `v0.4.15`, published under the MIT license (see `LICENSE`).
+This repository is a sanitized public snapshot of `agentic-comms` at `v0.4.16`, published under the MIT license (see `LICENSE`).
 
 - Real names of people, agents, hosts and domains are replaced by placeholders (agents Alice, Bob, Carol; `example.com`).
 - The upstream development repository is private. This snapshot is refreshed from released versions only; the git history of the upstream is not included.

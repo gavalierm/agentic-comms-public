@@ -20,6 +20,7 @@ export class Store {
       notices: path.join(dir, 'notices'),
       events: path.join(dir, 'events'),
       turns: path.join(dir, 'turns'),
+      clients: path.join(dir, 'clients'),
     };
   }
 
@@ -177,6 +178,23 @@ export class Store {
 
   turns(filter = () => true) {
     return listJsonFiles(this.dirs.turns).map((f) => readJson(path.join(this.dirs.turns, f), null)).filter((t) => t && filter(t));
+  }
+
+  // --- client versions (per sender and machine) ------------------------------------
+  clientFile(sender, machine) {
+    return path.join(this.dirs.clients, `${encodeURIComponent(sender)}__${encodeURIComponent(machine || 'unknown')}.json`);
+  }
+
+  client(sender, machine) {
+    return readJson(this.clientFile(sender, machine), null);
+  }
+
+  saveClient(rec) {
+    writeJson(this.clientFile(rec.sender, rec.machine), rec);
+  }
+
+  clients() {
+    return listJsonFiles(this.dirs.clients).map((f) => readJson(path.join(this.dirs.clients, f), null)).filter(Boolean);
   }
 
   // --- wake events ----------------------------------------------------------------

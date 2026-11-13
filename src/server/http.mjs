@@ -23,6 +23,7 @@ export function createHandler(service, store) {
         throw new HttpError(401, 'chýba alebo neplatný kľúč');
       }
 
+      service.noteClient(sender, req.headers);
       const route = `${req.method} ${url.pathname}`;
       switch (route) {
         case 'GET /': {
@@ -65,6 +66,8 @@ export function createHandler(service, store) {
           return sendJson(res, 200, service.turn(body));
         case 'GET /turns':
           return sendJson(res, 200, { turns: service.turns({ open: url.searchParams.get('open') === '1' }) });
+        case 'GET /clients':
+          return sendJson(res, 200, { clients: service.clients() });
         case 'POST /notice':
           return sendJson(res, 201, service.createExternalNotice(sender, body));
         case 'GET /events': {

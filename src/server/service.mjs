@@ -112,6 +112,38 @@ export class Service {
     return this.instance.instance_id;
   }
 
+  /**
+   * Record which mail client and workflow version a sender (persona) runs on a machine (headers X-Comms-Client,
+   * X-Workflow-Version, X-Comms-Machine). A client without them (older than 0.4.16) is recorded with nulls under
+   * machine `unknown`. A call without X-Workflow-Version keeps the recorded workflow version. The file is rewritten
+   * only when a value changes or `last_seen` is older than a minute.
+   */
+  noteClient(sender, headers = {}, now = Date.now()) {
+    try {
+      const h = (k) => { const v = headers[k]; return v == null || v === '' ? null : String(v).slice(0, 80); };
+      const machine = normalizeMachine(h('x-comms-machine')) || 'unknown';
+      const cache = this.clientSeen || (this.clientSeen = new Map());
+      const key = `${sender}\u0000${machine}`;
+      const prev = cache.get(key) || this.store.client(sender, machine);
+      // A call without the workflow header (wake module, direct CLI) keeps the workflow version seen before.
+      const rec = { sender, machine, comms_version: h('x-comms-client'), workflow_version: h('x-workflow-version') ?? prev?.workflow_version ?? null };
+      const same = prev && prev.comms_version === rec.comms_version && prev.workflow_version === rec.workflow_version;
+      if (same && prev.last_seen && now - Date.parse(prev.last_seen) < 60_000) return prev;
+      const out = { ...rec, first_seen: (same && prev.first_seen) || new Date(now).toISOString(), last_seen: new Date(now).toISOString() };
+      this.store.saveClient(out);
+      cache.set(key, out);
+      return out;
+    } catch (e) {
+      this.log(`noteClient: ${e.message}`);
+      return null;
+    }
+  }
+
+  /** Recorded client versions, newest first. */
+  clients() {
+    return this.store.clients().sort((a, b) => String(b.last_seen).localeCompare(String(a.last_seen)));
+  }
+
   health() {
     return { ok: true, instance_id: this.instanceId, instance: this.instance.instance, pid: process.pid, time: nowIso() };
   }

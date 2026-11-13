@@ -65,6 +65,8 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
                  čakajúce sa vrátia odosielateľom (undelivered); nová registrácia bez --close ju znovu otvorí
   events [--since <n>|latest] [--wait <ms>]       udalosti budenia (long-poll)
   flush                                           odošle odchádzajúcu schránku (outbox)
+  clients                                         verzie pošty a workflow podľa odosielateľa (persony) a stroja, ako ich služba videla
+                                                  (comms_version a workflow_version null: starý klient bez verzie alebo workflow ju neposlal)
 
 Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http://host:port>
                 --key <kľúč> | --thread <id> | --machine <stroj> | --outbox <cesta> | --timeout <ms> | --no-start
@@ -313,6 +315,8 @@ async function run(cmd, args, cfg, io) {
       });
     case 'events':
       return client.events(args.since === 'latest' ? 'latest' : Number(args.since || 0), Number(args.wait || 0));
+    case 'clients':
+      return client.clients();
     case 'flush': {
       await client.ensureRunning();
       return client.flushOutbox();

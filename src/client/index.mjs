@@ -14,6 +14,8 @@ export const COUNT_TTL = 60_000;
 /** Turn records (`turn`) give up quickly; only a `closed` record is queued on outage. */
 export const TURN_TIMEOUT = 1000;
 const BIN = fileURLToPath(new URL('../../bin/comms.mjs', import.meta.url));
+/** Version of this mail client (package.json); sent with every request so the service records which client a machine runs. */
+export const CLIENT_VERSION = readJson(fileURLToPath(new URL('../../package.json', import.meta.url)), {}).version || null;
 
 export class CommsError extends Error {
   constructor(code, message, extra = {}) {
@@ -44,6 +46,8 @@ export function resolveConfig(opts = {}, env = process.env) {
     threadId: opts.thread || env.COMMS_THREAD_ID || cfg.thread_id || env.T3CODE_THREAD_ID || null,
     // Machine of this client's threads: wake modules ring only holders on their own machine.
     machine: normalizeMachine(opts.machine || env.COMMS_MACHINE || cfg.machine || os.hostname()),
+    // Version of the workflow that calls this client (the workflow sets COMMS_WORKFLOW_VERSION); recorded by the service.
+    workflowVersion: opts.workflowVersion || env.COMMS_WORKFLOW_VERSION || cfg.workflow_version || null,
     outbox: opts.outbox || env.COMMS_OUTBOX || cfg.outbox || path.join(cdir, 'outbox'),
     clientDir: cdir,
     timeout: Number(opts.timeout || env.COMMS_TIMEOUT || cfg.timeout || DEFAULT_TIMEOUT),
@@ -74,6 +78,7 @@ export class Client {
       : { socketPath: this.cfg.socket, path: pathname + q };
     const headers = { Accept: 'application/json' };
     if (auth && this.cfg.key) headers.Authorization = `Bearer ${this.cfg.key}`;
+    Object.assign(headers, versionHeaders(this.cfg));
     let payload = null;
     if (body !== undefined) {
       payload = JSON.stringify(body);
@@ -197,6 +202,8 @@ export class Client {
   bounce(body) { return this.call('POST', '/bounce', { body }); }
   message(id) { return this.call('GET', '/message', { query: { id } }); }
   turns(open = true) { return this.call('GET', '/turns', { query: { open: open ? '1' : null } }); }
+  /** Versions of mail clients and workflow per sender (persona) and machine, as the service saw them. */
+  clients() { return this.call('GET', '/clients'); }
 
   /**
    * Record a turn (open/closed); never thrown on outage. On outage a `closed` record is
@@ -287,6 +294,16 @@ export class Client {
       return { total: entry.total ?? null, blocker: entry.blocker ?? null, ...idsOf(entry), cached: entry.total != null, unavailable: true, first_report: true, error: e.message };
     }
   }
+}
+
+/** Headers naming the client version, workflow version and machine (an older service ignores them). */
+export function versionHeaders(cfg) {
+  const h = {};
+  const clean = (v) => String(v).replace(/[^\x20-\x7e]/g, '').trim().slice(0, 80);
+  if (CLIENT_VERSION) h['X-Comms-Client'] = clean(CLIENT_VERSION);
+  if (cfg.workflowVersion) h['X-Workflow-Version'] = clean(cfg.workflowVersion);
+  if (cfg.machine) h['X-Comms-Machine'] = clean(cfg.machine);
+  return h;
 }
 
 /** `ids` only when the service sent them (an older service has none; the workflow then uses `total`). */

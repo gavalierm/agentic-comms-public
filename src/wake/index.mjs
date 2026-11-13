@@ -359,7 +359,7 @@ export class Waker {
 
   // --- keepalive ----------------------------------------------------------------------
   /** One keepalive round over the open turns; returns one result per turn. */
-  async keepaliveOnce() {
+  async keepaliveOnce(signal) {
     if (!this.keepaliveSince) return [];
     const since = await this.keepaliveSince();
     if (since == null) {
@@ -371,7 +371,10 @@ export class Waker {
     this.kaClient.reset?.();
     const { turns } = await this.kaClient.turns(true);
     const out = [];
-    for (const turn of turns) out.push(await this.keepaliveTurn(turn, since));
+    for (const turn of turns) {
+      if (signal && signal.aborted) break;   // SIGTERM ends the round at the next thread, not after all of them
+      out.push(await this.keepaliveTurn(turn, since));
+    }
     return out;
   }
 
@@ -450,11 +453,12 @@ export class Waker {
    * ring is no progress: one `turn-stalled` notice to the operator, no further ring. Code, not the agent, keeps the loop going.
    * A turn closed with `resume_at` (the thread's timer, P-061) is rung at that time, also with the same step again.
    */
-  async continueOnce() {
+  async continueOnce(signal) {
     if (!this.adapter) return [];
     const { turns } = await this.kaClient.turns(false);
     const out = [];
     for (const turn of turns) {
+      if (signal && signal.aborted) break;   // SIGTERM ends the round at the next thread (T3 status takes ~1 s each)
       if (turn.state !== 'closed' || !turn.next || turn.close_reason === 'keepalive') continue;
       out.push(await this.continueTurn(turn));
     }
@@ -505,13 +509,13 @@ export class Waker {
   async keepaliveLoop(signal) {
     while (!signal || !signal.aborted) {
       try {
-        await this.continueOnce();
+        await this.continueOnce(signal);
       } catch (e) {
         if (signal && signal.aborted) break;
         this.log(`continue: ${e.code === 'UNAVAILABLE' ? 'comms unavailable' : `error: ${e.message}`}`);
       }
       try {
-        await this.keepaliveOnce();
+        await this.keepaliveOnce(signal);
       } catch (e) {
         if (signal && signal.aborted) break;
         this.log(`keepalive: ${e.code === 'UNAVAILABLE' ? 'comms unavailable' : `error: ${e.message}`}`);

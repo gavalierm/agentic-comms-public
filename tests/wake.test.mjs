@@ -795,6 +795,27 @@ test('discussion with the operator: steer and assist are held, a blocker rings; 
   assert.deepEqual(waker.state.held, {});
 });
 
+// SIGTERM during a round over many threads (T3 status ~1.2 s each) stopped wake only after the whole round, ~17 s
+// (2026-11-13): the round ends at the next thread once the signal aborts.
+test('continue and keepalive rounds end at the next thread when the signal aborts', async (t) => {
+  const { client, waker, adapter, clock, t3 } = await kaSetup(t);
+  for (const th of ['thr-a', 'thr-b', 'thr-c']) {
+    await client.turn({ thread: th, state: 'open', machine: 'm1', project: 'p', topic: 't' });
+    await client.turn({ thread: th, state: 'closed', next: 'step' });
+  }
+  for (const th of ['thr-d', 'thr-e', 'thr-f']) await client.turn({ thread: th, state: 'open', machine: 'm1', project: 'p', topic: 't' });
+  await t3.restart();
+  clock.t = Date.now() + 2 * 60_000;
+  let ac = new AbortController();
+  adapter.status = async (thread) => { adapter.statusCalls.push(thread); ac.abort(); return { ok: true, running: false, status: 'completed' }; };
+  assert.equal((await waker.continueOnce(ac.signal)).length, 1, 'continue: no thread after the abort');
+  assert.equal(adapter.statusCalls.length, 1);
+  ac = new AbortController();
+  adapter.statusCalls.length = 0;
+  await waker.keepaliveOnce(ac.signal);
+  assert.deepEqual(adapter.statusCalls, ['thr-d'], 'keepalive: no thread after the abort');
+});
+
 test('held ring: dropped when picked up meanwhile; released by the next poll without a `discussion-closed` event', async (t) => {
   const { inst, client, waker, adapter } = await setup(t);
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });

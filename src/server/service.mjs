@@ -589,7 +589,7 @@ export class Service {
       total: list.length, blocker: list.filter((m) => levelOf(m) === 'blocker').length, ids: list.map((m) => m.id),
       items: list.map((m) => ({
         id: m.id, level: levelOf(m), reply_to: m.reply_to || null, reply_state: m.reply_to ? replyStateOf(m) : null, cancels: m.cancels || null,
-        answer_state: m.answer_state || null, answer_at: m.answer_at || null, to_thread: m.to_thread || null, sender: m.sender || null, created_at: m.created_at,
+        answer_state: m.answer_state || null, answer_at: m.answer_at || null, to_thread: m.to_thread || null, sender: m.sender || null, created_at: m.created_at, picked_at: m.picked_at || null,
       })),
     };
   }

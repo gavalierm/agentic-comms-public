@@ -201,6 +201,8 @@ export class Client {
   createNotice(body) { return this.call('POST', '/notice', { body }); }
   bounce(body) { return this.call('POST', '/bounce', { body }); }
   message(id) { return this.call('GET', '/message', { query: { id } }); }
+  /** Pending messages of a mailbox without reading them (no pickup, no count cache): the wake module's check before a ring. */
+  pendingMail(q) { return this.call('GET', '/count', { query: q }); }
   turns(open = true) { return this.call('GET', '/turns', { query: { open: open ? '1' : null } }); }
   /** Versions of mail clients and workflow per sender (persona) and machine, as the service saw them. */
   clients() { return this.call('GET', '/clients'); }

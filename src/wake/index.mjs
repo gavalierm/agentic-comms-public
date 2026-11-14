@@ -224,6 +224,23 @@ export class Waker {
       }
     }
 
+    // Mail bell only while mail waits: the thread picked it up meanwhile (receive) → no ring; the bell turn would find no
+    // new mail and the workflow hook would block its prompt (wake-picked-check 2026-11-14).
+    if (BOUNCE_TYPES.includes(ev.type)) {
+      const q = { thread: String(ev.holder) };
+      if (ev.project && ev.topic) { q.project = ev.project; q.topic = ev.topic; }
+      try {
+        const c = await this.client.pendingMail(q);
+        const items = Array.isArray(c.items) ? c.items : [];
+        if (!items.some((m) => !m.picked_at)) {
+          this.log(`mail ${topicLabel(ev)}: ${items.length} pending, ${items.length ? 'všetky prevzaté' : 'žiadna'}; správa ${ev.message_id || '-'} nezvoní`);
+          return skip('picked');
+        }
+      } catch (e) {
+        this.log(`count ${topicLabel(ev)}: ${e.message}; zvoní sa bez kontroly`);
+      }
+    }
+
     // A busy thread gets the ring as its next turn: at most one queued ring per run.
     let openTurn = null;
     let record = null;

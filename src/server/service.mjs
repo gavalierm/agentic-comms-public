@@ -672,16 +672,18 @@ export class Service {
       if (Date.parse(m.expires_at) > now) continue;
       // Picked up within the deadline: it was read in time, so no `no reply` bell.
       if (m.picked_at && Date.parse(m.picked_at) <= Date.parse(m.expires_at)) continue;
-      // The recipient thread's open turn waits for the operator's dialog (P-061, `waiting_operator`): it cannot pick up, but it
-      // lives. The answer is `otázka` of origin `code`; the sender is rung as for a reply (no `no reply`).
-      if (this.recipientWaitsForOperator(m)) {
-        m.answer_state = 'otázka';
+      // The recipient lives but cannot pick up: it waits for the operator (P-061, `otázka`) or runs a turn that holds the
+      // message back (`busy`). The answer of origin `code` is written; the sender is rung as for a reply (no `no reply`).
+      const codeState = this.recipientCodeAnswer(m);
+      if (codeState) {
+        m.answer_state = codeState;
         m.answer_at = new Date(now).toISOString();
         m.answer_id = null;
         m.answer_origin = 'code';
         this.store.saveMessage(m);
-        const ev = this.emitOutcome('expired', m, { answer_state: 'otázka' });
-        this.log(`answer otázka (code) ${m.id} (${m.level}) ${m.project}/${m.topic}: recipient waits for the operator${ev ? `, event ${ev.seq} → ${ev.holder}` : ', no way back (log only)'}`);
+        const ev = this.emitOutcome('expired', m, { answer_state: codeState });
+        const why = codeState === 'busy' ? 'recipient runs a turn, delivered after it' : 'recipient waits for the operator';
+        this.log(`answer ${codeState} (code) ${m.id} (${m.level}) ${m.project}/${m.topic}: ${why}${ev ? `, event ${ev.seq} → ${ev.holder}` : ', no way back (log only)'}`);
         continue;
       }
       m.expired_at = new Date(now).toISOString();
@@ -706,15 +708,20 @@ export class Service {
   }
 
   /**
-   * The recipient's turn is open and waits for the operator's dialog (flag `waiting_operator` of the turn record), or the
-   * recipient discusses with the operator and the message is a steer/assist it holds back (D-0015, D-0022); a blocker
-   * passes the discussion, so its expiry stays `no reply`.
+   * Answer the service writes for an unpicked message past its deadline (CODE_ANSWER_STATES), or null (`no reply`):
+   * - `otázka`: the recipient waits for the operator: its open turn is in the dialog (`waiting_operator`), or, for a
+   *   steer/assist, its last turn ended with a question (closed turn with `discussion`, D-0015, D-0022);
+   * - `busy`: a steer/assist the recipient's open running turn holds back (`discussion` without `waiting_operator`: a turn
+   *   started by the operator or the first turn of a topic thread); it is delivered after the turn, nobody waits for the
+   *   operator (2026-11-14: such a turn got `otázka`).
+   * A blocker passes the discussion, so its expiry stays `no reply`.
    */
-  recipientWaitsForOperator(m) {
+  recipientCodeAnswer(m) {
     const thread = this.recipientThread(m);
     const turn = thread ? this.store.turn(thread) : null;
-    if (turn && turn.state === 'open' && turn.waiting_operator) return true;
-    return DISCUSSION_HELD_LEVELS.includes(levelOf(m)) && discussionOpen(turn);
+    if (turn && turn.state === 'open' && turn.waiting_operator) return 'otázka';
+    if (!DISCUSSION_HELD_LEVELS.includes(levelOf(m)) || !discussionOpen(turn)) return null;
+    return turn.state === 'open' ? 'busy' : 'otázka';
   }
 
   /**

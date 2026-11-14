@@ -49,7 +49,8 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
                                                   záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;
                                                   closed s --next: ďalší krok z handoveru, budenie vlákno zobudí na pokračovanie;
                                                   --discussion open: vlákno diskutuje s operátorom (D-0015), budenie steer/assist
-                                                  pozdrží do zatvorenia diskusie, po lehote odosielateľ dostane „otázka“; blocker prejde;
+                                                  pozdrží do zatvorenia diskusie, po lehote odosielateľ dostane „busy“ (otvorený ťah,
+                                                  doručí sa po ťahu) alebo „otázka“ (ťah skončil otázkou); blocker prejde;
                                                   pri výpadku { ok:false, unavailable:true[, queued:true] }, kód 0 (closed ide do outboxu)
   turn --waiting-operator true|false [--thread <id>] [--opened-at <iso>]
                                                   príznak otvoreného ťahu: vlákno čaká na dialóg operátora (P-061); pošta správu preň po lehote

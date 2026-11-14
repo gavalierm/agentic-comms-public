@@ -97,9 +97,10 @@ test('an answer left `otázka` for 24 h: exactly one operator notice with a dedu
 });
 
 // D-0015, D-0022: while the recipient discusses with the operator (turn `discussion`), a steer/assist it cannot pick up
-// is answered `otázka` by code, as in the dialog; a blocker passes the discussion and expires as before.
-test('discussion with the operator: an unpicked steer/assist is answered `otázka` by code, a blocker expires', async (t) => {
-  const { alice, bob, svc } = await setup(t);
+// is answered by code: `busy` while its turn runs (delivered after the turn), `otázka` once it waits for the operator
+// (dialog, or the last turn ended with a question); a blocker passes the discussion and expires as before.
+test('discussion with the operator: an unpicked steer/assist is answered `busy` in a running turn, `otázka` when waiting; a blocker expires', async (t) => {
+  const { alice, bob, asBob, svc } = await setup(t);
   const o = await bob.turn({ thread: 'thr-bob', state: 'open', discussion: 'open' });
   assert.equal(o.turn.discussion, true);
   const steer = await alice.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', ttl: '60s' });
@@ -108,10 +109,18 @@ test('discussion with the operator: an unpicked steer/assist is answered `otázk
   assert.deepEqual(svc.checkExpired(Date.now() + 120_000), [blocker.id], 'only the blocker expires');
   for (const m of [steer, assist]) {
     const st = await alice.message(m.id);
-    assert.deepEqual([st.outcome, st.answer_state, st.answer_origin], [null, 'otázka', 'code'], m.level);
+    assert.deepEqual([st.outcome, st.answer_state, st.answer_origin], [null, 'busy', 'code'], m.level);
   }
   const ev = (await alice.events(0, 0)).events.filter((e) => e.type === 'expired');
-  assert.deepEqual(ev.map((e) => [e.message_id, e.answer_state || null]), [[steer.id, 'otázka'], [assist.id, 'otázka'], [blocker.id, null]]);
+  assert.deepEqual(ev.map((e) => [e.message_id, e.answer_state || null]), [[steer.id, 'busy'], [assist.id, 'busy'], [blocker.id, null]]);
+  // A reply cannot carry `busy` (it is not a reply state).
+  await assert.rejects(asBob.send({ reply_to: steer.id, reply_state: 'busy', text: 'x' }), (e) => e.status === 400);
+
+  // The same open turn in the operator's dialog: `otázka`.
+  await bob.turn({ thread: 'thr-bob', waiting_operator: true, opened_at: o.turn.opened_at });
+  const m1 = await send(alice);
+  assert.deepEqual(svc.checkExpired(Date.now() + 120_000), []);
+  assert.equal((await alice.message(m1.id)).answer_state, 'otázka');
 
   // The turn ends with a question to the operator: the discussion stays open over the closed turn.
   const c = await bob.turn({ thread: 'thr-bob', state: 'closed', opened_at: o.turn.opened_at, discussion: 'open' });

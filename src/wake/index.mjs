@@ -27,7 +27,7 @@
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { readJson, writeJson, nowIso, normalizeMachine, parseTimestamp, discussionOpen, DISCUSSION_HELD_LEVELS } from '../common/util.mjs';
+import { readJson, writeJson, nowIso, normalizeMachine, parseTimestamp, discussionOpen, DISCUSSION_HELD_LEVELS, CODE_ANSWER_STATES } from '../common/util.mjs';
 import { resolveConfig, Client } from '../client/index.mjs';
 import { Store } from '../server/store.mjs';
 import { selfRestartEnabled } from '../common/selfrestart.mjs';
@@ -212,8 +212,9 @@ export class Waker {
     if (ev.type === 'expired' && ev.message_id) {
       try {
         const st = await this.client.message(ev.message_id);
-        // Interim `otázka` of origin `code` (the recipient waits for the operator's dialog): the ring tells the sender so.
-        const byCode = st.answer_origin === 'code' && st.answer_state === 'otázka';
+        // Answer of origin `code` (`otázka`: the recipient waits for the operator; `busy`: its running turn holds the
+        // message back): the ring tells the sender so.
+        const byCode = st.answer_origin === 'code' && CODE_ANSWER_STATES.includes(st.answer_state);
         // A held message (unregistered topic, persona without a main thread) is open as a pending one: its expiry tells the
         // sender nobody got it (4 silent expiries, audit M5 2026-11-11).
         const open = st.state === 'pending' || st.state === 'held';

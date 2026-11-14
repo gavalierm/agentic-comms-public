@@ -802,6 +802,19 @@ test('expired event with answer `otázka` by code (recipient waits for the opera
   assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the bell stays; the hook reads the state `otázka` from `message`');
 });
 
+test('expired event with answer `busy` by code (recipient runs a turn that holds the message) is rung to the sender, not skipped as answered', async (t) => {
+  const { inst, client, waker, adapter, svc } = await setup(t);
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });
+  await bob.turn({ thread: 'thr-1', state: 'open', discussion: 'open' });
+  const m = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'adjust', ttl: '60s', thread_id: 'thr-a' });
+  await waker.pollOnce(500);
+  adapter.calls.length = 0;
+  svc.checkExpired(Date.now() + 61_000);
+  assert.equal((await client.message(m.id)).answer_state, 'busy');
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the bell stays; the hook reads the state `busy` from `message`');
+});
+
 // D-0015, D-0022: no steer/assist ring into an open discussion with the operator; a blocker passes; the held ring goes
 // out when the discussion closes.
 test('discussion with the operator: steer and assist are held, a blocker rings; the held mail rings when it closes', async (t) => {

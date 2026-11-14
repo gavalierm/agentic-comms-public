@@ -6,6 +6,13 @@ export const LEVELS = ['blocker', 'steer', 'assist'];
 /** State a reply carries (workflow P-061): one final `hotovo` per message; `otázka` and `čakám` are interim. */
 export const REPLY_STATES = ['hotovo', 'otázka', 'čakám'];
 export const FINAL_REPLY_STATE = 'hotovo';
+/**
+ * Answer states the service writes itself (`answer_origin: code`) to an unpicked steer/assist/blocker past its deadline:
+ * `otázka` = the recipient waits for the operator (dialog, or its last turn ended with a question); `busy` = the recipient
+ * runs an open turn that holds the message back (discussion with the operator), it is delivered after the turn.
+ * `busy` is not a reply state (a reply cannot carry it).
+ */
+export const CODE_ANSWER_STATES = ['otázka', 'busy'];
 /** Level removed (operator 2026-11-02): refused with this text, pointing to the valid levels. */
 export const LEVEL_REMOVED_TEXT = 'úroveň „info“ bola zrušená; použi assist (nečakáš, príjemca prečíta pri voľnom bode), steer (príjemca rieši hneď) alebo blocker (čakáš na odpoveď). Platné úrovne: ' + 'blocker|steer|assist';
 /** Deadline for PICKUP (the body is read), not for the answer. `ttl` may shorten it, never extend it. A reply has none; it carries a state (REPLY_STATES). */

@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import { Store } from './store.mjs';
 import { Service } from './service.mjs';
 import { createHandler } from './http.mjs';
+import { migrateData } from './migrate.mjs';
 import { socketPath } from '../common/paths.mjs';
 import { nowIso } from '../common/util.mjs';
 
@@ -48,7 +49,15 @@ export async function startServer({ dataDir, tcp = null, log = () => {}, managed
     try { fs.unlinkSync(sock); } catch { /* no stale socket */ }
   }
 
+  // 0.4.x data (no meta.json) is migrated in one step before any request is served (design 4b); a failed verification
+  // throws MigrationError and the service does not start (the data stays in the backup).
+  const migration = migrateData(store, { log });
+  if (migration.migrated) log(`migrated to schema 2, backup ${migration.backup}`);
+
   const service = new Service(store, { log });
+  // I5: a reply written without its original (stop between the two writes) is finished before the first request.
+  const repaired = service.repair();
+  if (repaired.length) log(`repair: ${repaired.length} message(s) finished: ${repaired.join(', ')}`);
   const handler = createHandler(service, store);
   const server = http.createServer(handler);
   server.keepAliveTimeout = 5000;
@@ -98,5 +107,5 @@ export async function startServer({ dataDir, tcp = null, log = () => {}, managed
     if (tcpServer) { tcpServer.close(done); tcpServer.closeAllConnections?.(); }
   });
 
-  return { close, socket: sock, tcp: tcpCfg, service, store };
+  return { close, socket: sock, tcp: tcpCfg, service, store, migration, repaired };
 }

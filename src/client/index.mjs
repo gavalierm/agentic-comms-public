@@ -1,5 +1,7 @@
-// Client core: http.request over socketPath (or TCP URL), instance_id check,
-// start-on-demand, outbox for outages, message count (live; after an outage a 60 s backoff).
+// Client core of mail model 2: http.request over socketPath (or TCP URL), instance_id and model check, start-on-demand,
+// outbox for outages (writes with client_op_id), obligations with an offline backup, message count.
+// Model (4a, I10): every request carries X-Comms-Model: 2; a service of another model (/health, 426) fails loudly and
+// nothing is written or queued. The outbox is only for an unavailable service (P-041).
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,14 +15,23 @@ export const DEFAULT_TIMEOUT = 2000;
 export const COUNT_TTL = 60_000;
 /** Turn records (`turn`) give up quickly; only a `closed` record is queued on outage. */
 export const TURN_TIMEOUT = 1000;
+/** Mail model this client speaks (D-0087, D-0089); the service must report the same in /health. */
+export const MAIL_MODEL = 2;
+/** Writes that go into the outbox on outage; each carries a client_op_id (the service replays a repeated one). */
+export const OUTBOX_OPS = ['/send', '/resolve', '/withdraw'];
 const BIN = fileURLToPath(new URL('../../bin/comms.mjs', import.meta.url));
 /** Version of this mail client (package.json); sent with every request so the service records which client a machine runs. */
 export const CLIENT_VERSION = readJson(fileURLToPath(new URL('../../package.json', import.meta.url)), {}).version || null;
 
+/** The one line of a model mismatch (3c, 4a). */
+export function modelMismatchText(model) {
+  return `comms model ${model ?? '?'} ≠ ${MAIL_MODEL}: update mail and workflow together`;
+}
+
 export class CommsError extends Error {
   constructor(code, message, extra = {}) {
     super(message);
-    this.code = code; // UNAVAILABLE | INSTANCE_MISMATCH | REJECTED | USAGE
+    this.code = code; // UNAVAILABLE | INSTANCE_MISMATCH | MODEL_MISMATCH | REJECTED | BAD_RESPONSE | USAGE
     Object.assign(this, extra);
   }
 }
@@ -68,15 +79,15 @@ export class Client {
   }
 
   /**
-   * Raw request; throws CommsError UNAVAILABLE on transport failure, REJECTED on 4xx/5xx,
-   * BAD_RESPONSE on a 2xx whose body is not JSON. Every call has its own timeout (default cfg.timeout).
+   * Raw request; throws CommsError UNAVAILABLE on transport failure, MODEL_MISMATCH on 426, REJECTED on another
+   * 4xx/5xx, BAD_RESPONSE on a 2xx whose body is not JSON. Every call has its own timeout (default cfg.timeout).
    */
   request(method, pathname, { body, query, auth = true, timeout = this.cfg.timeout } = {}) {
     const q = query ? '?' + new URLSearchParams(Object.entries(query).filter(([, v]) => v != null && v !== '')).toString() : '';
     const target = this.cfg.url
       ? (() => { const u = new URL(this.cfg.url); return { host: u.hostname, port: u.port || 80, path: (u.pathname.replace(/\/$/, '')) + pathname + q }; })()
       : { socketPath: this.cfg.socket, path: pathname + q };
-    const headers = { Accept: 'application/json' };
+    const headers = { Accept: 'application/json', 'X-Comms-Model': String(MAIL_MODEL) };
     if (auth && this.cfg.key) headers.Authorization = `Bearer ${this.cfg.key}`;
     Object.assign(headers, versionHeaders(this.cfg));
     let payload = null;
@@ -101,6 +112,7 @@ export class Client {
             }
           }
           if (ok) return resolve(data);
+          if (res.statusCode === 426) return reject(new CommsError('MODEL_MISMATCH', `${modelMismatchText(data.model ?? null)} (${data.error || 'HTTP 426'})`, { status: 426, data }));
           reject(new CommsError('REJECTED', data.error || `HTTP ${res.statusCode}`, { status: res.statusCode, data }));
         });
       });
@@ -111,7 +123,7 @@ export class Client {
     });
   }
 
-  /** Ensure the service answers and is the expected instance; start it if allowed. */
+  /** Ensure the service answers, is the expected instance and speaks model 2; start it if allowed. */
   async ensureRunning() {
     if (this.health) return this.health;
     let h = await this.tryHealth();
@@ -128,6 +140,8 @@ export class Client {
     if (expected && h.instance_id !== expected) {
       throw new CommsError('INSTANCE_MISMATCH', `comms: iná inštancia (očakávané ${expected}, služba hlási ${h.instance_id})`, { expected, actual: h.instance_id });
     }
+    // Another model: nothing is read, written or queued (4a); the outbox stays as it is (3c).
+    if (h.model !== MAIL_MODEL) throw new CommsError('MODEL_MISMATCH', modelMismatchText(h.model), { model: h.model ?? null, version: h.version ?? null });
     this.health = h;
     return h;
   }
@@ -165,22 +179,42 @@ export class Client {
     return this.request(method, pathname, opts);
   }
 
-  send(body) {
-    return this.call('POST', '/send', { body: this.withThread(body) });
-  }
-
-  /** Send; on outage queue into the outbox instead of failing. */
-  async sendOrQueue(body) {
-    const msg = this.withThread(body);
+  /**
+   * A write of the outbox kind (send, resolve, withdraw) with a client_op_id: the outbox goes first (order), then this
+   * write. Only an unavailable service queues it (`{ queued: true, client_op_id, outbox_file }`); another model, a
+   * rejection or an instance mismatch throw and nothing is queued.
+   */
+  async write(pathname, body) {
+    const item = { ...body, client_op_id: body.client_op_id || newId() };
     try {
       await this.ensureRunning();
-      await this.flushOutbox();
-      return await this.request('POST', '/send', { body: msg });
+      if (listJsonFiles(this.cfg.outbox).length) await this.flushOutbox();
+      return await this.request('POST', pathname, { body: item });
     } catch (e) {
       if (e.code !== 'UNAVAILABLE') throw e;
-      const file = this.queue('/send', msg);
-      return { queued: true, outbox_file: file, message: 'comms unavailable' };
+      const file = this.queue(pathname, item);
+      return { queued: true, client_op_id: item.client_op_id, outbox_file: file, message: 'comms unavailable' };
     }
+  }
+
+  /** New message (never a reply: a reply is `resolve`); queued on outage. */
+  send(body) {
+    return this.write('/send', this.withThread(body));
+  }
+
+  /**
+   * Answer or settle a message of the caller's mailbox (one operation, 1d): `state` hotovo|otázka|čakám, `text` (without
+   * text only hotovo = settled), `ack: true` (acked, from picked only), `cancels`. The mailbox: project+topic, persona or
+   * thread (default the client's thread). Queued on outage.
+   */
+  resolve(body) {
+    const b = this.withThread(body);
+    return this.write('/resolve', { ...b, thread: body.thread || b.thread_id });
+  }
+
+  /** The sender takes its non-final message back; queued on outage. */
+  withdraw(body) {
+    return this.write('/withdraw', body);
   }
 
   withThread(body) {
@@ -189,22 +223,30 @@ export class Client {
   }
 
   receive(q) { return this.call('GET', '/receive', { query: q }); }
-  ack(ids) { return this.call('POST', '/ack', { body: { ids } }); }
   notices(all = false) { return this.call('GET', '/notices', { query: { all: all ? '1' : null } }); }
   decide(body) { return this.call('POST', '/decide', { body }); }
   /**
    * Register a topic (see service.registerTopic). `takeover: true` allows replacing another holder;
    * `release: true` clears the holder (no holder given, or the current one; else needs `takeover`);
-   * `close: true` also marks the topic closed (send/reply 410, pending mail bounces to the senders).
+   * `close: true` also marks the topic closed (send 410, pending mail becomes undelivered for the senders).
    */
   registerTopic(body) { return this.call('POST', '/register-topic', { body }); }
   createNotice(body) { return this.call('POST', '/notice', { body }); }
   bounce(body) { return this.call('POST', '/bounce', { body }); }
-  message(id) { return this.call('GET', '/message', { query: { id } }); }
-  /** Settle a picked message without a reply (final answer `hotovo`, origin `settled`); body { id, thread | project+topic | persona }. */
-  settle(body) { return this.call('POST', '/settle', { body }); }
+  /** State of one message (status, history); the body only for its sender and its mailbox (q names the mailbox). */
+  message(id, q = {}) { return this.call('GET', '/message', { query: { id, ...q } }); }
   /** Pending messages of a mailbox without reading them (no pickup, no count cache): the wake module's check before a ring. */
   pendingMail(q) { return this.call('GET', '/count', { query: q }); }
+  /** Waits due now (1e): the key `wake` all of them, another key those of its own messages. */
+  due() { return this.call('GET', '/obligations', { query: { due: '1' } }); }
+  /**
+   * Confirm the ring of a due wait (1e point 2): the next check, or the end of the wait. Without `rangAt` the service
+   * takes its own clock (a wake module on another machine whose clock is behind would confirm before the due time,
+   * which the service ignores).
+   */
+  waitRang(id, rangAt = null) { return this.call('POST', '/wait-rang', { body: { id, ...(rangAt ? { rang_at: rangAt } : {}) } }); }
+  /** Hand a local wait over to the service (4b step 5): only the sender of a non-final message. */
+  waitAdopt(body) { return this.call('POST', '/wait-adopt', { body }); }
   turns(open = true) { return this.call('GET', '/turns', { query: { open: open ? '1' : null } }); }
   /** Versions of mail clients and workflow per sender (persona) and machine, as the service saw them. */
   clients() { return this.call('GET', '/clients'); }
@@ -237,37 +279,105 @@ export class Client {
 
   // --- outbox ----------------------------------------------------------------------
   queue(pathname, body) {
+    // The name sorts by time (newId starts with it), so a flush keeps the order of the writes.
     const file = path.join(this.cfg.outbox, `${newId()}.json`);
     writeJson(file, { path: pathname, body, queued_at: nowIso() });
     return file;
   }
 
-  /** Send queued messages in order. Stops at first outage. Returns summary. */
-  async flushOutbox() {
-    const files = listJsonFiles(this.cfg.outbox);
-    const out = { sent: [], rejected: [], remaining: 0 };
-    for (const f of files) {
+  /** Queued items in order: [{ file, item }] (an unreadable file is removed). */
+  outboxItems() {
+    const out = [];
+    for (const f of listJsonFiles(this.cfg.outbox)) {
       const full = path.join(this.cfg.outbox, f);
       const item = readJson(full, null);
-      if (!item) { fs.unlinkSync(full); continue; }
+      if (!item) { try { fs.unlinkSync(full); } catch { /* gone */ } continue; }
+      out.push({ file: f, item });
+    }
+    return out;
+  }
+
+  /**
+   * Send the queued items in order (3c). The model is checked first (ensureRunning): another model leaves every item
+   * where it is. Per item: 2xx → done; 409 with a final status → dropped with the line `already <resolution>`; another
+   * 4xx → `rejected/` with a line; outage, 426 or 5xx → stop, the rest stays. Returns
+   * `{ sent, dropped, rejected, remaining, lines }`; an outage or another model throws after recording what was sent.
+   */
+  async flushOutbox() {
+    await this.ensureRunning();
+    const items = this.outboxItems();
+    const out = { sent: [], dropped: [], rejected: [], remaining: 0, lines: [] };
+    for (let i = 0; i < items.length; i++) {
+      const { file: f, item } = items[i];
+      const full = path.join(this.cfg.outbox, f);
       try {
         const res = await this.request('POST', item.path, { body: item.body });
         fs.unlinkSync(full);
-        out.sent.push({ file: f, id: res.id });
+        out.sent.push({ file: f, path: item.path, id: res.id ?? null, ...(res.replayed ? { replayed: true } : {}) });
       } catch (e) {
-        if (e.code === 'REJECTED') {
+        const st = e.data || {};
+        if (e.code === 'REJECTED' && e.status === 409 && FINAL_STATUSES.includes(st.status)) {
+          fs.unlinkSync(full);
+          const line = `already ${st.resolution || st.status} ${st.id || item.body.id || ''}`.trim();
+          out.dropped.push({ file: f, path: item.path, id: st.id || item.body.id || null, status: st.status, resolution: st.resolution || null });
+          out.lines.push(line);
+          continue;
+        }
+        if (e.code === 'REJECTED' && e.status >= 400 && e.status < 500) {
           const dir = path.join(this.cfg.outbox, 'rejected');
           fs.mkdirSync(dir, { recursive: true });
           fs.renameSync(full, path.join(dir, f));
-          writeJson(path.join(dir, `${f}.error.json`), { error: e.message, status: e.status, at: nowIso() });
-          out.rejected.push({ file: f, error: e.message });
+          writeJson(path.join(dir, `${f}.error.json`), { error: e.message, status: e.status, details: e.data || null, at: nowIso() });
+          out.rejected.push({ file: f, path: item.path, status: e.status, error: e.message });
+          out.lines.push(`rejected ${item.path} ${item.body.id || ''} (${e.status}): ${e.message}`.replace(/\s+/g, ' '));
           continue;
         }
-        out.remaining = files.length - out.sent.length - out.rejected.length;
+        out.remaining = items.length - i;
+        e.flush = out;
         throw e;
       }
     }
     return out;
+  }
+
+  // --- obligations (section 2) with the offline backup (3b) ------------------------------
+  obligationsCacheFile() { return path.join(this.cfg.clientDir, 'obligations-cache.json'); }
+
+  /**
+   * What the thread owes and awaits (`GET /obligations`). Live: the outbox is flushed first (3c point 2), the answer then
+   * replaces the backup for this query (point 3). Unavailable: the last answer of the same query with `offline: true`,
+   * `age_s`, no `recent` rows (they were shown), minus the ids with a queued operation (an owed message with a queued
+   * resolve, an awaited one with a queued withdraw). No backup yet → `{ offline: true, unavailable: true, cached: false }`.
+   * Another model throws (nothing is read).
+   */
+  async obligations(q = {}, now = Date.now()) {
+    const key = ['thread', 'topics', 'project', 'persona'].map((k) => q[k] || '').join('|');
+    const cache = readJson(this.obligationsCacheFile(), {});
+    try {
+      await this.ensureRunning();
+      let flush = null;
+      if (listJsonFiles(this.cfg.outbox).length) flush = await this.flushOutbox();
+      const res = await this.request('GET', '/obligations', { query: q });
+      const { recent: _recent, ...kept } = res;
+      cache[key] = { at: now, data: kept };
+      writeJson(this.obligationsCacheFile(), cache);
+      return { ...res, offline: false, ...(flush && flush.lines.length ? { outbox_lines: flush.lines } : {}) };
+    } catch (e) {
+      if (e.code !== 'UNAVAILABLE') throw e;
+      const entry = cache[key];
+      if (!entry) return { offline: true, unavailable: true, cached: false, error: e.message };
+      const queued = new Map();
+      for (const { item } of this.outboxItems()) if (item.body && item.body.id) queued.set(String(item.body.id), item.path);
+      const d = entry.data;
+      const inbox = d.inbox ? { ...d.inbox, ids: (d.inbox.ids || []).filter((x) => !queued.has(x.id)) } : d.inbox;
+      if (inbox) inbox.n = inbox.ids.length;
+      return {
+        ...d, inbox,
+        owed: (d.owed || []).filter((x) => queued.get(x.id) !== '/resolve'),
+        awaiting: (d.awaiting || []).filter((x) => queued.get(x.id) !== '/withdraw'),
+        recent: [], offline: true, unavailable: true, cached: true, age_s: Math.max(0, Math.round((now - entry.at) / 1000)), error: e.message,
+      };
+    }
   }
 
   // --- cached count ------------------------------------------------------------------
@@ -284,23 +394,26 @@ export class Client {
     const cache = readJson(this.cacheFile(), {});
     const entry = cache[key] || {};
     if (entry.failed_at && now - entry.failed_at < COUNT_TTL) {
-      return { total: entry.total ?? null, blocker: entry.blocker ?? null, ...idsOf(entry), cached: true, unavailable: true, first_report: false };
+      return { total: entry.total ?? null, blocker: entry.blocker ?? null, ids: entry.ids || [], cached: true, unavailable: true, first_report: false };
     }
     try {
       const res = await this.call('GET', '/count', { query: q });
-      cache[key] = { total: res.total, blocker: res.blocker, ...idsOf(res), at: now };
+      cache[key] = { total: res.total, blocker: res.blocker, ids: res.ids, at: now };
       writeJson(this.cacheFile(), cache);
       return { ...res, cached: false, unavailable: false };
     } catch (e) {
-      if (e.code === 'REJECTED') throw e;
+      if (e.code !== 'UNAVAILABLE') throw e;
       cache[key] = { ...entry, at: null, failed_at: now };
       writeJson(this.cacheFile(), cache);
-      return { total: entry.total ?? null, blocker: entry.blocker ?? null, ...idsOf(entry), cached: entry.total != null, unavailable: true, first_report: true, error: e.message };
+      return { total: entry.total ?? null, blocker: entry.blocker ?? null, ids: entry.ids || [], cached: entry.total != null, unavailable: true, first_report: true, error: e.message };
     }
   }
 }
 
-/** Headers naming the client version, workflow version and machine (an older service ignores them). */
+/** Final statuses of model 2 (1a): a 409 with one of them means the queued operation already happened another way. */
+export const FINAL_STATUSES = ['done', 'discarded', 'superseded', 'undelivered'];
+
+/** Headers naming the client version, workflow version and machine. */
 export function versionHeaders(cfg) {
   const h = {};
   const clean = (v) => String(v).replace(/[^\x20-\x7e]/g, '').trim().slice(0, 80);
@@ -308,11 +421,6 @@ export function versionHeaders(cfg) {
   if (cfg.workflowVersion) h['X-Workflow-Version'] = clean(cfg.workflowVersion);
   if (cfg.machine) h['X-Comms-Machine'] = clean(cfg.machine);
   return h;
-}
-
-/** `ids` only when the service sent them (an older service has none; the workflow then uses `total`). */
-function idsOf(o) {
-  return Array.isArray(o && o.ids) ? { ids: o.ids } : {};
 }
 
 function sleep(ms) {

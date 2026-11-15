@@ -7,10 +7,10 @@ import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { makeInstance, startInstance, makeClient, cleanup, sleep, tmpDir } from './helpers.mjs';
-import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, wakeText, ringText, pairKey, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
+import { makeInstance, startInstance, makeClient, addKey, cleanup, sleep, tmpDir } from './helpers.mjs';
+import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, RECIPIENT_CLOSED_TEMPLATE, WAKE_TYPES, wakeText, dueText, pairKey, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
 import { acquireWakeLock, readWakeLock, lockHeld, lockFile } from '../src/wake/lock.mjs';
-import { parseTimestamp, parseDuration } from '../src/common/util.mjs';
+import { parseTimestamp, parseDuration, TURN_BUSY_MAX_MS } from '../src/common/util.mjs';
 import { createT3Adapter, parseCommand, platformCommand } from '../src/adapters/t3/index.mjs';
 
 const FAKE_T3 = fileURLToPath(new URL('./fixtures/fake-t3.mjs', import.meta.url));
@@ -26,6 +26,29 @@ function keepaliveAdapter() {
   const a = { name: 'fake', command: ['fake'], calls: [], statusCalls: [], running: {}, ok: true };
   a.ring = async (holder, text) => { a.calls.push({ holder, text }); return { ok: a.ok }; };
   a.status = async (thread) => { a.statusCalls.push(thread); return { ok: true, running: !!a.running[thread], status: a.running[thread] ? 'running' : 'completed' }; };
+  return a;
+}
+
+/**
+ * Fake T3 with thread states: `threads[id]` = { run, archived } (run: the active run id, none = not running) or 'gone'
+ * (T3: no longer available). A ring into an archived or gone thread fails as T3 answers it.
+ */
+function t3Adapter() {
+  const a = { name: 'fake', command: ['fake'], calls: [], statusCalls: [], threads: {} };
+  a.ring = async (holder, text) => {
+    a.calls.push({ holder, text });
+    const s = a.threads[holder];
+    if (s === 'gone') return { ok: false, stderr: `Thread ${holder} was not found.` };
+    if (s && s.archived) return { ok: false, stderr: `Thread ${holder} is archived and cannot receive messages.` };
+    return { ok: true };
+  };
+  a.status = async (thread) => {
+    a.statusCalls.push(thread);
+    const s = a.threads[thread];
+    if (s === 'gone') return { ok: false, running: false, status: null, error: `Thread ${thread} is no longer available.` };
+    const x = s || {};
+    return { ok: true, running: !!x.run, status: x.run ? 'running' : 'completed', archived: !!x.archived, run: x.run || null };
+  };
   return a;
 }
 
@@ -57,6 +80,29 @@ async function waitFor(fn, timeout = 5000, step = 25) {
   }
 }
 
+// --- mail model 2 (design v3 part 1e): the sender's wait is a state of the message, read by dueOnce -------------------
+/** Write fields of a message on the service (a wait made due, a deadline passed) without sleeping. */
+function patchMsg(svc, id, fields) {
+  const m = svc.store.message(id);
+  Object.assign(m, fields);
+  svc.store.saveMessage(m);
+  return m;
+}
+/** The wait of `id` is due at the fake clock minus `agoMs` (the clock is never ahead of real time, so GET due sees it). */
+function makeDue({ svc, clock }, id, agoMs = 0) {
+  return patchMsg(svc, id, { wait_due_at: new Date(clock.t - agoMs).toISOString() });
+}
+/** The pickup deadline of `id` passed at the fake clock: checkExpired writes expired_at and the due wait (or a code answer). */
+function expire({ svc, clock }, id) {
+  patchMsg(svc, id, { expires_at: new Date(clock.t - 1000).toISOString() });
+  return svc.checkExpired(clock.t);
+}
+/** The service's clock is the fake clock (hours pass without sleeping): due and the wait-rang confirmation at clock.t. */
+function dueByClock({ svc, waker, clock }, sender = 'alice') {
+  waker.client.due = async () => svc.due(sender, clock.t);
+  waker.client.waitRang = async (id) => svc.waitRang(sender, { id, rang_at: new Date(clock.t).toISOString() });
+}
+
 test('blocker rings the topic holder with the fixed template, never the body', async (t) => {
   const { client, waker, adapter } = await setup(t);
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'SECRET BODY: prevezmi tému X', thread_id: 'thr-sender' });
@@ -80,7 +126,10 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
   assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail in topic p/t' }]);
   adapter.calls.length = 0;
 
-  await bob.send({ reply_to: a.id, text: 'answer' });
+  // Model 2: the recipient picks the message up and answers with resolve (send with reply_to is 400).
+  await assert.rejects(bob.send({ reply_to: a.id, level: 'assist', text: 'answer' }), (e) => e.status === 400);
+  await bob.receive({ project: 'p', topic: 't' });
+  await bob.resolve({ project: 'p', topic: 't', id: a.id, state: 'hotovo', text: 'answer' });
   assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: 'you have mail in topic q/u' }]);
   const s = await bob.send({ project: 'p', topic: 't', level: 'steer', text: 'stop that', thread_id: 'thr-a' });
@@ -93,8 +142,10 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
 
   // Blocker from a main thread without a topic: the reply names the thread.
   const b = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'urgent', thread_id: 'thr-main' });
-  await bob.send({ reply_to: b.id, level: 'assist', text: 'done' });
-  assert.equal(await waker.pollOnce(500), 2);
+  assert.equal(await waker.pollOnce(500), 1);
+  await bob.receive({ project: 'p', topic: 't', ids: b.id });
+  await bob.resolve({ project: 'p', topic: 't', id: b.id, state: 'hotovo', text: 'done' });
+  assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(adapter.calls, [
     { holder: 'thr-1', text: 'you have mail in topic p/t' },
     { holder: 'thr-main', text: 'you have mail in topic thread/thr-main' },
@@ -112,10 +163,12 @@ test('limit 6 per hour per pair of topics: above it a notice, no ring; resumes a
   const notices = (await client.notices()).notices.filter((n) => n.kind === 'wake-limit');
   assert.equal(notices.length, 1, 'one open notice per pair (deduplicated)');
   assert.match(notices[0].title, /Limit budenia/);
-  assert.equal(notices[0].message_id, (await client.receive({ project: 'p', topic: 't' })).messages[6].id);
+  // The inbox is read without a pickup (count): receive would pick the messages up.
+  const inbox = await client.pendingMail({ project: 'p', topic: 't' });
+  assert.equal(notices[0].message_id, inbox.ids[6]);
   assert.deepEqual(notices[0].options.map((o) => o.id), ['ack']);
   // Messages above the limit are still in the mailbox.
-  assert.equal((await client.receive({ project: 'p', topic: 't' })).messages.length, 8);
+  assert.equal(inbox.total, 8);
 
   // Another pair is not affected.
   await client.registerTopic({ project: 'p', topic: 'other', subject: 'O', holder: 'thr-2' });
@@ -163,7 +216,8 @@ test('holder mode operator: blocker rings the holder and creates the notice, rep
   assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail in topic p/t' }]);
   assert.equal((await client.notices()).notices.filter((n) => n.kind === 'blocker').length, 1);
-  await bob.send({ reply_to: b.id, level: 'assist', text: 'here' });
+  await bob.receive({ project: 'p', topic: 't' });
+  await bob.resolve({ project: 'p', topic: 't', id: b.id, state: 'hotovo', text: 'here' });
   await waker.pollOnce(500);
   assert.deepEqual(adapter.calls.slice(1), [{ holder: 'thr-a', text: 'you have mail in topic thread/thr-a' }]);
   // A topic without holder cannot be rung; without an adapter nothing is rung.
@@ -355,51 +409,70 @@ test('wake lock: a second run waits while the first holds a fresh lock; a dead h
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-// --- hotfix 0.2.1 / 0.3.0: expired deadline (`no reply <id>`) and keepalive ----------------
+// --- model 2 (1e): the sender's wait after the deadline (`no reply <id>`) and keepalive -----------------------------
 
-test('expired deadline: rings the sender with `no reply <id>`, never the recipient; answered meanwhile → skip', async (t) => {
-  const { inst, client, waker, adapter, svc, logs } = await setup(t);
+test('due wait after the deadline: rings the sender once with `no reply <id>`, never the recipient; wait-rang confirms (wait_n 1, next check); answered → not due', async (t) => {
+  const ctx = await setup(t);
+  const { inst, client, waker, adapter, svc, clock } = ctx;
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
   await client.registerTopic({ project: 'q', topic: 'u', subject: 'Src', holder: 'thr-q' });
   const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'SECRET?', ttl: '60s', thread_id: 'thr-a', from_project: 'q', from_topic: 'u' });
   const m2 = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'main?', ttl: '60s', from_project: 'q', from_topic: 'u' });
-  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'later deadline', ttl: '30m', thread_id: 'thr-a' });
+  const m3 = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'later deadline', ttl: '30m', thread_id: 'thr-a' });
   assert.equal(await waker.pollOnce(500), 3, 'each assist rings the recipient once');
   adapter.calls.length = 0;
-  // The service check runs every 30 s; here directly with a time past the deadline.
-  svc.checkExpired(Date.now() + 61_000);
-  assert.equal(await waker.pollOnce(500), 2);
-  assert.deepEqual(adapter.calls, [
+  assert.deepEqual(await waker.dueOnce(), [], 'nothing due before the deadline');
+  // The service check runs every 30 s; here directly at the fake clock past the deadline of m and m2.
+  expire(ctx, m.id);
+  expire(ctx, m2.id);
+  assert.ok((await client.message(m.id)).expired_at);
+  const out = await waker.dueOnce();
+  assert.deepEqual(out.map((x) => x.action), ['rang', 'rang']);
+  assert.deepEqual(adapter.calls.sort((a, b) => a.holder.localeCompare(b.holder)), [
     { holder: 'thr-a', text: `no reply ${m.id}` },
     { holder: 'thr-q', text: `no reply ${m2.id}` },
   ]);
   assert.equal(NO_REPLY_TEMPLATE, 'no reply');
+  assert.equal(dueText({ id: 'x1', wait_reason: 'no-reply' }), 'no reply x1');
   assert.ok(!adapter.calls.some((c) => c.holder === 'thr-1'), 'the expiry does not wake the recipient (holder of p/t)');
-
-  // Second check: nothing new. A real late reply wakes the sender with the usual template.
-  svc.checkExpired(Date.now() + 61_000);
-  assert.equal(await waker.pollOnce(0), 0);
-  await bob.send({ reply_to: m.id, level: 'assist', text: 'late' });
+  assert.ok(!adapter.calls.some((c) => c.text.includes('SECRET')));
+  for (const id of [m.id, m2.id]) {
+    const st = await client.message(id);
+    assert.equal(st.wait_n, 1, 'wait-rang confirmed');
+    assert.equal(Date.parse(st.wait_due_at), Date.parse(st.wait_rang_at) + 3600_000 * 2, 'next check rang_at (service clock) + base (assist 1 h) × 2');
+    assert.equal(st.status, 'pending', 'the message itself stays');
+  }
+  // Second cycle: nothing due. A real late answer (receive + resolve) wakes the sender with the usual template.
+  assert.deepEqual(await waker.dueOnce(), []);
+  assert.equal(adapter.calls.length, 2);
+  await bob.receive({ project: 'p', topic: 't' });
+  await bob.resolve({ project: 'p', topic: 't', id: m.id, state: 'hotovo', text: 'late' });
   assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(adapter.calls[2], { holder: 'thr-a', text: `${WAKE_TEMPLATE} q/u` });
-
-  // An expired event of a message answered (or acked) before the ring is skipped.
-  const r = await waker.handle({ seq: 99, type: 'expired', message_id: m.id, level: 'assist', project: 'p', topic: 't', holder: 'thr-a' });
-  assert.deepEqual([r.action, r.reason], ['skipped', 'answered']);
-  await bob.ack([m2.id]);
-  assert.equal((await waker.handle({ seq: 100, type: 'expired', message_id: m2.id, project: 'p', topic: 't', holder: 'thr-q' })).reason, 'answered');
-  assert.equal(adapter.calls.length, 3);
-  assert.ok(logs.some((l) => /skip 99 \(answered\)/.test(l)));
+  // Answered or acked: no wait any more, never due; the unanswered m3 still is.
+  await bob.resolve({ project: 'p', topic: 't', id: m2.id, state: 'hotovo', ack: true });
+  const farDue = svc.due('alice', Date.now() + 365 * 86400_000).due.map((x) => x.id);
+  assert.ok(!farDue.includes(m.id) && !farDue.includes(m2.id), 'answered/acked are not due');
+  assert.ok(farDue.includes(m3.id));
+  assert.equal((await client.message(m.id)).wait_due_at, null);
+  // A picked message (no answer yet) is not due either before its check.
+  assert.equal((await client.message(m3.id)).status, 'picked');
+  assert.ok(!(await waker.dueOnce()).length);
+  // Expired events are gone: an `expired`/`undelivered` event is not a ring type any more.
+  assert.deepEqual(WAKE_TYPES, ['blocker', 'steer', 'assist', 'reply']);
+  assert.equal((await waker.handle({ seq: 99, type: 'expired', message_id: m3.id, holder: 'thr-a' })).reason, 'unknown-type');
 });
 
 // Audit M5 2026-11-11.
-test('expired held message (unregistered topic) rings the sender with `no reply <id>`, not skipped as answered', async (t) => {
-  const { client, waker, adapter, svc } = await setup(t);
+test('held message (unregistered topic) past its deadline: the sender is rung with `no reply <id>` via due', async (t) => {
+  const ctx = await setup(t);
+  const { client, waker, adapter } = ctx;
   const m = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'lost?', ttl: '60s', thread_id: 'thr-a' });
-  assert.equal(m.state, 'held');
-  svc.checkExpired(Date.now() + 61_000);
-  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(m.status, 'held');
+  assert.deepEqual(expire(ctx, m.id), [m.id]);
+  assert.equal(await waker.pollOnce(100), 0, 'no event: the wait is read from due');
   assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-a'), [{ holder: 'thr-a', text: `no reply ${m.id}` }]);
+  assert.equal((await client.message(m.id)).wait_n, 1);
 });
 
 test('one queued ring per open turn of a busy holder; a new turn may be rung again; state persisted and pruned', async (t) => {
@@ -603,8 +676,9 @@ test('T3 start time parsing (ISO, epoch, @epoch, systemctl) and since_command; a
   t.after(() => cleanup(dir));
   const logFile = path.join(dir, 'calls.log');
   const mk = (stdout, exit = '0') => createT3Adapter({ statusCommand: [process.execPath, FAKE_T3, 'thread', 'show', '--json'], env: { ...process.env, FAKE_T3_LOG: logFile, FAKE_T3_STDOUT: stdout, FAKE_T3_EXIT: exit } });
-  assert.deepEqual(await mk(JSON.stringify({ thread: { status: 'completed', activeRunId: null } })).status('thr-1'), { ok: true, running: false, status: 'completed' });
-  assert.deepEqual(await mk(JSON.stringify({ thread: { status: 'running', activeRunId: 'run-7' } })).status('thr-1'), { ok: true, running: true, status: 'running' });
+  assert.deepEqual(await mk(JSON.stringify({ thread: { status: 'completed', activeRunId: null } })).status('thr-1'), { ok: true, running: false, status: 'completed', archived: false, run: null });
+  assert.deepEqual(await mk(JSON.stringify({ thread: { status: 'running', activeRunId: 'run-7' } })).status('thr-1'), { ok: true, running: true, status: 'running', archived: false, run: 'run-7' });
+  assert.deepEqual(await mk(JSON.stringify({ thread: { status: 'completed', activeRunId: null, archived: true } })).status('thr-1'), { ok: true, running: false, status: 'completed', archived: true, run: null });
   assert.equal((await mk('not json').status('thr-1')).ok, false);
   assert.equal((await mk('{}', '4').status('thr-1')).ok, false);
   assert.deepEqual(JSON.parse(fs.readFileSync(logFile, 'utf8').trim().split('\n')[0]), ['thread', 'show', '--json', 'thr-1']);
@@ -623,49 +697,56 @@ test('run(): the keepalive loop runs next to the long-poll and stops with the si
   assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: KEEPALIVE_TEMPLATE }]);
 });
 
-test('ring to an archived thread bounces: the sender is rung with `undelivered <id>` once, no mail, the message stays pending', async (t) => {
+test('ring to an archived thread bounces: the sender gets `undelivered <id>` via due once, no mail; a picked message is not bounced', async (t) => {
   const adapter = { name: 'fake', command: ['fake'], calls: [], ring: async (holder, text) => { adapter.calls.push({ holder, text }); return holder === 'thr-1' || holder === 'thr-dead' ? { ok: false, stderr: `Thread ${holder} is archived and cannot receive messages.` } : { ok: true }; } };
-  const { client, waker } = await setup(t, { adapter });
+  const ctx = await setup(t, { adapter });
+  const { inst, client, waker, clock } = ctx;
   const m = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'restart?', thread_id: 'thr-sender' });
   assert.equal(await waker.pollOnce(500), 1);
-  // The bounce is an `undelivered` event → the sender's thread is rung with the exact text.
-  assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }, { holder: 'thr-sender', text: `undelivered ${m.id}` }]);
-  assert.equal(UNDELIVERED_TEMPLATE, 'undelivered');
-  assert.equal(ringText({ type: 'undelivered', message_id: 'x1' }), 'undelivered x1');
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }]);
   const st = await client.message(m.id);
-  assert.deepEqual([st.state, st.replied, st.outcome, st.undelivered_holder], ['pending', false, 'undelivered', 'thr-1']);
+  assert.deepEqual([st.status, st.undelivered_holder, st.wait_reason], ['undelivered', 'thr-1', 'undelivered']);
   assert.match(st.undelivered_reason, /archived/);
+  // The bounce made the sender's wait due now (real time): the next cycle rings the sender's thread with the exact text.
+  clock.t = Date.now() + 1000;
+  assert.equal(await waker.pollOnce(100), 0, 'no event: the wait comes from due');
+  assert.deepEqual(adapter.calls.slice(1), [{ holder: 'thr-sender', text: `undelivered ${m.id}` }]);
+  assert.equal(UNDELIVERED_TEMPLATE, 'undelivered');
+  assert.equal(dueText({ id: 'x1', wait_reason: 'undelivered' }), 'undelivered x1');
+  assert.equal((await client.message(m.id)).wait_due_at, null, 'one-shot wait: confirmed and ended');
+  assert.deepEqual(await waker.dueOnce(), [], 'once per message');
   assert.equal(((await client.receive({ thread: 'thr-sender' })).messages || []).length, 0, 'no mail from comms');
-  // Once per message.
-  assert.equal((await client.bounce({ message_id: m.id, holder: 'thr-1', reason: 'archived' })).reason, 'already');
+  assert.equal((await client.bounce({ message_id: m.id, holder: 'thr-1', reason: 'archived' })).bounced, false, 'a final message is not bounced again');
   assert.equal((await client.notices()).notices.filter((n) => n.kind !== 'blocker').length, 0, 'no operator notice');
 
-  // A failed `undelivered`/`expired` ring never bounces (only a log line).
-  const m2 = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'i', thread_id: 'thr-dead' });
-  const r = await waker.handle({ seq: 50, type: 'undelivered', message_id: m2.id, project: 'p', topic: 't', holder: 'thr-dead' });
-  assert.deepEqual([r.action, r.ok, r.bounce], ['rang', false, undefined]);
-  const r2 = await waker.handle({ seq: 51, type: 'expired', message_id: m2.id, project: 'p', topic: 't', holder: 'thr-dead' });
-  assert.deepEqual([r2.action, r2.ok, r2.bounce], ['rang', false, undefined]);
-  assert.equal((await client.message(m2.id)).outcome, null);
-});
+  // A picked message stays picked (I3): its ring fails for good, the bounce changes nothing.
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
+  const picked = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'read', thread_id: 'thr-s2' });
+  const waiting = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'unread', thread_id: 'thr-s3' });
+  await bob.receive({ project: 'p', topic: 't', ids: picked.id });
+  adapter.calls.length = 0;
+  assert.equal(await waker.pollOnce(500), 2);
+  assert.equal((await client.message(picked.id)).status, 'picked', 'a picked message is not bounced');
+  assert.equal((await client.message(waiting.id)).status, 'undelivered');
 
-test('hour limit applies to expired/undelivered rings too (wake-limit notice)', async (t) => {
-  const { client, waker, adapter } = await setup(t, { limitPerHour: 1 });
-  const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'a', thread_id: 'thr-s' });
-  const ev = { type: 'undelivered', message_id: m.id, project: 'p', topic: 't', holder: 'thr-s', thread_id: 'thr-s' };
-  assert.equal((await waker.handle({ seq: 1, ...ev })).action, 'rang');
-  const r = await waker.handle({ seq: 2, ...ev, type: 'expired' });
-  assert.deepEqual([r.action, r.reason], ['limited', 'hour']);
-  assert.equal(adapter.calls.length, 1);
-  assert.equal((await client.notices()).notices.filter((n) => n.kind === 'wake-limit').length, 1);
+  // A due ring that fails for good (the sender's thread archived) is confirmed, never bounced: no later turn will come.
+  const m2 = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'i', thread_id: 'thr-dead' });
+  clock.t = Date.now();
+  makeDue(ctx, m2.id);
+  adapter.calls.length = 0;
+  const r = (await waker.dueOnce()).filter((x) => x.id === m2.id);
+  assert.deepEqual(r.map((x) => [x.action, x.reason]), [['failed', 'permanent']]);
+  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-dead'), [{ holder: 'thr-dead', text: `no reply ${m2.id}` }]);
+  const st2 = await client.message(m2.id);
+  assert.deepEqual([st2.status, st2.wait_n], ['held', 1], 'confirmed, not bounced');
 });
 
 test('transient ring failure does not bounce', async (t) => {
   const { client, waker } = await setup(t, { adapter: fakeAdapter(false) });
   const m = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'x', thread_id: 'thr-sender' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.equal((await client.message(m.id)).replied, false);
+  const st = await client.message(m.id);
+  assert.deepEqual([st.status, st.wait_reason, st.undelivered_at], ['pending', 'no-reply', null]);
 });
 
 test('turn records accept T3 thread ids (mcp:<uuid>) and keepalive rings them', async (t) => {
@@ -702,28 +783,29 @@ test('keepalive: closing a turn closes only that turn; a newer open turn of the 
 });
 
 // bob 2026-11-02 scenario.
-test('operator-mode topic: blocker rings the holder; assist to a main thread held by an archived thread bounces to the sender at once', async (t) => {
+test('operator-mode topic: blocker rings the holder; assist to a main thread held by an archived thread bounces, the sender gets `undelivered <id>` in the next cycle', async (t) => {
   const adapter = fakeAdapter();
   adapter.ring = async (holder, text) => {
     adapter.calls.push({ holder, text });
     return holder === 'thr-archived' ? { ok: false, stderr: 'thread is archived' } : { ok: true };
   };
-  const { inst, client, waker } = await setup(t, { holderMode: 'operator', adapter });
+  const { client, waker, clock } = await setup(t, { holderMode: 'operator', adapter });
   // @alice/main is held by a thread that was archived with its topic.
   await client.registerTopic({ persona: 'alice', main: true, holder: 'thr-archived' });
   await client.registerTopic({ project: 'bob', topic: 'units', subject: 'U', holder: 'thr-bob' });
   const assist = await client.send({ persona: 'alice', level: 'assist', text: 'units?', thread_id: 'thr-bob', from_project: 'bob', from_topic: 'units' });
   // Blocker into p/t held in operator mode by thr-1 (the dev thread).
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'units!', thread_id: 'thr-bob', from_project: 'bob', from_topic: 'units' });
-  await waker.pollOnce(500);
-  await waker.pollOnce(500);
-  const rings = adapter.calls.map((c) => [c.holder, c.text]);
-  assert.deepEqual(rings, [
+  assert.equal(await waker.pollOnce(500), 2);
+  assert.equal((await client.message(assist.id)).status, 'undelivered');
+  clock.t = Date.now() + 1000;
+  await waker.pollOnce(100);
+  assert.deepEqual(adapter.calls.map((c) => [c.holder, c.text]), [
     ['thr-archived', 'you have mail in topic @alice/main'],
     ['thr-1', 'you have mail in topic p/t'],
     ['thr-bob', `${UNDELIVERED_TEMPLATE} ${assist.id}`],
   ]);
-  assert.equal((await client.message(assist.id)).outcome, 'undelivered');
+  assert.equal((await client.message(assist.id)).wait_due_at, null);
 });
 
 test('continuation: a closed turn with a next step is rung once after the delay; the same step again is a turn-stalled notice', async (t) => {
@@ -789,30 +871,49 @@ test('timer: a turn closed with resume_at is rung at that time, also with the sa
   await assert.rejects(client.turn({ thread: 'thr-1', state: 'closed', next: 'x', resume_at: 'soon' }), /resume_at/);
 });
 
-test('expired event with answer `otázka` by code (recipient waits for the operator) is rung to the sender, not skipped as answered', async (t) => {
-  const { inst, client, waker, adapter, svc } = await setup(t);
+test('code answer `otázka` (recipient waits for the operator): no ring at the deadline; the sender is rung with `no reply <id>` after the 4 h base', async (t) => {
+  const ctx = await setup(t);
+  const { inst, client, waker, adapter, svc, clock } = ctx;
+  dueByClock(ctx);
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });
   const o = await bob.turn({ thread: 'thr-1', state: 'open' });
   await bob.turn({ thread: 'thr-1', waiting_operator: true, opened_at: o.turn.opened_at });
   const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'decide?', ttl: '60s', thread_id: 'thr-a' });
   assert.equal(await waker.pollOnce(500), 1);
   adapter.calls.length = 0;
-  svc.checkExpired(Date.now() + 61_000);
-  assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the bell stays; the hook reads the state `otázka` from `message`');
+  assert.deepEqual(expire(ctx, m.id), [], 'a code answer, not an expiry');
+  const st = await client.message(m.id);
+  assert.deepEqual([st.code_answer, st.status, st.wait_reason, st.expired_at], ['otázka', 'pending', 'check', null]);
+  assert.equal(Date.parse(st.wait_due_at), clock.t + 4 * 3600_000, 'the wait restarts with the 4 h base');
+  assert.deepEqual(await waker.dueOnce(), [], 'not due before the base');
+  clock.t += 4 * 3600_000;
+  await waker.dueOnce();
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the hook reads the state `otázka` from `message`');
+  const after = await client.message(m.id);
+  assert.equal(after.wait_n, 1);
+  assert.equal(Date.parse(after.wait_due_at), clock.t + 4 * 3600_000 * 2);
+  assert.ok(!svc.due('alice', clock.t).due.length);
 });
 
-test('expired event with answer `busy` by code (recipient runs a turn that holds the message) is rung to the sender, not skipped as answered', async (t) => {
-  const { inst, client, waker, adapter, svc } = await setup(t);
+test('code answer `busy` (recipient runs a turn that holds the message): the sender is rung with `no reply <id>` after the 4 h base', async (t) => {
+  const ctx = await setup(t);
+  const { inst, client, waker, adapter, clock } = ctx;
+  dueByClock(ctx);
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });
   await bob.turn({ thread: 'thr-1', state: 'open', discussion: 'open' });
   const m = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'adjust', ttl: '60s', thread_id: 'thr-a' });
   await waker.pollOnce(500);
   adapter.calls.length = 0;
-  svc.checkExpired(Date.now() + 61_000);
-  assert.equal((await client.message(m.id)).answer_state, 'busy');
-  assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the bell stays; the hook reads the state `busy` from `message`');
+  expire(ctx, m.id);
+  const st = await client.message(m.id);
+  assert.deepEqual([st.code_answer, st.status], ['busy', 'pending']);
+  assert.equal(Date.parse(st.wait_due_at), clock.t + 4 * 3600_000);
+  clock.t += 4 * 3600_000 - 1000;
+  assert.deepEqual(await waker.dueOnce(), []);
+  clock.t += 1000;
+  await waker.dueOnce();
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the hook reads the state `busy` from `message`');
+  assert.equal((await client.message(m.id)).wait_n, 1);
 });
 
 // D-0015, D-0022: no steer/assist ring into an open discussion with the operator; a blocker passes; the held ring goes
@@ -876,4 +977,243 @@ test('held ring: dropped when picked up meanwhile; released by the next poll wit
   assert.equal(await waker.pollOnce(100), 0);
   assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }], 'only the message not picked up rings');
   assert.deepEqual(waker.state.held, {});
+});
+
+// --- due waits (1e): restart, retry, open turn, recipient closed, own key ------------------------------------------
+
+// keep: core
+test('wake off while a wait becomes due: a waker started later (new state file) rings it once in its first cycle and confirms; the next cycle does not ring', async (t) => {
+  const inst = makeInstance('wake-restart');
+  const srv = await startInstance(inst);
+  const stateDir = tmpDir('comms-wake-restart-');
+  t.after(async () => { await srv.stop(); cleanup(inst.dir, stateDir); });
+  const svc = srv.srv.service;
+  const client = makeClient(inst);
+  await client.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-1' });
+  // No wake module runs: the message is sent and its wait becomes due (here written into the message, the clock unmoved).
+  const m = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'anyone?', thread_id: 'thr-a' });
+  patchMsg(svc, m.id, { wait_due_at: new Date(Date.now() - 2 * 3600_000).toISOString() });
+  // Wake starts (a restart: an empty state file), with the key `wake` of the service's machine, over HTTP.
+  const adapter = fakeAdapter();
+  const waker = new Waker({ client: makeClient(inst, { key: addKey(inst, 'wake') }), adapter, stateFile: path.join(stateDir, 'wake-state.json'), maxEventAgeMs: 1e12 });
+  assert.equal(await waker.pollOnce(100), 0, 'a new state starts at the end of the event stream (no replay)');
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'rung once in the first cycle');
+  const st = await client.message(m.id);
+  assert.equal(st.wait_n, 1, 'confirmed by wait-rang');
+  assert.ok(Date.parse(st.wait_due_at) > Date.now() + 25 * 60_000, 'next check rang_at + 15 min × 2');
+  assert.equal(waker.stats.due_rang, 1);
+  await waker.pollOnce(100);
+  assert.equal(adapter.calls.filter((c) => c.holder === 'thr-a').length, 1, 'the second cycle does not ring again');
+});
+
+test('unconfirmed ring (transient adapter failure) stays due and rings in a later cycle, even when the due time is hours old', async (t) => {
+  const adapter = fakeAdapter();
+  adapter.ok = false;
+  adapter.ring = async (holder, text) => { adapter.calls.push({ holder, text }); return adapter.ok ? { ok: true } : { ok: false, stderr: 'connection refused' }; };
+  const ctx = await setup(t, { adapter });
+  const { client, waker, clock } = ctx;
+  const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'x', thread_id: 'thr-a' });
+  makeDue(ctx, m.id, 3 * 3600_000);
+  const r1 = await waker.dueOnce();
+  assert.deepEqual(r1.map((x) => [x.action, x.reason]), [['failed', 'ring']]);
+  let st = await client.message(m.id);
+  assert.deepEqual([st.wait_n, st.wait_due_at], [0, new Date(clock.t - 3 * 3600_000).toISOString()], 'not confirmed: still due');
+  // Within the retry pause no second attempt.
+  clock.t += 30_000;
+  assert.deepEqual((await waker.dueOnce()).map((x) => x.reason), ['retry']);
+  assert.equal(adapter.calls.length, 1);
+  // Later cycle: the ring goes through and is confirmed, regardless of the age of the due time.
+  clock.t += 31_000;
+  adapter.ok = true;
+  assert.deepEqual((await waker.dueOnce()).map((x) => x.action), ['rang']);
+  assert.deepEqual(adapter.calls.at(-1), { holder: 'thr-a', text: `no reply ${m.id}` });
+  st = await client.message(m.id);
+  assert.equal(st.wait_n, 1);
+  assert.equal(Date.parse(st.wait_due_at), Date.parse(st.wait_rang_at) + 3600_000 * 2);
+});
+
+test('open turn of the holder: the due wait is not rung and stays due; rung after the turn closes', async (t) => {
+  const ctx = await setup(t);
+  const { client, waker, adapter } = ctx;
+  const o = await client.turn({ thread: 'thr-a', state: 'open', machine: 'm1' });
+  const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'x', thread_id: 'thr-a' });
+  const m2 = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'y', thread_id: 'thr-a' });
+  makeDue(ctx, m.id, 2000);
+  makeDue(ctx, m2.id, 1000);
+  assert.deepEqual((await waker.dueOnce()).map((x) => x.reason), ['running', 'running']);
+  assert.equal(adapter.calls.length, 0);
+  assert.equal((await client.message(m.id)).wait_n, 0, 'stays due');
+  await client.turn({ thread: 'thr-a', state: 'closed', opened_at: o.turn.opened_at });
+  const r = await waker.dueOnce();
+  assert.deepEqual(r.map((x) => [x.id, x.action, x.reason]), [[m.id, 'rang', null], [m2.id, 'skipped', 'this-round']], 'one wait ring per thread per round');
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }]);
+  assert.equal((await client.message(m.id)).wait_n, 1);
+  assert.equal((await client.message(m2.id)).wait_n, 0);
+  await waker.dueOnce();
+  assert.deepEqual(adapter.calls.at(-1), { holder: 'thr-a', text: `no reply ${m2.id}` }, 'the other wait in the next round');
+});
+
+test('wait reason recipient-closed: a picked message of a closed topic rings the sender with `recipient closed <id>` once', async (t) => {
+  const ctx = await setup(t);
+  const { inst, client, waker, adapter, clock } = ctx;
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
+  const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'x', thread_id: 'thr-a' });
+  await bob.receive({ project: 'p', topic: 't' });
+  const closed = await client.registerTopic({ project: 'p', topic: 't', holder: 'thr-1', close: true });
+  assert.deepEqual(closed.recipient_closed, [m.id]);
+  const st = await client.message(m.id);
+  assert.deepEqual([st.status, st.wait_reason], ['picked', 'recipient-closed'], 'picked stays, not undelivered');
+  clock.t = Date.now() + 1000;
+  await waker.dueOnce();
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `recipient closed ${m.id}` }]);
+  assert.equal(RECIPIENT_CLOSED_TEMPLATE, 'recipient closed');
+  assert.equal((await client.message(m.id)).wait_due_at, null, 'one-shot: ended by the confirmation');
+  assert.deepEqual(await waker.dueOnce(), []);
+});
+
+test('a waker with a non-wake key (carol) sees and confirms only the waits of messages sent with that key', async (t) => {
+  const ctx = await setup(t);
+  const { inst, client, svc, clock, stateDir } = ctx;
+  const carol = makeClient(inst, { key: addKey(inst, 'carol') });
+  const mine = await carol.send({ project: 'p', topic: 't', level: 'assist', text: 'from carol', thread_id: 'thr-l' });
+  const other = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'from alice', thread_id: 'thr-a' });
+  makeDue(ctx, mine.id);
+  makeDue(ctx, other.id);
+  const adapter = fakeAdapter();
+  const waker = new Waker({ client: carol, adapter, stateFile: path.join(stateDir, 'carol-state.json'), now: () => clock.t });
+  assert.deepEqual((await carol.due()).due.map((x) => x.id), [mine.id]);
+  const r = await waker.dueOnce();
+  assert.deepEqual(r.map((x) => [x.id, x.action]), [[mine.id, 'rang']]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-l', text: `no reply ${mine.id}` }]);
+  assert.equal((await client.message(mine.id)).wait_n, 1);
+  assert.equal((await client.message(other.id)).wait_n, 0, 'the wait of another sender is untouched');
+  assert.ok(svc.due('wake').due.some((x) => x.id === other.id), 'still due for the key wake');
+  await assert.rejects(carol.waitRang(other.id), (e) => e.status === 403);
+});
+
+// --- busy only for a thread that runs; an archived or gone holder is undelivered (comms-client-wake, workflow 1.8.0) --
+// 2026-11-15: a steer to stop did not reach a running thread and an archived thread was listed as busy: busy came from
+// an open turn record and the discussion, and a held steer/assist was returned only on a permanent ring failure.
+
+// keep: core
+test('a stale open turn record gives no busy: T3 not running → rung, nothing queued, a due wait rings; a ring queued behind run-1 does not stop the mail of run-2', async (t) => {
+  const adapter = t3Adapter();
+  const ctx = await setup(t, { adapter });
+  const { client, waker } = ctx;
+  // thr-1 has an open record (its Stop was lost), T3 runs nothing.
+  await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }]);
+  assert.deepEqual(waker.state.queued, {}, 'not queued behind a run nobody runs');
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(adapter.calls.length, 2, 'the next mail rings too');
+
+  // T3 runs run-1: one ring queues behind it, the next mail of that run is not rung again.
+  adapter.threads['thr-1'] = { run: 'run-1' };
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'three', thread_id: 'thr-s3' });
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'four', thread_id: 'thr-s4' });
+  assert.equal(await waker.pollOnce(500), 2);
+  assert.equal(adapter.calls.length, 3);
+  assert.ok(waker.state.queued['thr-1']);
+  assert.equal(waker.state.queuedRun['thr-1'], 'run-1');
+  // The queued ring started run-2, the record stayed open (no Stop, the same record run): a steer rings into run-2.
+  adapter.threads['thr-1'] = { run: 'run-2' };
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop now', thread_id: 'thr-s5' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(adapter.calls.length, 4, 'rung: the ring queued behind run-1 has started');
+  assert.equal(waker.state.queuedRun['thr-1'], 'run-2');
+
+  // A due wait of a sender with an open record: T3 decides, not the record.
+  await client.turn({ thread: 'thr-a', state: 'open', machine: 'm1' });
+  const m = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'x', thread_id: 'thr-a' });
+  const m2 = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'y', thread_id: 'thr-a' });
+  makeDue(ctx, m.id, 2000);
+  makeDue(ctx, m2.id, 1000);
+  adapter.threads['thr-a'] = { run: 'run-a' };
+  assert.deepEqual((await waker.dueOnce()).map((x) => x.reason), ['running', 'running'], 'T3 runs it: waits');
+  adapter.threads['thr-a'] = {};
+  assert.deepEqual((await waker.dueOnce()).map((x) => [x.id, x.action]), [[m.id, 'rang'], [m2.id, 'skipped']], 'stale record: rung');
+  assert.deepEqual(adapter.calls.at(-1), { holder: 'thr-a', text: `no reply ${m.id}` });
+});
+
+// keep: core
+test('without the thread state an open record counts only within its deadline: past it the service writes no busy, a due wait rings, wake queues nothing', async (t) => {
+  const ctx = await setup(t);   // fake adapter without `status`
+  const { inst, client, waker, adapter, clock } = ctx;
+  dueByClock(ctx);
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key, thread: 'thr-1' });
+  await bob.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
+  await client.turn({ thread: 'thr-a', state: 'open', machine: 'm1' });
+  // Within the deadline the open records are busy: the service writes `busy`, a due wait of thr-a waits.
+  const s0 = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'adjust', ttl: '60s', thread_id: 'thr-b' });
+  expire(ctx, s0.id);
+  assert.equal((await client.message(s0.id)).code_answer, 'busy');
+  const m = await client.send({ project: 'p', topic: 'nowhere', level: 'assist', text: 'x', thread_id: 'thr-a' });
+  makeDue(ctx, m.id);
+  assert.deepEqual((await waker.dueOnce()).filter((x) => x.id === m.id).map((x) => x.reason), ['running']);
+
+  // Past the deadline nothing says the threads run (interrupted, archived, Stop lost).
+  clock.t += TURN_BUSY_MAX_MS + 60_000;
+  assert.deepEqual((await waker.dueOnce()).filter((x) => x.id === m.id).map((x) => x.action), ['rang']);
+  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-a'), [{ holder: 'thr-a', text: `no reply ${m.id}` }]);
+  const s1 = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'adjust again', ttl: '60s', thread_id: 'thr-b' });
+  assert.ok(expire(ctx, s1.id).includes(s1.id), 'expired: no code answer');
+  const st = await client.message(s1.id);
+  assert.deepEqual([st.code_answer, st.status, st.wait_reason], [null, 'pending', 'no-reply']);
+  // Wake: a blocker (it passes the discussion) rings thr-1 as an idle thread; no ring is queued behind its record.
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'now', thread_id: 'thr-c' });
+  await waker.pollOnce(500);
+  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-1'), [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t` }]);
+  assert.deepEqual(waker.state.queued, {});
+});
+
+// keep: core
+test('archived or gone holder: a steer/assist is undelivered instead of held for the discussion, the sender gets `undelivered <id>`; a topic held by another thread keeps it', async (t) => {
+  const adapter = t3Adapter();
+  const ctx = await setup(t, { adapter, goneCheckMs: 0 });
+  const { client, waker, logs } = ctx;
+  await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
+  adapter.threads['thr-1'] = { archived: true };
+  const m = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', thread_id: 'thr-s' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(waker.state.held, {}, 'not held');
+  assert.deepEqual(adapter.calls, [], 'no ring into the archived thread');
+  const st = await client.message(m.id);
+  assert.deepEqual([st.status, st.undelivered_holder, st.wait_reason], ['undelivered', 'thr-1', 'undelivered']);
+  assert.match(st.undelivered_reason, /archived/);
+  // 1e: the next cycle rings the sender once.
+  assert.equal(await waker.pollOnce(100), 0);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-s', text: `${UNDELIVERED_TEMPLATE} ${m.id}` }]);
+  assert.equal((await client.message(m.id)).wait_due_at, null);
+
+  // Held while the holder discusses (T3 runs it), archived later: the next poll returns it to its sender.
+  adapter.threads['thr-1'] = { run: 'run-1' };
+  adapter.calls.length = 0;
+  const a = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.equal(Object.keys(waker.state.held).length, 1, 'held for the discussion');
+  adapter.threads['thr-1'] = { archived: true };
+  assert.equal(await waker.pollOnce(100), 0);
+  assert.deepEqual(waker.state.held, {});
+  assert.equal((await client.message(a.id)).status, 'undelivered');
+  await waker.pollOnce(100);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-s2', text: `${UNDELIVERED_TEMPLATE} ${a.id}` }]);
+
+  // A thread T3 no longer has: the same.
+  adapter.threads['thr-1'] = 'gone';
+  adapter.calls.length = 0;
+  const g = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'gone?', thread_id: 'thr-s3' });
+  await waker.pollOnce(500);
+  const sg = await client.message(g.id);
+  assert.deepEqual([sg.status, sg.wait_reason], ['undelivered', 'undelivered']);
+  assert.match(sg.undelivered_reason, /no longer available/);
+  // The topic is held by another thread now: its message stays for the new holder.
+  const k = await client.send({ project: 'p', topic: 't', level: 'steer', text: 'kept', thread_id: 'thr-s4' });
+  await client.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-2', takeover: true });
+  await waker.pollOnce(500);
+  assert.equal((await client.message(k.id)).status, 'pending', 'the new holder receives it');
+  assert.ok(logs.some((l) => l.includes(`bounce ${k.id} nevrátené (holder thr-2)`)), logs.join('\n'));
+  assert.ok(!adapter.calls.some((c) => c.holder === 'thr-1'), 'never rung into the gone thread');
 });

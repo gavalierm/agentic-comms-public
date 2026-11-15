@@ -1,0 +1,141 @@
+// keep: core (5a, client of mail model 2): the outbox replayed twice is one answer; a service of another model gets
+// nothing written or queued and a flush keeps the outbox; 3c order of a flush; the obligations backup (3b).
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import http from 'node:http';
+import { makeInstance, startInstance, makeClient, cleanup, tmpDir, runCli } from './helpers.mjs';
+import { Client, resolveConfig, modelMismatchText } from '../src/client/index.mjs';
+
+const BOX = { project: 'p', topic: 't' };
+const jsonFiles = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.json')) : []);
+const readMsg = (inst, id) => JSON.parse(fs.readFileSync(path.join(inst.dir, 'messages', `${id}.json`), 'utf8'));
+
+async function setup(t) {
+  const inst = makeInstance('core');
+  const outbox = path.join(tmpDir('comms-core-outbox-'), 'outbox');
+  const s = await startInstance(inst);
+  t.after(async () => { await s.stop(); cleanup(inst.dir, path.dirname(outbox)); });
+  const sender = makeClient(inst, { thread: 'thr-a', outbox });
+  const recipient = makeClient(inst, { thread: 'thr-b', outbox });
+  await recipient.registerTopic({ ...BOX, subject: 'S', holder: 'thr-b' });
+  return { inst, s, outbox, sender, recipient };
+}
+
+/** A fake service: /health answers `health`, every other request `status` with `body`. */
+async function fakeService(t, health, status = 426, body = { error: 'mail model 2 (comms 0.5.0) and workflow 1.8.0 go together', model: 3 }) {
+  const seen = [];
+  const srv = http.createServer((req, res) => {
+    seen.push(`${req.method} ${req.url}`);
+    const [code, data] = req.url === '/health' ? [200, health] : [status, body];
+    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  const dir = tmpDir('comms-fake-');
+  t.after(() => cleanup(dir));
+  const url = `http://127.0.0.1:${srv.address().port}`;
+  const client = new Client(resolveConfig({ url, key: 'k', dataDir: dir, outbox: path.join(dir, 'outbox'), noStart: true }, {}));
+  return { client, seen, url, dir };
+}
+
+test('outbox replayed twice is one answer: the same client_op_id gives the original confirmation (send and resolve)', async (t) => {
+  const { inst, outbox, sender, recipient } = await setup(t);
+  const sent = await sender.send({ ...BOX, level: 'assist', text: 'q' });
+  await recipient.receive({ ...BOX, thread: 'thr-b' });
+  // The same resolve queued twice (a flush that died after the HTTP answer, then a second copy).
+  const item = { ...BOX, id: sent.id, state: 'hotovo', text: 'answer', thread: 'thr-b', thread_id: 'thr-b', client_op_id: 'op-resolve-1' };
+  recipient.queue('/resolve', item);
+  recipient.queue('/resolve', item);
+  const send = { ...BOX, level: 'assist', text: 'again', thread_id: 'thr-a', client_op_id: 'op-send-1' };
+  sender.queue('/send', send);
+  sender.queue('/send', send);
+  const r = await recipient.flushOutbox();
+  assert.equal(r.sent.length, 4);
+  assert.deepEqual(r.sent.map((x) => !!x.replayed), [false, true, false, true]);
+  assert.equal(jsonFiles(outbox).length, 0);
+  const m = readMsg(inst, sent.id);
+  assert.deepEqual([m.status, m.resolution], ['done', 'reply']);
+  const replies = fs.readdirSync(path.join(inst.dir, 'messages')).map((f) => JSON.parse(fs.readFileSync(path.join(inst.dir, 'messages', f), 'utf8'))).filter((x) => x.reply_to === sent.id);
+  assert.equal(replies.length, 1, 'one reply');
+  const again = (await sender.receive({ ...BOX, thread: 'thr-b' })).messages.filter((x) => x.text === 'again');
+  assert.equal(again.length, 1, 'one message from two queued sends');
+});
+
+test('another model: nothing is written or queued, the client fails loudly, a flush keeps the outbox (4a, 3c, I10)', async (t) => {
+  // Service 0.4.x: /health has no model.
+  const old = await fakeService(t, { ok: true, instance_id: null, version: '0.4.21' }, 200, { id: 'x' });
+  old.client.queue('/send', { ...BOX, level: 'assist', text: 'queued before', client_op_id: 'op-1' });
+  await assert.rejects(old.client.send({ ...BOX, level: 'assist', text: 'x' }), (e) => e.code === 'MODEL_MISMATCH' && e.message === modelMismatchText(null));
+  await assert.rejects(old.client.resolve({ id: 'm1', state: 'hotovo' }), (e) => e.code === 'MODEL_MISMATCH');
+  await assert.rejects(old.client.flushOutbox(), (e) => e.code === 'MODEL_MISMATCH');
+  await assert.rejects(old.client.obligations({ thread: 'thr-a' }), (e) => e.code === 'MODEL_MISMATCH');
+  assert.equal(jsonFiles(old.client.cfg.outbox).length, 1, 'only the item queued before; nothing moved to rejected/');
+  assert.ok(!fs.existsSync(path.join(old.client.cfg.outbox, 'rejected')));
+  assert.deepEqual(old.seen.filter((s) => !s.startsWith('GET /health')), [], 'nothing but /health was asked');
+  assert.equal(modelMismatchText(null), 'comms model ? ≠ 2: update mail and workflow together');
+
+  // A service that refuses the model with 426: an error, not an outage (no outbox item).
+  const strict = await fakeService(t, { ok: true, instance_id: null, model: 2 });
+  await assert.rejects(strict.client.send({ ...BOX, level: 'assist', text: 'x' }), (e) => e.code === 'MODEL_MISMATCH' && e.status === 426);
+  assert.equal(jsonFiles(strict.client.cfg.outbox).length, 0);
+
+  // CLI: exit code 3 and the line on stderr.
+  const cli = await runCli(['send', '--url', old.url, '--key', 'k', '--data-dir', old.dir, '--client-dir', old.dir, '--outbox', path.join(old.dir, 'cli-outbox'), ...['--project', 'p', '--topic', 't'], '--level', 'assist', '--text', 'x']);
+  assert.equal(cli.code, 3, cli.err);
+  assert.match(cli.err, /comms model \? ≠ 2: update mail and workflow together/);
+  assert.equal(jsonFiles(path.join(old.dir, 'cli-outbox')).length, 0);
+});
+
+test('flush (3c): 409 with a final status drops the item with `already <resolution>`; another refusal goes to rejected/', async (t) => {
+  const { inst, outbox, sender, recipient } = await setup(t);
+  const a = await sender.send({ ...BOX, level: 'assist', text: 'a' });
+  const b = await sender.send({ ...BOX, level: 'assist', text: 'b' });
+  await recipient.receive({ ...BOX, thread: 'thr-b' });
+  await recipient.resolve({ ...BOX, id: a.id, state: 'hotovo', text: 'done live' });
+  recipient.queue('/resolve', { ...BOX, id: a.id, state: 'hotovo', thread: 'thr-b', client_op_id: 'op-late' });
+  // A resolve for a mailbox the message is not in: 403.
+  recipient.queue('/resolve', { project: 'p', topic: 'other', id: b.id, state: 'hotovo', client_op_id: 'op-other' });
+  const r = await recipient.flushOutbox();
+  assert.deepEqual(r.dropped.map((x) => [x.id, x.resolution]), [[a.id, 'reply']]);
+  assert.ok(r.lines.includes(`already reply ${a.id}`));
+  assert.deepEqual(r.rejected.map((x) => x.status), [403]);
+  assert.equal(jsonFiles(outbox).length, 0);
+  assert.equal(jsonFiles(path.join(outbox, 'rejected')).filter((f) => !f.endsWith('.error.json')).length, 1);
+  assert.equal(readMsg(inst, b.id).status, 'picked', 'the refused resolve changed nothing');
+});
+
+test('obligations backup (3b): offline answer is the last live one, marked, without recent, minus ids with a queued operation', async (t) => {
+  const { inst, s, outbox, sender, recipient } = await setup(t);
+  const a = await sender.send({ ...BOX, level: 'assist', text: 'a' });
+  const b = await sender.send({ ...BOX, level: 'assist', text: 'b' });
+  await recipient.receive({ ...BOX, thread: 'thr-b' });
+  const t0 = Date.now();
+  const live = await recipient.obligations({ thread: 'thr-b' }, t0);
+  assert.equal(live.offline, false);
+  assert.deepEqual(live.owed.map((x) => x.id), [a.id, b.id]);
+  const mine = await sender.obligations({ thread: 'thr-a' }, t0);
+  assert.deepEqual(mine.awaiting.map((x) => x.id), [a.id, b.id]);
+  await s.stop();
+  const off = makeClient(inst, { thread: 'thr-b', outbox, timeout: 300 });
+  const q = await off.resolve({ ...BOX, id: a.id, state: 'hotovo', text: 'later' });
+  assert.equal(q.queued, true);
+  const o = await off.obligations({ thread: 'thr-b' }, t0 + 90_000);
+  assert.deepEqual([o.offline, o.cached, o.age_s, o.recent.length], [true, true, 90, 0]);
+  assert.deepEqual(o.owed.map((x) => x.id), [b.id], 'the resolved one is gone from owed');
+  const offSender = makeClient(inst, { thread: 'thr-a', outbox, timeout: 300 });
+  await offSender.withdraw({ id: b.id });
+  const o2 = await offSender.obligations({ thread: 'thr-a' }, t0);
+  assert.deepEqual(o2.awaiting.map((x) => x.id), [a.id], 'the withdrawn one is gone from awaiting');
+  // Back: the outbox goes first, then the live answer replaces the backup (server wins).
+  const s2 = await startInstance(inst);
+  t.after(() => s2.stop());
+  const back = makeClient(inst, { thread: 'thr-b', outbox });
+  const after = await back.obligations({ thread: 'thr-b' });
+  assert.equal(after.offline, false);
+  assert.deepEqual(after.owed, [], 'a resolved, b withdrawn');
+  assert.equal(jsonFiles(outbox).length, 0);
+  assert.deepEqual([readMsg(inst, a.id).resolution, readMsg(inst, b.id).resolution], ['reply', 'withdrawn']);
+});

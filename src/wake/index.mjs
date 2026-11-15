@@ -6,11 +6,13 @@
 // the same message arrives `stopOnRepeat` times in a row; above the limit the
 // message stays in the mailbox and the operator gets a notice (P-046).
 // The mail works without this module: every message waits for the next turn.
-// A message not picked up (body read) within its TTL arrives as an `expired` event for the sender, rung with
-// `no reply <id>` unless the message was answered or picked up meanwhile (checked with `message`).
-// A blocker/steer/assist/reply ring that fails for good (thread archived or gone) bounces: the service
-// marks the message undelivered and the sender gets an `undelivered` event, rung with
-// `undelivered <id>`; those two never bounce. A busy thread gets a ring as its next turn
+// The sender's wait is a state of the message on the service, not an event (1e): every cycle reads
+// `GET /obligations?due=1`, rings the sender's thread when it is not busy (`no reply <id>`; wait reason
+// `undelivered` → `undelivered <id>`, `recipient-closed` → `recipient closed <id>`) and confirms with
+// `POST /wait-rang`. An unconfirmed ring (wake off, crashed, thread unreachable) stays due and rings in a later cycle
+// regardless of its age. At most one wait ring per thread per cycle.
+// A blocker/steer/assist/reply ring that fails for good (thread archived or gone) bounces: the service marks the
+// unpicked message undelivered and the sender's wait becomes due. A busy thread gets a ring as its next turn
 // (T3): at most one queued ring per run of the holder (`turns`, wake-state `queued`). A run is the turn record's `run_at`:
 // a prompt steered into the running turn (UserPromptSubmit without a Stop) opens a new record of the same run, and the
 // queued ring still waits behind it; after the run's close the queued ring starts within `queuedStartMs`, and that
@@ -22,12 +24,19 @@
 // Discussion (D-0015, D-0022): a steer/assist to a holder that discusses with the operator (turn record, `discussionOpen`)
 // is held (wake-state `held`) and rung when the discussion ends (event `discussion-closed`, else the next poll); a
 // blocker passes.
+// Busy = the thread runs now (comms-client-wake, 2026-11-15): an open turn record alone is not enough (interrupted,
+// archived, Stop lost). Where an open record, a hold or a queued mark decides, wake reads the thread's state from T3
+// (adapter `status`, as keepalive and continuation do): busy only while T3 runs it, a queued mark only while T3 runs the
+// run it was rung into. Without the state the open record counts only within its deadline (TURN_BUSY_MAX_MS).
+// A holder that T3 reports archived or gone gets no hold and no ring: its message becomes undelivered (bounce; the
+// service leaves it to a new holder of the topic), and the sender's wait is due (`undelivered <id>`, 1e); a held message
+// whose holder is archived later goes the same way at the next poll.
 // Jobs (D-0023, D-0024): `jobs` in wake.json are shell commands run periodically next to the long-poll (e.g. the reporter's
 // issue watch), one run of a job at a time, with a time limit; a failure is logged, it never stops the module.
 import path from 'node:path';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { readJson, writeJson, nowIso, normalizeMachine, parseTimestamp, discussionOpen, DISCUSSION_HELD_LEVELS, CODE_ANSWER_STATES } from '../common/util.mjs';
+import { readJson, writeJson, nowIso, normalizeMachine, parseTimestamp, discussionOpen, turnFresh, TURN_BUSY_MAX_MS, DISCUSSION_HELD_LEVELS } from '../common/util.mjs';
 import { resolveConfig, Client } from '../client/index.mjs';
 import { Store } from '../server/store.mjs';
 import { selfRestartEnabled } from '../common/selfrestart.mjs';
@@ -35,12 +44,14 @@ import { createT3Adapter, DEFAULT_T3_COMMAND, DEFAULT_T3_STATUS_COMMAND } from '
 
 /** Fixed template; the workflow hook recognises this prefix (policy `wake_template`, P-047). */
 export const WAKE_TEMPLATE = 'you have mail in topic';
-/** Fixed templates for the sender of an unanswered / undelivered message (`<template> <message_id>`). */
+/** Fixed templates for the sender of a due wait (`<template> <message_id>`, P-047), by `wait_reason`. */
 export const NO_REPLY_TEMPLATE = 'no reply';
 export const UNDELIVERED_TEMPLATE = 'undelivered';
-/** Event types the module rings; only `blocker`/`steer`/`assist`/`reply` bounce on a permanent failure. */
-export const WAKE_TYPES = ['blocker', 'steer', 'assist', 'reply', 'expired', 'undelivered'];
-const BOUNCE_TYPES = ['blocker', 'steer', 'assist', 'reply'];
+export const RECIPIENT_CLOSED_TEMPLATE = 'recipient closed';
+/** Event types the module rings (new mail and replies); a permanent ring failure bounces the message. */
+export const WAKE_TYPES = ['blocker', 'steer', 'assist', 'reply'];
+/** A due wait whose ring failed is tried again after this long (it stays due on the service meanwhile). */
+const DUE_RETRY_MS = 60_000;
 /** The service's event when a thread's discussion with the operator ends: the held rings of that holder go out. */
 export const DISCUSSION_CLOSED = 'discussion-closed';
 /** Held rings at most this long and this many (the message itself waits in the mailbox anyway). */
@@ -53,7 +64,8 @@ export const CONTINUE_TEMPLATE = 'turn ended with a next step, continue from han
 export const DEFAULTS = {
   limitPerHour: 6, stopOnRepeat: 2, maxEventAgeMs: 60 * 60 * 1000, waitMs: 25_000, reconnectMs: 1000, maxReconnectMs: 30_000,
   keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 60_000, idleDedupeMs: 120_000,
-  queuedStartMs: 120_000,
+  // goneCheckMs: a held message's holder is asked T3 whether it still exists at most this often (each poll costs a call).
+  queuedStartMs: 120_000, turnBusyMaxMs: TURN_BUSY_MAX_MS, goneCheckMs: 60_000,
 };
 
 /** The run of a turn record: `run_at` (kept across prompts steered into a running turn), else `opened_at` (older mail). */
@@ -71,8 +83,8 @@ const JOB_OUTPUT_MAX = 2000;
 /** Longest single timer (setTimeout overflows above it); longer waits are slept in parts. */
 const MAX_TIMER_MS = 2_147_483_647;
 export const WAKE_SENDER = 'wake';
-/** Ring errors after which no later turn of the thread will come (the sender gets a bounce). */
-export const PERMANENT_RING_FAILURE = /archived|not found|does not exist|no such thread|unknown thread/i;
+/** Ring (and T3 status) errors after which no later turn of the thread will come (the sender gets a bounce). */
+export const PERMANENT_RING_FAILURE = /archived|not found|no longer available|does not exist|no such thread|unknown thread/i;
 
 /** Topic label of an event: `project/topic`, or the thread when the recipient has no topic. */
 export function topicLabel(ev) {
@@ -86,9 +98,14 @@ export function wakeText(ev) {
 
 /** Exact ring text of an event (the whole prompt, never the body). */
 export function ringText(ev) {
-  if (ev.type === 'expired') return `${NO_REPLY_TEMPLATE} ${ev.message_id}`;
-  if (ev.type === 'undelivered') return `${UNDELIVERED_TEMPLATE} ${ev.message_id}`;
   return wakeText(ev);
+}
+
+/** Exact ring text of a due wait (1e point 1): by `wait_reason`, never the body. */
+export function dueText(item) {
+  if (item.wait_reason === 'undelivered') return `${UNDELIVERED_TEMPLATE} ${item.id}`;
+  if (item.wait_reason === 'recipient-closed') return `${RECIPIENT_CLOSED_TEMPLATE} ${item.id}`;
+  return `${NO_REPLY_TEMPLATE} ${item.id}`;
 }
 
 /** Address of one side of an exchange: topic, else thread, else sender. */
@@ -124,6 +141,8 @@ export class WakeState {
     this.continued = d.continued || {};
     // holder → run (`runOf`) of the turn that already has one ring queued behind it.
     this.queued = d.queued || {};
+    // holder → T3 run id (adapter status `run`) the queued ring was rung into: another run of T3 means it has started.
+    this.queuedRun = d.queued_run || {};
     // holder → { at, text }: the last ring of a thread without an open turn (its turn opens seconds later).
     this.idle = d.idle || {};
     // message id → event of a steer/assist held while its holder discusses with the operator (D-0015).
@@ -155,13 +174,19 @@ export class WakeState {
       const rec = cur.get(holder);
       const same = !!rec && runOf(rec) === run;
       const waiting = same && (rec.state === 'open' || (rec.closed_at && now - Date.parse(rec.closed_at) < startMs));
-      if (!waiting) delete this.queued[holder];
+      if (!waiting) this.unqueue(holder);
     }
+    for (const holder of Object.keys(this.queuedRun)) if (!this.queued[holder]) delete this.queuedRun[holder];
+  }
+
+  unqueue(holder) {
+    delete this.queued[holder];
+    delete this.queuedRun[holder];
   }
 
   save() {
     this.updated_at = nowIso();
-    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, idle: this.idle, held: this.held, jobs: this.jobs, updated_at: this.updated_at });
+    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, queued_run: this.queuedRun, idle: this.idle, held: this.held, jobs: this.jobs, updated_at: this.updated_at });
   }
 }
 
@@ -184,7 +209,7 @@ export class Waker {
     this.now = now;
     this.opts = { ...DEFAULTS, ...opts };
     this.state = new WakeState(stateFile);
-    this.stats = { seen: 0, rang: 0, limited: 0, skipped: 0, failed: 0, keepalive_rang: 0, keepalive_notified: 0, continue_rang: 0, continue_stalled: 0, jobs_ok: 0, jobs_failed: 0 };
+    this.stats = { seen: 0, rang: 0, due_rang: 0, limited: 0, skipped: 0, failed: 0, keepalive_rang: 0, keepalive_notified: 0, continue_rang: 0, continue_stalled: 0, jobs_ok: 0, jobs_failed: 0 };
     this.jobsRunning = new Set();
   }
 
@@ -208,32 +233,15 @@ export class Waker {
     // and no reply): the holder answers in the wake turn; what needs the operator it reports to the operator (P-044, P-047).
     if (!this.adapter) return skip('no-adapter');
 
-    // Expired: answered, picked up (acked/discarded) meanwhile → nothing to say.
-    if (ev.type === 'expired' && ev.message_id) {
-      try {
-        const st = await this.client.message(ev.message_id);
-        // Answer of origin `code` (`otázka`: the recipient waits for the operator; `busy`: its running turn holds the
-        // message back): the ring tells the sender so.
-        const byCode = st.answer_origin === 'code' && CODE_ANSWER_STATES.includes(st.answer_state);
-        // A held message (unregistered topic, persona without a main thread) is open as a pending one: its expiry tells the
-        // sender nobody got it (4 silent expiries, audit M5 2026-11-11).
-        const open = st.state === 'pending' || st.state === 'held';
-        if (byCode ? !open : (st.replied || !open || st.picked_at)) return skip('answered');
-      } catch (e) {
-        this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
-      }
-    }
-
-    // Mail bell only while mail waits: the thread picked it up meanwhile (receive) → no ring; the bell turn would find no
-    // new mail and the workflow hook would block its prompt (wake-picked-check 2026-11-14).
-    if (BOUNCE_TYPES.includes(ev.type)) {
+    // Mail bell only while mail waits (inbox = status pending, I2): the thread picked it up meanwhile (receive) → no
+    // ring; the bell turn would find no new mail and the workflow hook would block its prompt (wake-picked-check 2026-11-14).
+    {
       const q = { thread: String(ev.holder) };
       if (ev.project && ev.topic) { q.project = ev.project; q.topic = ev.topic; }
       try {
         const c = await this.client.pendingMail(q);
-        const items = Array.isArray(c.items) ? c.items : [];
-        if (!items.some((m) => !m.picked_at)) {
-          this.log(`mail ${topicLabel(ev)}: ${items.length} pending, ${items.length ? 'všetky prevzaté' : 'žiadna'}; správa ${ev.message_id || '-'} nezvoní`);
+        if (!c.total) {
+          this.log(`mail ${topicLabel(ev)}: žiadna čakajúca; správa ${ev.message_id || '-'} nezvoní`);
           return skip('picked');
         }
       } catch (e) {
@@ -242,34 +250,47 @@ export class Waker {
     }
 
     // A busy thread gets the ring as its next turn: at most one queued ring per run.
-    let openTurn = null;
+    const holder = String(ev.holder);
     let record = null;
     let turnsKnown = false;
     try {
       const { turns } = await this.client.turns(false);
-      const open = turns.filter((x) => x.state === 'open');
       this.state.pruneQueued(turns, now, this.opts.queuedStartMs);
-      record = turns.find((x) => x.thread === String(ev.holder)) || null;
-      openTurn = open.find((x) => x.thread === String(ev.holder) && x.opened_at) || null;
+      record = turns.find((x) => x.thread === holder) || null;
       turnsKnown = true;
     } catch (e) {
       this.log(`turns: ${e.message}; bez kontroly zaradeného zvončeka`);
     }
+    const discussing = turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record);
+    const queuedMark = turnsKnown ? this.state.queued[holder] : null;
+    // The thread's state decides where the turn record alone would: an open record (busy), a hold, a queued mark.
+    const th = turnsKnown && ((record && record.state === 'open') || discussing || queuedMark)
+      ? await this.threadNow(holder, record, now) : { busy: false, gone: false, known: false, running: false, run: null };
+    // Archived or gone: no later turn comes, no hold and no ring; the message goes back to its sender (undelivered).
+    if (th.gone) return this.undeliverGone(ev, th.why, { holdOnError: discussing, now });
     // The holder discusses with the operator (D-0015, D-0022): a steer/assist waits for the end of the discussion; a
     // blocker passes. Without known turn records it rings, as before.
-    if (turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record)) {
+    if (discussing) {
       this.hold(ev, now);
       return skip('discussion');
     }
-    // A ring queued behind this run (pruned above) has not started yet: its turn will see this mail too.
-    if (turnsKnown && this.state.queued[String(ev.holder)]) {
-      this.state.save();
-      return skip('queued');
+    // A ring queued behind this run (pruned above) has not started yet: its turn will see this mail too. Behind an open
+    // record only while the thread really runs that run: a stale record (interrupted, Stop lost) or another T3 run means
+    // the queued ring has started or was lost, so this mail rings. A closed run within queuedStartMs: the ring is starting.
+    if (queuedMark) {
+      const runChanged = th.known && th.running && !!th.run && !!this.state.queuedRun[holder] && th.run !== this.state.queuedRun[holder];
+      if (record && record.state === 'open' && (!th.busy || runChanged)) {
+        this.log(`queued ${holder}: vlákno ${runChanged ? 'beží iný beh' : 'nebeží'}; zaradený zvonček už nečaká, zvoní sa`);
+        this.state.unqueue(holder);
+      } else {
+        this.state.save();
+        return skip('queued');
+      }
     }
     // An idle thread rung with the same bell moments ago, whose turn has not opened since: that turn will see this mail
     // too (fable audit M1). Only with known turn records: a lost wake is worse than a double one.
-    const idle = this.state.idle[String(ev.holder)];
-    if (!openTurn && turnsKnown && idle && idle.text === ringText(ev) && now - idle.at < this.opts.idleDedupeMs
+    const idle = this.state.idle[holder];
+    if (!th.busy && turnsKnown && idle && idle.text === ringText(ev) && now - idle.at < this.opts.idleDedupeMs
       && !(record && record.opened_at && Date.parse(record.opened_at) >= idle.at)) {
       return skip('queued');
     }
@@ -307,20 +328,22 @@ export class Waker {
     }
     if (result && result.ok) {
       this.stats.rang += 1;
-      if (openTurn) this.state.queued[String(ev.holder)] = runOf(openTurn);
-      else this.state.idle[String(ev.holder)] = { at: now, text };
+      if (th.busy) {
+        this.state.queued[holder] = runOf(record);
+        if (th.run) this.state.queuedRun[holder] = th.run; else delete this.state.queuedRun[holder];
+      } else this.state.idle[holder] = { at: now, text };
       this.state.save();
-      this.log(`rang ${ev.seq} ${ev.type} → ${ev.holder}: "${text}" (${recent.length}/${this.opts.limitPerHour} za hodinu, ${pair})${openTurn ? '; vlákno má otvorený ťah, zvonček zaradený' : ''}`);
+      this.log(`rang ${ev.seq} ${ev.type} → ${ev.holder}: "${text}" (${recent.length}/${this.opts.limitPerHour} za hodinu, ${pair})${th.busy ? '; vlákno beží, zvonček zaradený' : ''}`);
     } else {
       this.stats.failed += 1;
       const err = (result && (result.stderr || result.stdout)) || 'neznáma chyba';
       this.log(`ring failed ${ev.seq} → ${ev.holder} (${this.adapter.name}): ${err}; správa čaká na ďalší ťah`);
-      // Thread archived or gone: no later turn will come; tell the sender (`undelivered` event).
-      // A ring about the sender's own message (expired/undelivered) never bounces.
-      if (PERMANENT_RING_FAILURE.test(err) && ev.message_id && BOUNCE_TYPES.includes(ev.type)) {
+      // Thread archived or gone: no later turn will come; the service makes an unpicked message undelivered and the
+      // sender's wait due (a picked one stays, I3).
+      if (PERMANENT_RING_FAILURE.test(err) && ev.message_id) {
         try {
           const b = await this.client.bounce({ message_id: ev.message_id, holder: String(ev.holder), reason: err });
-          if (b.bounced) this.log(`bounce ${ev.message_id} → udalosť undelivered pre odosielateľa${b.event_seq ? ` (seq ${b.event_seq})` : ' (bez cesty späť)'}`);
+          if (b.bounced) this.log(`bounce ${ev.message_id} → undelivered, čakanie odosielateľa splatné`);
           else this.log(`bounce ${ev.message_id} nevrátené (${b.reason})`);
           return { action: 'rang', ok: false, holder: String(ev.holder), text, result, bounce: b };
         } catch (e) {
@@ -329,6 +352,66 @@ export class Waker {
       }
     }
     return { action: 'rang', ok: !!(result && result.ok), holder: String(ev.holder), text, result };
+  }
+
+  /**
+   * State of a thread in T3 (adapter `status`, as keepalive and continuation read it): { known, running, gone, run, why }.
+   * gone = archived or no longer there (no later turn comes). Unknown without `status` or when T3 does not answer.
+   */
+  async t3State(thread) {
+    if (!this.adapter || typeof this.adapter.status !== 'function') return { known: false, running: false, gone: false, run: null };
+    let st;
+    try { st = await this.adapter.status(String(thread)); } catch (e) { st = { ok: false, error: e.message }; }
+    if (st && st.ok) {
+      if (st.archived) return { known: true, running: false, gone: true, run: null, why: `Thread ${thread} is archived (T3 status)` };
+      return { known: true, running: !!st.running, gone: false, run: st.run ?? null };
+    }
+    const err = String((st && st.error) || '');
+    if (PERMANENT_RING_FAILURE.test(err)) return { known: true, running: false, gone: true, run: null, why: err.replace(/\s+/g, ' ').trim() };
+    return { known: false, running: false, gone: false, run: null, error: err || null };
+  }
+
+  /**
+   * Whether the holder is busy now: an open turn record of a thread that runs. T3 decides when it answers; else the open
+   * record only within its deadline (`turnBusyMaxMs`). Returns the T3 state with `busy`.
+   */
+  async threadNow(holder, record, now = this.now()) {
+    const t3 = await this.t3State(holder);
+    const open = !!record && record.state === 'open';
+    const busy = !t3.gone && open && (t3.known ? t3.running : turnFresh(record, now, this.opts.turnBusyMaxMs));
+    return { ...t3, busy };
+  }
+
+  /**
+   * The holder is archived or gone (T3): its message becomes undelivered and the sender's wait due (`undelivered <id>`,
+   * 1e). The service keeps it when another thread holds the topic now. A failed bounce of a discussion's message holds it
+   * (the next poll checks the holder again).
+   */
+  async undeliverGone(ev, why, { holdOnError = false, now = this.now() } = {}) {
+    const holder = String(ev.holder);
+    this.stats.failed += 1;
+    this.log(`vlákno ${holder}: ${why}; ďalší ťah nepríde, správa ${ev.message_id || '-'} sa nezvoní`);
+    if (!ev.message_id) return { action: 'skipped', reason: 'gone', holder };
+    try {
+      const b = await this.client.bounce({ message_id: ev.message_id, holder, reason: why });
+      if (b.bounced) this.log(`bounce ${ev.message_id} → undelivered, čakanie odosielateľa splatné`);
+      else this.log(`bounce ${ev.message_id} nevrátené (${b.reason})`);
+      return { action: 'undelivered', bounced: !!b.bounced, holder, bounce: b };
+    } catch (e) {
+      this.log(`bounce failed ${ev.message_id}: ${e.message}`);
+      if (holdOnError) this.hold(ev, now);
+      return { action: 'undelivered', bounced: false, holder, error: e.message };
+    }
+  }
+
+  /** A held message's holder is archived or gone: the reason, else null (asked T3 at most once per `goneCheckMs`). */
+  async heldGone(holder) {
+    const seen = (this.goneSeen ||= {})[holder];
+    const now = this.now();
+    if (seen && now - seen.at < this.opts.goneCheckMs) return seen.why;
+    const t3 = await this.t3State(holder);
+    this.goneSeen[holder] = { at: now, why: t3.gone ? t3.why : null };
+    return this.goneSeen[holder].why;
   }
 
   /** Keep a steer/assist event until its holder's discussion ends (newest HELD_MAX). */
@@ -342,7 +425,8 @@ export class Waker {
 
   /**
    * Ring the held steer/assist events (of one holder, else all) whose holder no longer discusses with the operator.
-   * A message picked up, answered or gone meanwhile is dropped without a ring. Returns the number rung.
+   * A message picked up, answered or gone meanwhile is dropped without a ring. A holder still discussing that T3 reports
+   * archived or gone never ends the discussion: its held message becomes undelivered. Returns the number rung.
    */
   async releaseHeld(holder = null) {
     this.state.prune(this.now());
@@ -357,15 +441,22 @@ export class Waker {
     }
     let released = 0;
     for (const [key, ev] of entries) {
-      if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) continue;
+      if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) {
+        const why = await this.heldGone(String(ev.holder));
+        if (!why) continue;
+        delete this.state.held[key];
+        this.state.save();
+        await this.undeliverGone(ev, why, { holdOnError: true });
+        continue;
+      }
       delete this.state.held[key];
       this.state.save();
       if (ev.message_id) {
         try {
           const st = await this.client.message(ev.message_id);
-          const answered = st.replied && st.answer_origin !== 'code';
-          if (st.state !== 'pending' || st.picked_at || answered || st.outcome === 'undelivered') {
-            this.log(`held ${ev.message_id}: ${st.state}${st.picked_at ? ', prevzatá' : ''}${answered ? ', zodpovedaná' : ''}; nezvoní sa`);
+          // Only a message still in the inbox (pending) is rung; picked, answered, withdrawn or undelivered is not.
+          if (st.status !== 'pending') {
+            this.log(`held ${ev.message_id}: ${st.status}${st.resolution ? `/${st.resolution}` : ''}; nezvoní sa`);
             continue;
           }
         } catch (e) {
@@ -377,6 +468,74 @@ export class Waker {
       await this.handle({ ...ev, created_at: new Date(this.now()).toISOString(), released: true });
     }
     return released;
+  }
+
+  // --- due waits of senders (1e) ---------------------------------------------------------
+  /**
+   * One round over `GET /obligations?due=1`: each due wait of a thread on this machine that is not busy (an open turn of a
+   * thread that runs, `threadNow`) is rung with `dueText` and confirmed with `POST /wait-rang` (then the service sets the
+   * next check or ends the wait). Not confirmed, so due again in a later cycle: no adapter, a busy thread, turn records unknown, a ring that failed (tried
+   * again after DUE_RETRY_MS), another wait of the same thread rung in this round. A ring that fails for good (thread
+   * archived or gone) is confirmed: no later turn will come. Returns one result per due item.
+   */
+  async dueOnce() {
+    if (!this.adapter) return [];
+    const { due = [] } = await this.client.due();
+    if (!due.length) return [];
+    const now = this.now();
+    for (const [id, at] of Object.entries(this.dueFailed ||= {})) if (now - at >= DUE_RETRY_MS) delete this.dueFailed[id];
+    let open = null;
+    try {
+      const { turns } = await this.client.turns(true);
+      open = new Map(turns.filter((t) => t.state === 'open').map((t) => [String(t.thread), t]));
+    } catch (e) {
+      this.log(`turns: ${e.message}; splatné čakania počkajú na ďalší cyklus`);
+    }
+    // Busy = an open record of a thread that runs (T3, else the record's deadline); asked once per thread per round.
+    const busyNow = new Map();
+    const busy = async (holder) => {
+      if (!open.has(holder)) return false;
+      if (!busyNow.has(holder)) busyNow.set(holder, (await this.threadNow(holder, open.get(holder), now)).busy);
+      return busyNow.get(holder);
+    };
+    const rungNow = new Set();
+    const out = [];
+    for (const item of due) {
+      const res = (action, reason, extra = {}) => {
+        if (action !== 'skipped' || !['other-machine', 'running', 'this-round', 'retry'].includes(reason)) this.log(`due ${action} ${item.id} (${item.wait_reason}) → ${item.holder || '-'}${reason ? ` (${reason})` : ''}`);
+        return { id: item.id, action, reason, ...extra };
+      };
+      if (!item.holder) { out.push(res('skipped', 'no-holder')); continue; }
+      const holder = String(item.holder);
+      if (item.holder_machine && this.opts.machine && normalizeMachine(item.holder_machine) !== normalizeMachine(this.opts.machine)) { out.push(res('skipped', 'other-machine')); continue; }
+      if (!open) { out.push(res('skipped', 'turns-unknown')); continue; }
+      if (rungNow.has(holder)) { out.push(res('skipped', 'this-round')); continue; }
+      if (this.dueFailed[item.id]) { out.push(res('skipped', 'retry')); continue; }
+      if (await busy(holder)) { out.push(res('skipped', 'running')); continue; }
+      const text = dueText(item);
+      let result;
+      try { result = await this.adapter.ring(holder, text); } catch (e) { result = { ok: false, stderr: e.message }; }
+      const err = result && result.ok ? null : ((result && (result.stderr || result.stdout)) || 'neznáma chyba');
+      if (err && !PERMANENT_RING_FAILURE.test(err)) {
+        this.stats.failed += 1;
+        this.dueFailed[item.id] = this.now();
+        out.push(res('failed', 'ring', { text, error: err }));
+        continue;
+      }
+      rungNow.add(holder);
+      if (!err) { this.stats.rang += 1; this.stats.due_rang += 1; this.state.idle[holder] = { at: this.now(), text }; this.state.save(); }
+      let confirmed = null;
+      try {
+        // The service's clock decides (no rang_at): the clock of this machine may be behind the service's.
+        confirmed = await this.client.waitRang(item.id);
+        if (confirmed && confirmed.wait_due_at === item.wait_due_at && (confirmed.wait_n ?? 0) === (item.wait_n ?? 0)) this.log(`wait-rang ${item.id}: služba čakanie nezmenila (wait_n ${confirmed.wait_n})`);
+      } catch (e) {
+        this.log(`wait-rang ${item.id}: ${e.message}`);
+      }
+      this.log(`${err ? `due ring failed for good ${item.id} → ${holder}: ${err}; čakanie potvrdené` : `rang due ${item.id} → ${holder}: "${text}"`}${confirmed ? ` (wait_n ${confirmed.wait_n}, ďalšia kontrola ${confirmed.wait_due_at || 'žiadna'})` : ''}`);
+      out.push({ id: item.id, action: err ? 'failed' : 'rang', reason: err ? 'permanent' : null, text, holder, confirmed });
+    }
+    return out;
   }
 
   async notifyLimit(ev, limit) {
@@ -641,8 +800,17 @@ export class Waker {
     return this.state.cursor;
   }
 
-  /** One long-poll round; returns the number of events processed. */
+  /**
+   * One cycle: the due waits first (a restart rings what stayed unconfirmed at once), then one long-poll round; returns
+   * the number of events processed. A refused due read (4xx) is logged, the events still run.
+   */
   async pollOnce(waitMs = this.opts.waitMs) {
+    try {
+      await this.dueOnce();
+    } catch (e) {
+      if (e.code !== 'REJECTED') throw e;
+      this.log(`due: ${e.message}`);
+    }
     const since = await this.initCursor();
     const r = await this.client.events(since, waitMs);
     for (const ev of r.events) {
@@ -688,8 +856,10 @@ export class Waker {
       } catch (e) {
         if (signal && signal.aborted) break;
         if (e.code === 'INSTANCE_MISMATCH') throw e;
-        if (!outage || e.code !== 'UNAVAILABLE') this.log(`${e.code === 'UNAVAILABLE' ? 'comms unavailable' : `error: ${e.message}`}; nový pokus o ${backoff} ms`);
-        outage = true;
+        // Another model (4a): one line per outage, nothing is rung or confirmed; tried again until mail and workflow match.
+        const quiet = outage === e.code && (e.code === 'UNAVAILABLE' || e.code === 'MODEL_MISMATCH');
+        if (!quiet) this.log(`${e.code === 'UNAVAILABLE' ? 'comms unavailable' : e.code === 'MODEL_MISMATCH' ? e.message : `error: ${e.message}`}; nový pokus o ${backoff} ms`);
+        outage = e.code || true;
         this.client.reset?.();
         await sleep(backoff, signal);
         backoff = Math.min(backoff * 2, this.opts.maxReconnectMs);

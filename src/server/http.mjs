@@ -1,8 +1,10 @@
 // HTTP routing and authentication. Every route except /health requires a key
 // (Authorization: Bearer, ?key=, or cookie comms_key). The sender is always
 // derived from the key, never from the request body (P-041, P-047).
+// Every API request carries X-Comms-Model: 2 (mail model 2, D-0089); another or no value is 426 (I10).
 import { HttpError } from '../common/util.mjs';
 import { renderPage, renderError } from './page.mjs';
+import { MAIL_MODEL, MODEL_MISMATCH_TEXT } from './lifecycle.mjs';
 
 const MAX_BODY = 256 * 1024;
 
@@ -14,6 +16,12 @@ export function createHandler(service, store) {
 
       // Body is read before authentication so that HTML forms may carry the key.
       const body = req.method === 'POST' ? await readBody(req) : null;
+      // The operator's page (GET / and its form posts) is not an API client; everything else is refused before anything is
+      // written (also the client record) when it speaks another model.
+      const isPage = (url.pathname === '/' && req.method === 'GET') || (body && body.__form === true);
+      if (!isPage && String(req.headers['x-comms-model'] || '') !== String(MAIL_MODEL)) {
+        throw new HttpError(426, MODEL_MISMATCH_TEXT, { model: MAIL_MODEL, got: req.headers['x-comms-model'] || null });
+      }
       const key = findKey(req, url) || (body && body.__form === true && body.key) || null;
       const sender = store.senderForKey(key);
       if (!sender) {
@@ -32,17 +40,31 @@ export function createHandler(service, store) {
           }
           const showAll = url.searchParams.get('all') === '1';
           const notices = service.notices({ all: showAll });
-          const pending = store.messages((m) => m.state === 'pending').sort((a, b) => a.created_at.localeCompare(b.created_at));
+          const pending = store.messages((m) => m.status === 'pending').sort((a, b) => a.created_at.localeCompare(b.created_at));
           return sendHtml(res, 200, renderPage({ instance: service.instance, notices, pending, key: url.searchParams.get('key'), showAll }));
         }
         case 'POST /send':
-          return sendJson(res, 201, service.send(sender, body));
-        case 'GET /receive':
+          return sendJson(res, 200, service.send(sender, body));
+        case 'GET /receive': {
+          const id = url.searchParams.get('id');
+          if (id) return sendJson(res, 200, { messages: [service.receiveOne(id, queryOf(url), sender)] });
           return sendJson(res, 200, { messages: service.receive(queryOf(url)) });
+        }
         case 'GET /count':
           return sendJson(res, 200, service.count(queryOf(url)));
-        case 'POST /ack':
-          return sendJson(res, 200, service.ack(body.ids));
+        case 'POST /resolve':
+          return sendJson(res, 200, service.resolve(sender, body));
+        case 'POST /withdraw':
+          return sendJson(res, 200, service.withdraw(sender, body));
+        case 'GET /obligations': {
+          const p = url.searchParams;
+          if (p.get('due') === '1') return sendJson(res, 200, service.due(sender));
+          return sendJson(res, 200, service.obligations({ thread: p.get('thread'), topics: p.get('topics'), project: p.get('project'), persona: p.get('persona'), since: p.get('since') }));
+        }
+        case 'POST /wait-rang':
+          return sendJson(res, 200, service.waitRang(sender, body));
+        case 'POST /wait-adopt':
+          return sendJson(res, 200, service.waitAdopt(sender, body));
         case 'GET /notices':
           return sendJson(res, 200, { notices: service.notices({ all: url.searchParams.get('all') === '1' }) });
         case 'POST /decide': {
@@ -59,11 +81,9 @@ export function createHandler(service, store) {
         case 'POST /register-topic':
           return sendJson(res, 200, service.registerTopic(body, sender));
         case 'GET /message':
-          return sendJson(res, 200, service.messageState(url.searchParams.get('id')));
+          return sendJson(res, 200, service.messageState(url.searchParams.get('id'), queryOf(url), sender));
         case 'POST /bounce':
           return sendJson(res, 200, service.bounce(body));
-        case 'POST /settle':
-          return sendJson(res, 200, service.settle(body));
         case 'POST /turn':
           return sendJson(res, 200, service.turn(body));
         case 'GET /turns':

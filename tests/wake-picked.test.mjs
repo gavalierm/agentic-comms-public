@@ -27,12 +27,16 @@ async function setup(t) {
 
 test('message picked up before the ring: no bell, the log says why', async (t) => {
   const { client, waker, calls, logs } = await setup(t);
-  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-a' });
+  const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-a' });
   await client.receive({ project: 'p', topic: 't' });
-  assert.ok((await client.count({ project: 'p', topic: 't' })).items[0].picked_at, 'the thread picked it up');
+  // Model 2 (I2): the inbox is status pending; a picked message leaves it (count total 0) and is owed, not new mail.
+  assert.equal((await client.pendingMail({ project: 'p', topic: 't' })).total, 0, 'the thread picked it up');
+  const st = await client.message(m.id);
+  assert.equal(st.status, 'picked');
+  assert.ok(st.picked_at);
   assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(calls, [], 'no bell for picked-up mail');
-  assert.ok(logs.some((l) => /mail p\/t: 1 pending, všetky prevzaté/.test(l)), logs.join('\n'));
+  assert.ok(logs.some((l) => l.includes(`mail p/t: žiadna čakajúca; správa ${m.id} nezvoní`)), logs.join('\n'));
   assert.ok(logs.some((l) => /skip \d+ \(picked\)/.test(l)), logs.join('\n'));
 });
 

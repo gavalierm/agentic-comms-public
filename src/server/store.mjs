@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { randomBytes } from 'node:crypto';
 import { readJson, writeJson, listJsonFiles, newSecret, nowIso, isValidThread, HttpError } from '../common/util.mjs';
+import { DATA_SCHEMA } from './lifecycle.mjs';
 
 export class Store {
   constructor(dir) {
@@ -13,6 +14,7 @@ export class Store {
       instance: path.join(dir, 'instance.json'),
       keys: path.join(dir, 'keys.json'),
       server: path.join(dir, 'server.json'),
+      meta: path.join(dir, 'meta.json'),
     };
     this.dirs = {
       messages: path.join(dir, 'messages'),
@@ -21,7 +23,17 @@ export class Store {
       events: path.join(dir, 'events'),
       turns: path.join(dir, 'turns'),
       clients: path.join(dir, 'clients'),
+      threads: path.join(dir, 'threads'),
     };
+  }
+
+  /** Schema of the data folder (`{schema, migrated_at?, backup?}`), or null for 0.4.x data. */
+  meta() {
+    return readJson(this.files.meta, null);
+  }
+
+  saveMeta(meta) {
+    writeJson(this.files.meta, meta);
   }
 
   exists() {
@@ -42,6 +54,7 @@ export class Store {
     };
     writeJson(this.files.instance, inst);
     writeJson(this.files.keys, { keys: [] });
+    this.saveMeta({ schema: DATA_SCHEMA, created_at: inst.created_at });
     const firstKey = this.addKey(sender || safeUser());
     return { created: true, instance: inst, firstKey };
   }
@@ -195,6 +208,20 @@ export class Store {
 
   clients() {
     return listJsonFiles(this.dirs.clients).map((f) => readJson(path.join(this.dirs.clients, f), null)).filter(Boolean);
+  }
+
+  // --- per-thread records (recent rows and their cursor, section 2) ------------------------
+  /** `key` is a thread id or `topic:<project>/<topic>` (a sender without a thread); the name is URI-encoded. */
+  threadFile(key) {
+    return path.join(this.dirs.threads, `${encodeURIComponent(key)}.json`);
+  }
+
+  threadRecord(key) {
+    return readJson(this.threadFile(key), null) || { key, cursor: 0, recent: [] };
+  }
+
+  saveThreadRecord(rec) {
+    writeJson(this.threadFile(rec.key), rec);
   }
 
   // --- wake events ----------------------------------------------------------------

@@ -63,6 +63,60 @@ export function rawRequest(sock, method, pathname, { body, headers = {} } = {}) 
 
 function tryJson(s) { try { return JSON.parse(s); } catch { return null; } }
 
+/**
+ * Mail model 2 API over the socket, raw HTTP without the client (server tests).
+ * `call(method, path, body?)` → { status, json }; every request carries X-Comms-Model: 2 and the key.
+ * Helpers return the JSON and throw on a status other than `expect` (default 2xx).
+ */
+export function api(inst, key = inst.key) {
+  const call = (method, pathname, body, headers = {}) => rawRequest(inst.socket, method, pathname, {
+    body, headers: { Authorization: `Bearer ${key}`, 'X-Comms-Model': '2', ...headers },
+  });
+  const ok = async (p, expect) => {
+    const r = await p;
+    if (expect ? r.status !== expect : (r.status < 200 || r.status > 299)) {
+      const e = new Error(`HTTP ${r.status}: ${r.body}`);
+      e.status = r.status; e.json = r.json;
+      throw e;
+    }
+    return r.json;
+  };
+  const qs = (o = {}) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(o)) if (v != null && v !== '') p.set(k, Array.isArray(v) ? v.join(',') : String(v));
+    const s = p.toString();
+    return s ? `?${s}` : '';
+  };
+  return {
+    call,
+    qs,
+    register: (body) => ok(call('POST', '/register-topic', { subject: 'Test topic', ...body })),
+    send: (body) => ok(call('POST', '/send', body)),
+    receive: (q) => ok(call('GET', `/receive${qs(q)}`)).then((j) => j.messages),
+    receiveId: (id, q = {}) => ok(call('GET', `/receive${qs({ id, ...q })}`)).then((j) => j.messages[0]),
+    count: (q) => ok(call('GET', `/count${qs(q)}`)),
+    resolve: (body) => ok(call('POST', '/resolve', body)),
+    withdraw: (body) => ok(call('POST', '/withdraw', body)),
+    message: (id, q = {}) => ok(call('GET', `/message${qs({ id, ...q })}`)),
+    obligations: (q) => ok(call('GET', `/obligations${qs(q)}`)),
+    due: () => ok(call('GET', '/obligations?due=1')),
+    waitRang: (body) => ok(call('POST', '/wait-rang', body)),
+    waitAdopt: (body) => ok(call('POST', '/wait-adopt', body)),
+    bounce: (body) => ok(call('POST', '/bounce', body)),
+    notices: (all = false) => ok(call('GET', `/notices${all ? '?all=1' : ''}`)).then((j) => j.notices),
+    decide: (body) => ok(call('POST', '/decide', body)),
+    turn: (body) => ok(call('POST', '/turn', body)),
+    events: (since = 0) => ok(call('GET', `/events?since=${since}`)).then((j) => j.events),
+    health: () => ok(call('GET', '/health')),
+  };
+}
+
+/** Add a key for another sender (e.g. `wake`) to a running or stopped instance; returns the key. */
+export function addKey(inst, sender) {
+  const existing = inst.store.keys().find((k) => k.sender === sender);
+  return existing ? existing.key : inst.store.addKey(sender).key;
+}
+
 export function cleanup(...dirs) {
   for (const d of dirs) fs.rmSync(d, { recursive: true, force: true });
 }

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, cleanup, sleep, killPid, tmpDir, runCli } from './helpers.mjs';
 import { probe } from '../src/server/index.mjs';
 import { socketPath } from '../src/common/paths.mjs';
-import { Client, resolveConfig } from '../src/client/index.mjs';
+import { Client, CommsError, resolveConfig } from '../src/client/index.mjs';
 
 const BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
 
@@ -51,20 +51,23 @@ test('stopped service: send goes to outbox, later flushed in order', async (t) =
 
   const offline = makeClient(a, { outbox, timeout: 500 });
   const started = Date.now();
-  const r1 = await offline.sendOrQueue({ project: 'p', topic: 't', level: 'assist', text: 'first' });
-  const r2 = await offline.sendOrQueue({ project: 'p', topic: 't', level: 'assist', text: 'second' });
+  const r1 = await offline.send({ project: 'p', topic: 't', level: 'assist', text: 'first' });
+  const r2 = await offline.send({ project: 'p', topic: 't', level: 'assist', text: 'second' });
   assert.ok(Date.now() - started < 2000, 'client must give up within the deadline');
   assert.equal(r1.queued, true);
   assert.equal(r2.queued, true);
-  assert.equal(fs.readdirSync(outbox).filter((f) => f.endsWith('.json')).length, 2);
+  const files = fs.readdirSync(outbox).filter((f) => f.endsWith('.json'));
+  assert.equal(files.length, 2);
+  assert.ok(files.every((f) => JSON.parse(fs.readFileSync(path.join(outbox, f), 'utf8')).body.client_op_id), 'every queued write carries a client_op_id');
   assert.equal(fs.readdirSync(path.join(a.dir, 'messages')).length, 0);
 
   // Service back: next client call flushes the outbox first.
   const s2 = await startInstance(a);
   t.after(() => s2.stop());
   const online = makeClient(a, { outbox });
-  const r3 = await online.sendOrQueue({ project: 'p', topic: 't', level: 'assist', text: 'third' });
+  const r3 = await online.send({ project: 'p', topic: 't', level: 'assist', text: 'third' });
   assert.equal(r3.queued, undefined);
+  assert.equal(r3.status, 'pending');
   assert.equal(fs.readdirSync(outbox).filter((f) => f.endsWith('.json')).length, 0);
   const inbox = await online.receive({ project: 'p', topic: 't' });
   assert.deepEqual(inbox.messages.map((m) => m.text), ['first', 'second', 'third']);
@@ -218,13 +221,15 @@ test('CLI send: info is refused with the valid levels; --ttl max 5m (blocker/ste
   assert.equal(cli(['register-topic', ...base, '--project', 'p', '--topic', 't', '--subject', 'S']).code, 0);
   const sent = cli(['send', ...base, '--thread', 'thr-a', '--project', 'p', '--topic', 't', '--level', 'assist', '--text', 'help', '--ttl', '90s']);
   assert.equal(sent.code, 0, sent.err);
-  assert.ok(sent.json.expires_at);
+  assert.equal(sent.json.status, 'pending');
+  assert.ok(sent.json.wait_due_at, 'an assist starts the sender wait (1e)');
   const msg = cli(['message', ...base, '--id', sent.json.id]);
   assert.equal(msg.code, 0, msg.err);
-  assert.deepEqual(msg.json, {
-    id: sent.json.id, state: 'pending', level: 'assist', reply_to: null, reply_state: null, answer_state: null, answer_at: null, answer_id: null, answer_origin: null, cancels: null, cancelled_by: null, project: 'p', topic: 't', to: 'p/t', outcome: null, replied: false,
-    expires_at: sent.json.expires_at, ttl_s: 90, picked_at: null, undelivered_holder: null, undelivered_reason: null,
-  });
+  assert.deepEqual(
+    [msg.json.id, msg.json.status, msg.json.resolution, msg.json.level, msg.json.to, msg.json.ttl_s, msg.json.picked_at, msg.json.history.length, msg.json.text],
+    [sent.json.id, 'pending', null, 'assist', 'p/t', 90, null, 1, 'help'],
+  );
+  assert.ok(!('state' in msg.json) && !('outcome' in msg.json) && !('replied' in msg.json), 'no field of model 1');
 
   const open = cli(['turn', ...base, '--state', 'open', '--thread', 'thr-a', '--machine', 'Box-1', '--project', 'p', '--topic', 't', '--holder-mode', 'operator']);
   assert.equal(open.code, 0, open.err);
@@ -240,7 +245,7 @@ test('CLI send: info is refused with the valid levels; --ttl max 5m (blocker/ste
   assert.deepEqual(count.json.ids, [sent.json.id]);
 });
 
-test('count keeps ids for an outage; an old service without ids gives none', async (t) => {
+test('count keeps ids for an outage', async (t) => {
   const { a, sa } = await serviceUp(t);
   const c = makeClient(a);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S' });
@@ -254,20 +259,16 @@ test('count keeps ids for an outage; an old service without ids gives none', asy
   assert.deepEqual(Object.values(cache)[0].ids, [m.id, m2.id]);
   // Outage: the last answer with its ids, marked cached and unavailable.
   const down = makeClient(a);
-  down.call = async () => { throw new Error('down'); };
+  down.call = async () => { throw new CommsError('UNAVAILABLE', 'down'); };
   const off = await down.count({ project: 'p', topic: 't' }, now + 20_000);
   assert.deepEqual([off.cached, off.unavailable, off.ids], [true, true, [m.id, m2.id]]);
-
-  // Old service: count without ids → the client reports none (the workflow falls back to total).
-  const old = makeClient(a, { clientDir: tmpDir('comms-oldcount-') });
-  t.after(() => cleanup(old.cfg.clientDir));
-  old.call = async () => ({ total: 2, blocker: 0 });
-  const r = await old.count({ project: 'p', topic: 't' }, now);
-  assert.deepEqual([r.total, 'ids' in r], [2, false]);
 });
 
 test('client: a 2xx answer that is not JSON is an error (BAD_RESPONSE); the outbox item is kept', async (t) => {
-  const srv = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>proxy page</html>'); });
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, instance_id: null, model: 2 })); }
+    res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>proxy page</html>');
+  });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   t.after(() => srv.close());
   const dir = tmpDir('comms-nonjson-');

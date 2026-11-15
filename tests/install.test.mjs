@@ -162,3 +162,25 @@ test('wakeStatus and count: no field before wake ever ran, running with a fresh 
   assert.equal(wf.code, 0, wf.err);
   assert.deepEqual(wf.json.wake, { running: false, pid: null, heartbeat_at: null }, 'found in the default wake dir, not in --client-dir');
 });
+
+// obligations replaces count for the status line (design v3 part 2; workflow 1.8.0 reads `wake` from it).
+test('obligations carries the wake status like count: no field before wake ever ran, running with a fresh lock, stopped without it', async (t) => {
+  const a = makeInstance('ob');
+  const stateDir = tmpDir('wake-state-ob-');
+  t.after(async () => {
+    try { const info = JSON.parse(fs.readFileSync(path.join(a.dir, 'server.json'), 'utf8')); killPid(info.pid); await sleep(100); } catch {}
+    cleanup(a.dir, stateDir);
+  });
+  const ob = () => node(COMMS_BIN, ['obligations', '--data-dir', a.dir, '--key', a.key, '--thread', 'thr-1'], { WAKE_STATE_DIR: stateDir });
+  const o0 = ob();
+  assert.equal(o0.code, 0, o0.err);
+  assert.equal(o0.json.inbox.n, 0);
+  assert.equal(o0.json.wake, undefined, 'a machine without wake shows nothing');
+  fs.writeFileSync(path.join(stateDir, 'wake-state.json'), '{}');
+  assert.deepEqual(ob().json.wake, { running: false, pid: null, heartbeat_at: null });
+  const now = new Date().toISOString();
+  fs.writeFileSync(lockFile(stateDir), JSON.stringify({ pid: process.pid, started_at: now, heartbeat_at: now }));
+  const o2 = ob();
+  assert.deepEqual(o2.json.wake, { running: true, pid: process.pid, heartbeat_at: now });
+  assert.equal(o2.json.server.model, 2, 'the rest of the answer is the service\'s');
+});

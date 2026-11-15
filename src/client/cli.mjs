@@ -27,26 +27,37 @@ Služba:
   stop                                            zastaví bežiacu službu inštancie
   health                                          stav služby a instance_id
 
-Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
+Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model pošty 2, iný model: kód 3, nič sa nezapíše):
   send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]]
-       --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--cancels <id>] [--supersede-key <kľúč>]
-  send --reply-to <id> --state hotovo|otázka|čakám [--wait-for <čo>] --text <text|->
+       --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--supersede-key <kľúč>]
+                                                  nová správa (odpoveď ide cez resolve); potvrdenie { id, status, wait_due_at }
                                                   adresa: projekt+téma, alebo persona (+projekt, +téma); persona bez
                                                   témy, ktorú vlastní, ide do hlavného vlákna persony (@<persona>/main)
                                                   --ttl: lehota na prevzatie správy (90s, 5m, 30m, sekundy; skracuje, nie predlžuje; blocker a steer najviac 5m, assist 30m)
-                                                  predvolené ttl: blocker a steer 5m, assist 30m (instance.json ttl.<úroveň>). Odpoveď (--reply-to) nemá lehotu, úroveň zdedí
-                                                  a nesie stav: hotovo je konečná (jedna na správu, po nej 409), otázka a čakám sú priebežné; bez --state platí hotovo.
-                                                  Na odpoveď sa neodpovedá (400). --cancels <id>: nová správa ruší tvoju konečnú odpoveď <id>
+                                                  predvolené ttl: blocker a steer 5m, assist 30m (instance.json ttl.<úroveň>)
                                                   --supersede-key <kľúč>: nová správa s rovnakým kľúčom od toho istého odosielateľa na tú istú adresu nahradí ešte neprevzatú
-                                                  (blocker s kľúčom vytvorí oznam až po neprevzatí v lehote). Konečná odpoveď (hotovo) sa pri prevzatí (receive) potvrdí sama.
-  receive --project <p> --topic <t> | --persona <meno> | --thread <id> [--id <id> ...] [--ack]
-                                                  čítanie tela = prevzatie (picked_at); --id číta iba zadané správy
-  ack --id <id> [--id <id> ...]
+                                                  (blocker s kľúčom vytvorí oznam až po neprevzatí v lehote)
+  receive --project <p> --topic <t> | --persona <meno> | --thread <id> [--id <id> ...]
+                                                  čakajúce správy (pending); čítanie tela = prevzatie (picked); odpoveď a steer sú tým vybavené (done/read);
+                                                  --id: iba zadané správy, aj prevzaté či konečné (telo odosielateľovi a schránke, opakovateľne)
+  resolve --id <id> --state hotovo|otázka|čakám [--text <text|->] [--wait-for <čo>] [--cancels <id odpovede>] [schránka]
+                                                  jediné vybavenie správy: hotovo s textom = konečná odpoveď (jedna, ďalšia 409), hotovo bez textu = vybavené
+                                                  bez odpovede (settled); otázka a čakám sú priebežné odpovede s textom; --cancels: nová konečná odpoveď
+                                                  nahradí tvoju predchádzajúcu. Pri uzavretej téme odosielateľa: 200, answer_delivered false
+  settle --id <id> [schránka]                     resolve hotovo bez textu (vybavené bez odpovede)
+  ack --id <id> [--id <id> ...] [schránka]        resolve hotovo s ack: potvrdená bez odpovede, iba prevzatá (picked); po priebežnej odpovedi 409
+  withdraw --id <id>                              odosielateľ stiahne svoju nekonečnú správu (done/withdrawn)
+                                                  schránka: --project <p> --topic <t> | --persona <meno> | --thread <id> (predvolene vlákno klienta)
+                                                  resolve, settle, ack a withdraw nesú client_op_id; pri nedostupnej pošte idú do outboxu
+  obligations [--thread <id>] [--topics <p/t,...>] [--project <p>] [--persona <meno>] [--since <cursor>]
+                                                  čo vlákno dlhuje a na čo čaká: inbox, owed, awaiting, recent (po --since), cursor, topics, server;
+                                                  pri nedostupnej pošte posledná odpoveď s offline: true, age_s (bez id s operáciou v outboxe);
+                                                  wake: stav budenia tohto stroja ako pri count (running, pid, heartbeat_at; chýba, ak tu nikdy nebežalo)
+  obligations --due                               splatné čakania odosielateľov (modul wake; kľúč wake všetky, iný kľúč iba svojich správ)
+  wait-adopt --id <id> --due-at <iso> [--base-s <sekundy>]
+                                                  služba prevezme lokálne čakanie (budík) klienta na odpoveď: iba odosielateľ, iba nekonečná správa
   count --project <p> --topic <t> | --persona <meno> | --thread <id>  počet a ids čakajúcich správ (vždy živo; po výpadku nový pokus najskôr po 60 s)
-  message --id <id>                               stav správy bez tela (state, to, outcome, replied, expires_at, ttl_s, undelivered_*)
-  settle --id <id> --project <p> --topic <t> | --persona <meno> | --thread <id>
-                                                  príjemca vybaví prevzatú správu bez odpovede: konečná odpoveď hotovo (pôvod settled),
-                                                  nič sa nedoručí (aj pri uzavretej téme odosielateľa); cudzia schránka 403, konečná odpoveď už je 409
+  message --id <id> [schránka]                    stav správy (status, resolution, history, wait_*); telo iba odosielateľovi a schránke
   turn --state open|closed [--thread <id>] [--machine <stroj>] [--project <p> --topic <t>] [--holder-mode operator|auto]
        [--opened-at <iso>] [--next <krok>] [--discussion open|closed]
                                                   záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;
@@ -66,9 +77,11 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
   register-topic --project <p> --topic <t> --release [--holder <thread>]   uvoľní držiteľa (bez --holder alebo vlastného);
                  cudzí držiteľ sa mení iba s --takeover; zmena držiteľa bez --takeover je odmietnutá (409)
   register-topic --project <p> --topic <t> --close [--holder <thread>]   uzavrie tému (dokončená, archivovaná): nové správy 410,
-                 čakajúce sa vrátia odosielateľom (undelivered); nová registrácia bez --close ju znovu otvorí
-  events [--since <n>|latest] [--wait <ms>]       udalosti budenia (long-poll)
-  flush                                           odošle odchádzajúcu schránku (outbox)
+                 neprevzaté sa vrátia odosielateľom (undelivered), prevzaté ostávajú (odosielateľ dostane „recipient closed“);
+                 nová registrácia bez --close ju znovu otvorí
+  events [--since <n>|latest] [--wait <ms>]       udalosti budenia novej správy a odpovede (long-poll)
+  flush                                           odošle odchádzajúcu schránku (outbox): 409 s konečným stavom zahodí („already <resolution>“),
+                                                  iné odmietnutie presunie do rejected/; pri inom modeli pošty ostane celá
   clients                                         verzie pošty a workflow podľa odosielateľa (persony) a stroja, ako ich služba videla
                                                   (comms_version a workflow_version null: starý klient bez verzie alebo workflow ju neposlal)
 
@@ -77,9 +90,10 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 `;
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
-  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'reply-to', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
-  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator', 'discussion']);
-const BOOL_FLAGS = new Set(['no-start', 'all', 'ack', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close']);
+  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
+  'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator', 'discussion',
+  'topics', 'due-at', 'base-s']);
+const BOOL_FLAGS = new Set(['no-start', 'all', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close', 'due']);
 
 export function parseArgs(argv) {
   const out = { _: [], id: [] };
@@ -116,7 +130,7 @@ export async function main(argv, { stdout = process.stdout, stderr = process.std
     if (result !== undefined) stdout.write(JSON.stringify(result, null, 2) + '\n');
     return 0;
   } catch (e) {
-    const code = e.code === 'UNAVAILABLE' ? 2 : e.code === 'INSTANCE_MISMATCH' ? 3 : 1;
+    const code = e.code === 'UNAVAILABLE' ? 2 : (e.code === 'INSTANCE_MISMATCH' || e.code === 'MODEL_MISMATCH') ? 3 : 1;
     stderr.write(JSON.stringify({ error: e.message, code: e.code || 'ERROR', ...(e.status ? { status: e.status } : {}), ...(e.data ? { details: e.data } : {}) }) + '\n');
     if (e.code === 'USAGE') stderr.write(USAGE);
     return code;
@@ -233,16 +247,14 @@ async function run(cmd, args, cfg, io) {
       return client.ensureRunning();
     case 'send': {
       need('text');
-      // Level is required, except for a reply (it inherits the level of the message it answers).
       if (args.level === 'info') throw new CommsError('REJECTED', LEVEL_REMOVED_TEXT, { status: 400 });
-      if (args.level == null && !args.replyTo) throw new CommsError('USAGE', `chýba voľba --level (${LEVELS.join('|')})`);
-      if (args.level != null && !LEVELS.includes(args.level)) throw new CommsError('REJECTED', `neznáma úroveň „${args.level}“; platné úrovne: ${LEVELS.join('|')}`, { status: 400 });
-      if (!args.replyTo && !args.persona) need('project', 'topic');
-      if (args.state != null && !args.replyTo) throw new CommsError('USAGE', '--state patrí iba odpovedi (--reply-to)');
-      if (args.state != null && !REPLY_STATES.includes(args.state)) throw new CommsError('REJECTED', `neznámy stav odpovede „${args.state}“; platné stavy: ${REPLY_STATES.join('|')}`, { status: 400 });
-      if (args.cancels != null && args.replyTo) throw new CommsError('USAGE', '--cancels patrí novej správe s úrovňou a adresou, nie odpovedi (--reply-to)');
-      if (args.supersedeKey != null && args.replyTo) throw new CommsError('USAGE', '--supersede-key patrí novej správe s úrovňou a adresou, nie odpovedi (--reply-to)');
-      if (args.ttl != null && !args.replyTo) {
+      need('level');
+      if (!LEVELS.includes(args.level)) throw new CommsError('REJECTED', `neznáma úroveň „${args.level}“; platné úrovne: ${LEVELS.join('|')}`, { status: 400 });
+      if (!args.persona) need('project', 'topic');
+      for (const f of ['state', 'cancels', 'waitFor']) {
+        if (args[f] != null) throw new CommsError('USAGE', `--${f === 'waitFor' ? 'wait-for' : f} patrí vybaveniu správy (comms resolve), nie send`);
+      }
+      if (args.ttl != null) {
         // Checked here too, so that a message queued during an outage is not rejected later (the server checks the same).
         const s = parseDuration(args.ttl);
         if (s == null) throw new CommsError('REJECTED', `neplatná lehota (ttl) „${args.ttl}“: napr. 90s, 5m, 30m alebo počet sekúnd`, { status: 400 });
@@ -251,24 +263,61 @@ async function run(cmd, args, cfg, io) {
       }
       let text = args.text;
       if (text === '-') text = await readAll(io.stdin);
-      return client.sendOrQueue({
+      return client.send({
         project: args.project || null, topic: args.topic || null, persona: args.persona || null, level: args.level, text,
-        reply_to: args.replyTo || null, from_project: args.fromProject || null, from_topic: args.fromTopic || null,
+        from_project: args.fromProject || null, from_topic: args.fromTopic || null,
         ...(args.ttl != null ? { ttl: args.ttl } : {}),
-        ...(args.replyTo && args.state != null ? { reply_state: args.state } : {}),
-        ...(args.replyTo && args.waitFor != null ? { wait_for: args.waitFor } : {}),
-        ...(args.cancels != null ? { cancels: args.cancels } : {}),
         ...(args.supersedeKey != null ? { supersede_key: args.supersedeKey } : {}),
       });
     }
     case 'message':
       if (!args.id.length) throw new CommsError('USAGE', 'chýba voľba --id');
       if (args.id.length > 1) throw new CommsError('USAGE', 'message zisťuje stav jednej správy: zadajte jedno --id');
-      return client.message(args.id[0]);
+      return client.message(args.id[0], mailboxOf(args, cfg));
+    case 'resolve': {
+      if (args.id.length !== 1) throw new CommsError('USAGE', 'resolve vybaví jednu správu: zadajte jedno --id');
+      need('state');
+      if (!REPLY_STATES.includes(args.state)) throw new CommsError('REJECTED', `neznámy stav „${args.state}“; platné stavy: ${REPLY_STATES.join('|')}`, { status: 400 });
+      let text = args.text ?? null;
+      if (text === '-') text = await readAll(io.stdin);
+      // Checked here too, so that an item queued during an outage is not rejected later (the server checks the same).
+      if ((text == null || !String(text).trim()) && args.state !== 'hotovo') throw new CommsError('USAGE', `priebežná odpoveď (${args.state}) musí mať --text`);
+      if (args.cancels != null && (args.state !== 'hotovo' || text == null)) throw new CommsError('USAGE', '--cancels nahrádza konečnú odpoveď: --state hotovo a --text');
+      return client.resolve({
+        id: args.id[0], state: args.state, ...(text != null ? { text } : {}), ...mailboxOf(args, cfg),
+        ...(args.waitFor != null ? { wait_for: args.waitFor } : {}), ...(args.cancels != null ? { cancels: args.cancels } : {}),
+      });
+    }
     case 'settle':
       if (args.id.length !== 1) throw new CommsError('USAGE', 'settle vybaví jednu správu: zadajte jedno --id');
-      if (!args.thread && !args.persona) need('project', 'topic');
-      return client.settle({ id: args.id[0], thread: args.thread || null, project: args.project || null, topic: args.topic || null, persona: args.persona || null });
+      return client.resolve({ id: args.id[0], state: 'hotovo', ...mailboxOf(args, cfg) });
+    case 'ack': {
+      if (!args.id.length) throw new CommsError('USAGE', 'zadaj aspoň jedno --id');
+      const results = [];
+      for (const id of args.id) results.push(await client.resolve({ id, state: 'hotovo', ack: true, ...mailboxOf(args, cfg) }));
+      return args.id.length === 1 ? results[0] : { results };
+    }
+    case 'withdraw':
+      if (args.id.length !== 1) throw new CommsError('USAGE', 'withdraw stiahne jednu správu: zadajte jedno --id');
+      return client.withdraw({ id: args.id[0] });
+    case 'obligations': {
+      if (args.due) return client.due();
+      const q = { thread: args.thread || cfg.threadId || null, topics: args.topics || null, project: args.project || null, persona: args.persona || null, since: args.since ?? null };
+      if (!q.thread && !q.topics && !q.persona) throw new CommsError('USAGE', 'obligations: zadaj --thread (alebo COMMS_THREAD_ID), --topics alebo --persona');
+      // obligations replaces count for the status line (design part 2), so it carries the wake status of this machine
+      // like count (comms-public#4), also with the offline backup: null (no field) when wake never ran here.
+      const r = await client.obligations(q);
+      const wake = wakeStatus(wakeStateDir(args));
+      return wake ? { ...r, wake } : r;
+    }
+    case 'wait-adopt': {
+      if (args.id.length !== 1) throw new CommsError('USAGE', 'wait-adopt prevezme čakanie jednej správy: zadajte jedno --id');
+      need('dueAt');
+      if (!Number.isFinite(Date.parse(args.dueAt))) throw new CommsError('USAGE', '--due-at musí byť čas ISO 8601');
+      const base = args.baseS == null ? null : Number(args.baseS);
+      if (base != null && !(Number.isInteger(base) && base > 0)) throw new CommsError('USAGE', '--base-s musí byť kladné celé číslo sekúnd');
+      return client.waitAdopt({ id: args.id[0], due_at: args.dueAt, ...(base != null ? { base_s: base } : {}) });
+    }
     case 'turn': {
       // `--waiting-operator true|false` without --state: the flag of the open turn (the thread waits for the operator's dialog).
       if (args.state == null && args.waitingOperator != null) {
@@ -288,15 +337,12 @@ async function run(cmd, args, cfg, io) {
     case 'receive': {
       if (!args.thread && !args.persona) need('project', 'topic');
       await client.ensureRunning();
-      try { await client.flushOutbox(); } catch { /* outbox stays, reported by flush */ }
-      // `--id` limits the read (and so the pickup) to the named messages.
-      const r = await client.receive({ project: args.project, topic: args.topic, thread: args.thread, persona: args.persona, ids: args.id.length ? args.id.join(',') : null });
-      if (args.ack && r.messages.length) await client.ack(r.messages.map((m) => m.id));
-      return r;
+      try { await client.flushOutbox(); } catch (e) { if (e.code === 'MODEL_MISMATCH' || e.code === 'INSTANCE_MISMATCH') throw e; /* outbox stays, reported by flush */ }
+      const q = { project: args.project, topic: args.topic, thread: args.thread, persona: args.persona };
+      // One `--id`: that message in any status (receive?id, 1d); more: only those of the pending ones.
+      if (args.id.length === 1) return client.receive({ ...q, id: args.id[0] });
+      return client.receive({ ...q, ids: args.id.length ? args.id.join(',') : null });
     }
-    case 'ack':
-      if (!args.id.length) throw new CommsError('USAGE', 'zadaj aspoň jedno --id');
-      return client.ack(args.id);
     case 'count':
       if (!args.thread && !args.persona) need('project', 'topic');
     {
@@ -332,6 +378,12 @@ async function run(cmd, args, cfg, io) {
     default:
       throw new CommsError('USAGE', `neznámy príkaz „${cmd}“`);
   }
+}
+
+/** Mailbox of resolve/settle/ack/message: project+topic, persona, else the thread (--thread or the client's thread). */
+function mailboxOf(args, cfg) {
+  const thread = args.thread || cfg.threadId || null;
+  return { project: args.project || null, topic: args.topic || null, persona: args.persona || null, thread };
 }
 
 function requireInstance(store, cfg) {

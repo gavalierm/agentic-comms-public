@@ -55,6 +55,19 @@ export function discussionOpen(turn) {
 }
 
 /**
+ * Deadline of an open turn record when the thread's state cannot be read from T3 (the service never can; wake without
+ * `status` or when T3 does not answer): an open record whose last write (open, discussion, waiting_operator) is older
+ * says nothing about a running thread (interrupted, archived, Stop lost), so it gives no `busy`.
+ */
+export const TURN_BUSY_MAX_MS = 60 * 60 * 1000;
+/** The open turn record is younger than its deadline (TURN_BUSY_MAX_MS): the only `busy` without the thread's state. */
+export function turnFresh(turn, now = Date.now(), maxMs = TURN_BUSY_MAX_MS) {
+  if (!turn || turn.state !== 'open') return false;
+  const at = [turn.opened_at, turn.discussion_at, turn.waiting_operator_at].map((v) => Date.parse(v || '')).filter(Number.isFinite);
+  return at.length > 0 && now - Math.max(...at) < maxMs;
+}
+
+/**
  * Time-sortable id: 20261101T001234567Z-00a1b2c3. Ids created in the same
  * millisecond by one process stay in creation order (monotonic counter).
  */

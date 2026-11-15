@@ -3,8 +3,8 @@
 // tests and other machines may substitute it; the thread id and the fixed template
 // are always the last two arguments. Without the CLI nothing is woken: the message
 // waits in the mailbox for the next turn.
-// `status(threadId)` (keepalive) runs `t3 thread show --json <threadId>` (configurable
-// as `wake.status_command`) and reads `thread.status` and `thread.activeRunId`.
+// `status(threadId)` (keepalive, busy, archived) runs `t3 thread show --json <threadId>` (configurable
+// as `wake.status_command`) and reads `thread.status`, `thread.activeRunId` and `thread.archived`.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -83,8 +83,9 @@ export function createT3Adapter({ command = DEFAULT_T3_COMMAND, statusCommand = 
     },
     /**
      * Whether the thread runs a turn now. T3 does not mark a run cut by a restart
-     * (`status: completed`, `activeRunId: null`), so `running` = active run present.
-     * Resolves { ok, running, status, error? }; never throws.
+     * (`status: completed`, `activeRunId: null`), so `running` = active run present. `archived`: the thread takes no
+     * further turn; `run`: the active run id (a ring queued behind a run has started once it changes).
+     * Resolves { ok, running, status, archived, run, error? }; never throws.
      */
     async status(threadId) {
       if (!statusArgv.length) return { ok: false, running: false, status: null, error: 'prázdny príkaz stavu' };
@@ -95,7 +96,8 @@ export function createT3Adapter({ command = DEFAULT_T3_COMMAND, statusCommand = 
       // Exit 0 without a thread object is an unknown state, never "not running" (keepalive would ring a busy thread).
       if (!j || typeof j.thread !== 'object' || j.thread === null) return { ok: false, running: null, status: null, error: 'výstup bez objektu thread' };
       const th = j.thread;
-      return { ok: true, running: th.activeRunId != null && th.activeRunId !== '', status: th.status ?? null };
+      const run = th.activeRunId != null && th.activeRunId !== '' ? String(th.activeRunId) : null;
+      return { ok: true, running: run !== null, status: th.status ?? null, archived: th.archived === true, run };
     },
   };
 }

@@ -321,4 +321,5 @@ src/wake/   modul budenia: Waker (udalosti, limity, šablóna, stav), cli
 src/adapters/t3/  adaptér budenia cez T3 CLI (`t3 thread send`, stav `t3 thread show --json`)
 src/notify/ notifikácia operátora (externý príkaz `notify.command`)
 tests/      node --test (`npm test`), dočasné priečinky v /tmp
+scripts/    test-slot.mjs: celé testy (`npm test`) čakajú na voľný slot, najviac 2 behy na stroji spolu s agentic-flow (`AGENTIC_TEST_SLOTS`, sloty v `~/.local/state/agentic/test-slots`, D-0069); jeden `node --test <súbor>` nečaká
 ```

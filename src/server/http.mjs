@@ -62,6 +62,8 @@ export function createHandler(service, store) {
           return sendJson(res, 200, service.messageState(url.searchParams.get('id')));
         case 'POST /bounce':
           return sendJson(res, 200, service.bounce(body));
+        case 'POST /settle':
+          return sendJson(res, 200, service.settle(body));
         case 'POST /turn':
           return sendJson(res, 200, service.turn(body));
         case 'GET /turns':

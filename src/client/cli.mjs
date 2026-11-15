@@ -44,6 +44,9 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config):
   ack --id <id> [--id <id> ...]
   count --project <p> --topic <t> | --persona <meno> | --thread <id>  počet a ids čakajúcich správ (vždy živo; po výpadku nový pokus najskôr po 60 s)
   message --id <id>                               stav správy bez tela (state, to, outcome, replied, expires_at, ttl_s, undelivered_*)
+  settle --id <id> --project <p> --topic <t> | --persona <meno> | --thread <id>
+                                                  príjemca vybaví prevzatú správu bez odpovede: konečná odpoveď hotovo (pôvod settled),
+                                                  nič sa nedoručí (aj pri uzavretej téme odosielateľa); cudzia schránka 403, konečná odpoveď už je 409
   turn --state open|closed [--thread <id>] [--machine <stroj>] [--project <p> --topic <t>] [--holder-mode operator|auto]
        [--opened-at <iso>] [--next <krok>] [--discussion open|closed]
                                                   záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;
@@ -262,6 +265,10 @@ async function run(cmd, args, cfg, io) {
       if (!args.id.length) throw new CommsError('USAGE', 'chýba voľba --id');
       if (args.id.length > 1) throw new CommsError('USAGE', 'message zisťuje stav jednej správy: zadajte jedno --id');
       return client.message(args.id[0]);
+    case 'settle':
+      if (args.id.length !== 1) throw new CommsError('USAGE', 'settle vybaví jednu správu: zadajte jedno --id');
+      if (!args.thread && !args.persona) need('project', 'topic');
+      return client.settle({ id: args.id[0], thread: args.thread || null, project: args.project || null, topic: args.topic || null, persona: args.persona || null });
     case 'turn': {
       // `--waiting-operator true|false` without --state: the flag of the open turn (the thread waits for the operator's dialog).
       if (args.state == null && args.waitingOperator != null) {

@@ -616,6 +616,37 @@ export class Service {
     return { acked, already };
   }
 
+  /**
+   * Settle a picked message without a reply (POST /settle): the recipient writes the final answer `hotovo` of origin
+   * `settled` onto the original. Nothing is delivered, so the sender's closed topic or missing way back does not matter
+   * (a reply there is refused with 410/400 and the message stayed `picked … | no answer`). The caller names its mailbox
+   * as for receive (thread, project+topic or persona); the message must be addressed to it (else 403) and picked up
+   * (else 409 `not-picked`). 409 when the message already has a final answer.
+   */
+  settle({ id = null, thread = null, project = null, topic = null, persona = null } = {}) {
+    if (!present(id)) throw new HttpError(400, 'zadaj id správy');
+    if (present(persona)) { requireName(persona, 'persona'); project = personaProject(persona); topic = PERSONA_MAIN_TOPIC; }
+    const byTopic = present(project) && present(topic);
+    if (!byTopic && !present(thread)) throw new HttpError(400, 'zadaj schránku príjemcu: project a topic, persona alebo thread');
+    const m = this.store.message(String(id));
+    if (!m) throw new HttpError(404, `správa ${id} neexistuje`);
+    const mine = (present(thread) && m.to_thread === thread) || (byTopic && m.project === project && m.topic === topic);
+    if (!mine) throw new HttpError(403, `správa ${id} nie je adresovaná tejto schránke: vybaviť ju smie iba jej príjemca`);
+    if (m.reply_to) throw new HttpError(400, `správa ${id} je odpoveď: odpoveď sa nevybavuje`);
+    const answer = this.answerOf(m);
+    if (answer && answer.state === FINAL_REPLY_STATE) {
+      throw new HttpError(409, `správa ${id} má už konečnú odpoveď${answer.id ? ` ${answer.id}` : ''} (${answer.origin})`, { answer_id: answer.id, answer_at: answer.at, answer_origin: answer.origin });
+    }
+    if (!m.picked_at) throw new HttpError(409, `správa ${id} ešte nebola prevzatá (receive): vybaviť sa dá iba prevzatá správa`, { reason: 'not-picked' });
+    m.answer_state = FINAL_REPLY_STATE;
+    m.answer_at = nowIso();
+    m.answer_id = null;
+    m.answer_origin = 'settled';
+    this.store.saveMessage(m);
+    this.log(`settled ${m.id} (${levelOf(m)}) ${m.project || '-'}/${m.topic || '-'}${m.to_thread ? ` thread ${m.to_thread}` : ''}`);
+    return this.messageState(m.id);
+  }
+
   /** State of one message without its body (wake checks it before ringing an `expired` event). */
   messageState(id) {
     const m = this.store.message(id || '');

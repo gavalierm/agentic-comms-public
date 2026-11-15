@@ -201,6 +201,8 @@ export class Client {
   createNotice(body) { return this.call('POST', '/notice', { body }); }
   bounce(body) { return this.call('POST', '/bounce', { body }); }
   message(id) { return this.call('GET', '/message', { query: { id } }); }
+  /** Settle a picked message without a reply (final answer `hotovo`, origin `settled`); body { id, thread | project+topic | persona }. */
+  settle(body) { return this.call('POST', '/settle', { body }); }
   /** Pending messages of a mailbox without reading them (no pickup, no count cache): the wake module's check before a ring. */
   pendingMail(q) { return this.call('GET', '/count', { query: q }); }
   turns(open = true) { return this.call('GET', '/turns', { query: { open: open ? '1' : null } }); }

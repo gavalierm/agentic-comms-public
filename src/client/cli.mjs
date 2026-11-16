@@ -87,7 +87,7 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model poš
   clients                                         verzie pošty a workflow podľa odosielateľa (persony) a stroja, ako ich služba videla
                                                   (comms_version a workflow_version null: starý klient bez verzie alebo workflow ju neposlal)
 
-Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http://host:port>
+Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http(s)://host[:port]>
                 --key <kľúč> | --thread <id> | --machine <stroj> | --outbox <cesta> | --timeout <ms> | --no-start
 `;
 

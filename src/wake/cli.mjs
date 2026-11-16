@@ -18,7 +18,7 @@ const USAGE = `Použitie: wake <príkaz> [voľby]
   install   trvalý beh pre prihláseného používateľa: Linux systemd --user, macOS LaunchAgent, Windows Plánovač úloh
             (voľby ako run; --print iba vypíše súbory a príkazy, --remove registráciu odstráni)
 
-Voľby pošty (ako comms): --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http://host:port>
+Voľby pošty (ako comms): --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http(s)://host[:port]>
                          --key <kľúč> | --instance-id <id> | --timeout <ms> | --no-start
 Voľby budenia:           --adapter t3|none (predvolené t3) | --command "<príkaz>" (predvolené "t3 thread send")
                          --limit-per-hour <n> (6) | --stop-on-repeat <n> (2) | --max-event-age-ms <ms> (3600000)

@@ -1,8 +1,9 @@
-// Client core of mail model 2: http.request over socketPath (or TCP URL), instance_id and model check, start-on-demand,
+// Client core of mail model 2: http.request over socketPath (or an http:// / https:// URL), instance_id and model check, start-on-demand,
 // outbox for outages (writes with client_op_id), obligations with an offline backup, message count.
 // Model (4a, I10): every request carries X-Comms-Model: 2; a service of another model (/health, 426) fails loudly and
 // nothing is written or queued. The outbox is only for an unavailable service (P-041).
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -84,9 +85,11 @@ export class Client {
    */
   request(method, pathname, { body, query, auth = true, timeout = this.cfg.timeout } = {}) {
     const q = query ? '?' + new URLSearchParams(Object.entries(query).filter(([, v]) => v != null && v !== '')).toString() : '';
-    const target = this.cfg.url
-      ? (() => { const u = new URL(this.cfg.url); return { host: u.hostname, port: u.port || 80, path: (u.pathname.replace(/\/$/, '')) + pathname + q }; })()
-      : { socketPath: this.cfg.socket, path: pathname + q };
+    let target;
+    let transport = http;
+    if (this.cfg.url) {
+      try { ({ transport, target } = urlTarget(this.cfg.url, pathname + q)); } catch (e) { return Promise.reject(e); }
+    } else target = { socketPath: this.cfg.socket, path: pathname + q };
     const headers = { Accept: 'application/json', 'X-Comms-Model': String(MAIL_MODEL) };
     if (auth && this.cfg.key) headers.Authorization = `Bearer ${this.cfg.key}`;
     Object.assign(headers, versionHeaders(this.cfg));
@@ -97,7 +100,7 @@ export class Client {
       headers['Content-Length'] = Buffer.byteLength(payload);
     }
     return new Promise((resolve, reject) => {
-      const req = http.request({ ...target, method, headers, timeout }, (res) => {
+      const req = transport.request({ ...target, method, headers, timeout }, (res) => {
         let raw = '';
         res.setEncoding('utf8');
         res.on('data', (d) => { raw += d; });
@@ -147,7 +150,7 @@ export class Client {
   }
 
   async tryHealth() {
-    try { return await this.request('GET', '/health', { auth: false }); } catch { return null; }
+    try { return await this.request('GET', '/health', { auth: false }); } catch (e) { if (e.code === 'USAGE') throw e; return null; }
   }
 
   /** instance.json `managed`: the service manager starts it, clients do not (no autostart). */
@@ -414,6 +417,21 @@ export class Client {
 export const FINAL_STATUSES = ['done', 'discarded', 'superseded', 'undelivered'];
 
 /** Headers naming the client version, workflow version and machine. */
+/**
+ * Transport and request options for a service URL: https:// goes over TLS (default port 443), http:// over plain
+ * TCP (default port 80). Another protocol is a configuration error (USAGE), never a silent plain-HTTP call.
+ */
+export function urlTarget(url, pathAndQuery) {
+  let u;
+  try { u = new URL(url); } catch { throw new CommsError('USAGE', `neplatná adresa pošty: ${url}`); }
+  const secure = u.protocol === 'https:';
+  if (!secure && u.protocol !== 'http:') throw new CommsError('USAGE', `adresa pošty musí byť http:// alebo https:// (${u.protocol})`);
+  return {
+    transport: secure ? https : http,
+    target: { host: u.hostname.replace(/^\[|\]$/g, ''), port: Number(u.port) || (secure ? 443 : 80), path: u.pathname.replace(/\/$/, '') + pathAndQuery },
+  };
+}
+
 export function versionHeaders(cfg) {
   const h = {};
   const clean = (v) => String(v).replace(/[^\x20-\x7e]/g, '').trim().slice(0, 80);

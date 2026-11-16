@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, cleanup, sleep, killPid, tmpDir, runCli } from './helpers.mjs';
 import { probe } from '../src/server/index.mjs';
 import { socketPath } from '../src/common/paths.mjs';
-import { Client, CommsError, resolveConfig } from '../src/client/index.mjs';
+import { Client, CommsError, resolveConfig, urlTarget } from '../src/client/index.mjs';
 
 const BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
 
@@ -279,6 +281,34 @@ test('client: a 2xx answer that is not JSON is an error (BAD_RESPONSE); the outb
   await assert.rejects(c.request('POST', '/send', { body: {} }), (e) => e.code === 'BAD_RESPONSE');
   await assert.rejects(c.flushOutbox(), (e) => e.code === 'BAD_RESPONSE');
   assert.equal(fs.existsSync(file), true, 'the queued message is not deleted');
+});
+
+test('client: the URL protocol picks the transport and default port (https 443 over TLS, http 80)', () => {
+  const s = urlTarget('https://comms.example.org', '/health');
+  assert.equal(s.transport, https);
+  assert.deepEqual(s.target, { host: 'comms.example.org', port: 443, path: '/health' });
+  const p = urlTarget('http://192.0.2.5', '/x?a=1');
+  assert.equal(p.transport, http);
+  assert.deepEqual(p.target, { host: '192.0.2.5', port: 80, path: '/x?a=1' });
+  assert.deepEqual(urlTarget('https://h.example:8443/base/', '/health').target, { host: 'h.example', port: 8443, path: '/base/health' });
+  assert.equal(urlTarget('http://[::1]:7680', '/health').target.host, '::1');
+  assert.throws(() => urlTarget('ftp://h.example', '/health'), (e) => e instanceof CommsError && e.code === 'USAGE');
+  assert.throws(() => urlTarget('nie adresa', '/health'), (e) => e.code === 'USAGE');
+});
+
+test('client: an https:// URL speaks TLS (no plain HTTP request to a TLS endpoint); a bad URL is not "unavailable"', async (t) => {
+  // A raw TCP server records the first byte: 0x16 is a TLS handshake record, "G" would be plain "GET".
+  let first = null;
+  const srv = net.createServer((sock) => { sock.once('data', (d) => { first = d[0]; sock.destroy(); }); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => srv.close());
+  const dir = tmpDir('comms-https-');
+  t.after(() => cleanup(dir));
+  const c = new Client(resolveConfig({ url: `https://127.0.0.1:${srv.address().port}`, key: 'k', outbox: path.join(dir, 'outbox'), dataDir: dir, noStart: true }, {}));
+  await assert.rejects(c.request('GET', '/health', { auth: false }), (e) => e.code === 'UNAVAILABLE');
+  assert.equal(first, 0x16, 'the client opened a TLS handshake');
+  const bad = new Client(resolveConfig({ url: 'ftp://127.0.0.1', key: 'k', outbox: path.join(dir, 'outbox2'), dataDir: dir, noStart: true }, {}));
+  await assert.rejects(bad.ensureRunning(), (e) => e.code === 'USAGE');
 });
 
 test('CLI: serve forwards --config/--machine to the wake child; --wake on a running service exits non-zero', async (t) => {

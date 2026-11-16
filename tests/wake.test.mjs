@@ -328,9 +328,10 @@ test('bin/wake.mjs run: rings through the command, survives a mail restart, stop
   const dir = tmpDir('comms-wakeproc-');
   const logFile = path.join(dir, 'calls.log');
   let srv = await startInstance(inst);
+  // The status probe goes to the fake T3 too (a thread without a turn record is asked whether it runs): never the real t3.
   const spawnWake = (extraEnv = {}) => spawn(process.execPath, [WAKE_BIN, 'run', '--data-dir', inst.dir, '--no-start', '--command', `${process.execPath} ${FAKE_T3}`,
-    '--wait-ms', '300', '--reconnect-ms', '100', '--state-dir', dir], {
-    env: { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_T3_LOG: logFile, COMMS_SELF_RESTART: '0', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'],
+    '--status-command', `${process.execPath} ${FAKE_T3} status`, '--wait-ms', '300', '--reconnect-ms', '100', '--state-dir', dir], {
+    env: { PATH: process.env.PATH, HOME: process.env.HOME, FAKE_T3_LOG: logFile, FAKE_T3_STDOUT: JSON.stringify({ thread: { status: 'completed', activeRunId: null } }), COMMS_SELF_RESTART: '0', ...extraEnv }, stdio: ['ignore', 'pipe', 'pipe'],
   });
   const child = spawnWake();
   let out = '';
@@ -347,7 +348,8 @@ test('bin/wake.mjs run: rings through the command, survives a mail restart, stop
   const c = makeClient(inst);
   await c.registerTopic({ project: 'p', topic: 't', subject: 'S', holder: 'thr-1' });
   await c.send({ project: 'p', topic: 't', level: 'blocker', text: 'one' });
-  const lines = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean) : []);
+  // Rings only; status probes start with `status`.
+  const lines = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).filter((l) => JSON.parse(l)[0] !== 'status') : []);
   await waitFor(() => lines().length >= 1);
   assert.deepEqual(JSON.parse(lines()[0]), ['thr-1', 'you have mail in topic p/t']);
   // The rung thread took its turn (else the same bell again would be skipped as queued).

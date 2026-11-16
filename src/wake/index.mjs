@@ -28,6 +28,10 @@
 // archived, Stop lost). Where an open record, a hold or a queued mark decides, wake reads the thread's state from T3
 // (adapter `status`, as keepalive and continuation do): busy only while T3 runs it, a queued mark only while T3 runs the
 // run it was rung into. Without the state the open record counts only within its deadline (TURN_BUSY_MAX_MS).
+// A thread without any turn record (it runs outside the workflow, e.g. the maintainer's thread of send --maintainer) has
+// no hook that drops a stale bell at its turn start: while T3 runs it, its ring is held (`held_reason: running`) and rung
+// after the run ends, only when the mail still waits (operator 2026-11-16: a bell queued behind the running turn came
+// after the mail was picked and cost an empty turn).
 // A holder that T3 reports archived or gone gets no hold and no ring: its message becomes undelivered (bounce; the
 // service leaves it to a new holder of the topic), and the sender's wait is due (`undelivered <id>`, 1e); a held message
 // whose holder is archived later goes the same way at the next poll.
@@ -264,7 +268,9 @@ export class Waker {
     const discussing = turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record);
     const queuedMark = turnsKnown ? this.state.queued[holder] : null;
     // The thread's state decides where the turn record alone would: an open record (busy), a hold, a queued mark.
-    const th = turnsKnown && ((record && record.state === 'open') || discussing || queuedMark)
+    // No record at all: a thread outside the workflow; only T3 tells whether it runs now.
+    const outside = turnsKnown && !record;
+    const th = turnsKnown && ((record && record.state === 'open') || discussing || queuedMark || outside)
       ? await this.threadNow(holder, record, now) : { busy: false, gone: false, known: false, running: false, run: null };
     // Archived or gone: no later turn comes, no hold and no ring; the message goes back to its sender (undelivered).
     if (th.gone) return this.undeliverGone(ev, th.why, { holdOnError: discussing, now });
@@ -273,6 +279,11 @@ export class Waker {
     if (discussing) {
       this.hold(ev, now);
       return skip('discussion');
+    }
+    // Outside the workflow and running now: a ring would queue behind the run and arrive after the mail may be picked.
+    if (outside && th.busy) {
+      this.hold(ev, now, 'running');
+      return skip('running');
     }
     // A ring queued behind this run (pruned above) has not started yet: its turn will see this mail too. Behind an open
     // record only while the thread really runs that run: a stale record (interrupted, Stop lost) or another T3 run means
@@ -378,7 +389,8 @@ export class Waker {
   async threadNow(holder, record, now = this.now()) {
     const t3 = await this.t3State(holder);
     const open = !!record && record.state === 'open';
-    const busy = !t3.gone && open && (t3.known ? t3.running : turnFresh(record, now, this.opts.turnBusyMaxMs));
+    // Without any record only T3 can say it runs (a thread outside the workflow).
+    const busy = !t3.gone && (open ? (t3.known ? t3.running : turnFresh(record, now, this.opts.turnBusyMaxMs)) : (!record && t3.known && t3.running));
     return { ...t3, busy };
   }
 
@@ -414,10 +426,13 @@ export class Waker {
     return this.goneSeen[holder].why;
   }
 
-  /** Keep a steer/assist event until its holder's discussion ends (newest HELD_MAX). */
-  hold(ev, now = this.now()) {
+  /**
+   * Keep an event until its holder's discussion ends, or (`reason` running) until the run of a thread outside the workflow
+   * ends (newest HELD_MAX).
+   */
+  hold(ev, now = this.now(), reason = 'discussion') {
     const key = ev.message_id || `seq:${ev.seq}`;
-    this.state.held[key] = { ...ev, held_at: new Date(now).toISOString() };
+    this.state.held[key] = { ...ev, held_at: new Date(now).toISOString(), held_reason: reason };
     const keys = Object.keys(this.state.held);
     for (const k of keys.slice(0, Math.max(0, keys.length - HELD_MAX))) delete this.state.held[k];
     this.state.save();
@@ -441,7 +456,17 @@ export class Waker {
     }
     let released = 0;
     for (const [key, ev] of entries) {
-      if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) {
+      if (ev.held_reason === 'running') {
+        // Held while the thread ran (outside the workflow): rung only once T3 no longer runs it; archived or gone bounces.
+        const t3 = await this.t3State(String(ev.holder));
+        if (t3.gone) {
+          delete this.state.held[key];
+          this.state.save();
+          await this.undeliverGone(ev, t3.why, { holdOnError: true });
+          continue;
+        }
+        if (!t3.known || t3.running) continue;
+      } else if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) {
         const why = await this.heldGone(String(ev.holder));
         if (!why) continue;
         delete this.state.held[key];
@@ -463,9 +488,10 @@ export class Waker {
           this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
         }
       }
-      this.log(`release ${ev.message_id || key} → ${ev.holder}: diskusia s operátorom skončila`);
+      this.log(`release ${ev.message_id || key} → ${ev.holder}: ${ev.held_reason === 'running' ? 'ťah vlákna skončil' : 'diskusia s operátorom skončila'}`);
       released += 1;
-      await this.handle({ ...ev, created_at: new Date(this.now()).toISOString(), released: true });
+      const { held_at: _a, held_reason: _r, ...orig } = ev;
+      await this.handle({ ...orig, created_at: new Date(this.now()).toISOString(), released: true });
     }
     return released;
   }

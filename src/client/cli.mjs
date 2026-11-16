@@ -28,11 +28,13 @@ Služba:
   health                                          stav služby a instance_id
 
 Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model pošty 2, iný model: kód 3, nič sa nezapíše):
-  send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]]
+  send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]] | --maintainer
        --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--supersede-key <kľúč>]
                                                   nová správa (odpoveď ide cez resolve); potvrdenie { id, status, wait_due_at }
                                                   adresa: projekt+téma, alebo persona (+projekt, +téma); persona bez
                                                   témy, ktorú vlastní, ide do hlavného vlákna persony (@<persona>/main)
+                                                  --maintainer: vlákno T3 správcu workflow (instance.json maintainer.thread);
+                                                  bez nastaveného vlákna 404, archivované/neexistujúce vlákno → undelivered
                                                   --ttl: lehota na prevzatie správy (90s, 5m, 30m, sekundy; skracuje, nie predlžuje; blocker a steer najviac 5m, assist 30m)
                                                   predvolené ttl: blocker a steer 5m, assist 30m (instance.json ttl.<úroveň>)
                                                   --supersede-key <kľúč>: nová správa s rovnakým kľúčom od toho istého odosielateľa na tú istú adresu nahradí ešte neprevzatú
@@ -93,7 +95,7 @@ const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key'
   'sender', 'tcp', 'project', 'topic', 'level', 'text', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
   'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator', 'discussion',
   'topics', 'due-at', 'base-s']);
-const BOOL_FLAGS = new Set(['no-start', 'all', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close', 'due']);
+const BOOL_FLAGS = new Set(['maintainer', 'no-start', 'all', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close', 'due']);
 
 export function parseArgs(argv) {
   const out = { _: [], id: [] };
@@ -250,7 +252,8 @@ async function run(cmd, args, cfg, io) {
       if (args.level === 'info') throw new CommsError('REJECTED', LEVEL_REMOVED_TEXT, { status: 400 });
       need('level');
       if (!LEVELS.includes(args.level)) throw new CommsError('REJECTED', `neznáma úroveň „${args.level}“; platné úrovne: ${LEVELS.join('|')}`, { status: 400 });
-      if (!args.persona) need('project', 'topic');
+      if (args.maintainer && (args.project || args.topic || args.persona)) throw new CommsError('USAGE', '--maintainer sa nekombinuje s --project, --topic ani --persona');
+      if (!args.persona && !args.maintainer) need('project', 'topic');
       for (const f of ['state', 'cancels', 'waitFor']) {
         if (args[f] != null) throw new CommsError('USAGE', `--${f === 'waitFor' ? 'wait-for' : f} patrí vybaveniu správy (comms resolve), nie send`);
       }
@@ -264,7 +267,7 @@ async function run(cmd, args, cfg, io) {
       let text = args.text;
       if (text === '-') text = await readAll(io.stdin);
       return client.send({
-        project: args.project || null, topic: args.topic || null, persona: args.persona || null, level: args.level, text,
+        project: args.project || null, topic: args.topic || null, persona: args.persona || null, ...(args.maintainer ? { maintainer: true } : {}), level: args.level, text,
         from_project: args.fromProject || null, from_topic: args.fromTopic || null,
         ...(args.ttl != null ? { ttl: args.ttl } : {}),
         ...(args.supersedeKey != null ? { supersede_key: args.supersedeKey } : {}),

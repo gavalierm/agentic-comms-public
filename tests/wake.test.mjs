@@ -155,7 +155,7 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
 test('limit 6 per hour per pair of topics: above it a notice, no ring; resumes after an hour', async (t) => {
   const { inst, client, waker, adapter, clock } = await setup(t);
   for (let n = 1; n <= 8; n++) {
-    await client.send({ project: 'p', topic: 't', level: 'blocker', text: `message ${n}`, from_project: 'q', from_topic: 'u' });
+    await client.send({ project: 'p', topic: 't', level: 'assist', text: `message ${n}`, from_project: 'q', from_topic: 'u' });
   }
   assert.equal(await waker.pollOnce(500), 8);
   assert.equal(adapter.calls.length, 6);
@@ -210,6 +210,20 @@ test('a message above the hourly limit is held and rung once the window has room
   assert.equal(adapter.calls.length, 7);
   assert.deepEqual(adapter.calls[6], { holder: 'thr-1', text: 'you have mail in topic p/t' });
   assert.equal(Object.keys(waker.state.held).length, 0);
+});
+
+test('a steer and a blocker get twice the hourly pair limit; they count in the same window', async (t) => {
+  const { client, waker, adapter } = await setup(t);
+  for (let n = 1; n <= 6; n++) await client.send({ project: 'p', topic: 't', level: 'assist', text: `assist ${n}`, from_project: 'q', from_topic: 'u' });
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'assist 7', from_project: 'q', from_topic: 'u' });
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'zmena smeru', from_project: 'q', from_topic: 'u' });
+  await waker.pollOnce(500);
+  assert.equal(adapter.calls.length, 7, 'the 7th assist waits, the steer rings');
+  assert.equal(waker.stats.limited, 1);
+  for (let n = 1; n <= 6; n++) await client.send({ project: 'p', topic: 't', level: 'blocker', text: `blocker ${n}`, from_project: 'q', from_topic: 'u' });
+  await waker.pollOnce(500);
+  assert.equal(adapter.calls.length, 12, 'urgent rings stop at twice the limit');
+  assert.equal(waker.stats.limited, 2);
 });
 
 test('a held limited message the thread picked up meanwhile is not rung', async (t) => {

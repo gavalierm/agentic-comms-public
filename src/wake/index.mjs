@@ -65,6 +65,16 @@ const HELD_MAX = 200;
 export const KEEPALIVE_TEMPLATE = 'turn interrupted, continue from handover';
 /** Continuation (P-026): a turn closed with a next step left in the handover is rung once per step. */
 export const CONTINUE_TEMPLATE = 'turn ended with a next step, continue from handover';
+/**
+ * Hourly ring limit of a pair for an event: a blocker and a steer get twice the limit (report 2026-11-17: a steer to a thread
+ * working with another one waited 20 min behind six assists of the hour). They still count in the pair, so a loop still
+ * stops; repeated text stops by `stopOnRepeat`.
+ */
+export const URGENT_TYPES = ['blocker', 'steer'];
+export function pairLimit(ev, limitPerHour) {
+  return URGENT_TYPES.includes(ev?.type) ? limitPerHour * 2 : limitPerHour;
+}
+
 export const DEFAULTS = {
   limitPerHour: 6, stopOnRepeat: 2, maxEventAgeMs: 60 * 60 * 1000, waitMs: 25_000, reconnectMs: 1000, maxReconnectMs: 30_000,
   keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 60_000, idleDedupeMs: 120_000,
@@ -318,7 +328,7 @@ export class Waker {
 
     let limit = null;
     if (ev.text_hash && !ev.released && repeats >= this.opts.stopOnRepeat) limit = { reason: 'repeat', detail: `rovnaká správa ${repeats}× za sebou (${dir})` };
-    else if (recent.length >= this.opts.limitPerHour) limit = { reason: 'hour', detail: `${recent.length} zobudení za poslednú hodinu (${pair}), limit ${this.opts.limitPerHour}` };
+    else if (recent.length >= pairLimit(ev, this.opts.limitPerHour)) limit = { reason: 'hour', detail: `${recent.length} zobudení za poslednú hodinu (${pair}), limit ${pairLimit(ev, this.opts.limitPerHour)}` };
 
     if (limit) {
       this.stats.limited += 1;
@@ -466,7 +476,7 @@ export class Waker {
     for (const [key, ev] of entries) {
       if (ev.held_reason === 'limit') {
         // Held above the hourly limit: rung once the pair's window has room again (handle counts the ring).
-        if ((this.state.rings[pairKey(ev)] || []).length >= this.opts.limitPerHour) continue;
+        if ((this.state.rings[pairKey(ev)] || []).length >= pairLimit(ev, this.opts.limitPerHour)) continue;
         // A bell of the same topic rang the idle holder after the hold: that turn sees this mail too.
         const idle = this.state.idle[String(ev.holder)];
         if (idle && idle.text === ringText(ev) && idle.at > Date.parse(ev.held_at)) {

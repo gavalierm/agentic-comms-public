@@ -917,7 +917,8 @@ export class Waker {
       if (!ev.message_id || !mine(ev) || this.state.held[ev.message_id]) continue;
       const age = now - Date.parse(ev.created_at);
       if (age < this.opts.remindAfterMs) continue;
-      if (age > this.opts.remindMaxAgeMs) { old.push(ev); continue; }
+      // Too old to ring: once in the summary notice (an acked summary is not made again for the same messages).
+      if (age > this.opts.remindMaxAgeMs) { if (!this.state.reminded[ev.message_id]?.noticed) old.push(ev); continue; }
       const r = this.state.reminded[ev.message_id] || { count: 0, at: 0 };
       if (r.count >= this.opts.remindMax) {
         if (!r.noticed) {
@@ -948,6 +949,7 @@ export class Waker {
       await this.notice({ kind: 'unpicked', title: `${old.length} správ(y) nevyzdvihnutých dlhšie ako ${Math.round(this.opts.remindMaxAgeMs / HOUR)} h`, message_id: old[0].message_id,
         detail: `Najstaršia ${old[0].message_id} (${topicLabel(old[0])}, od ${old[0].created_at}). Bez zvončeka (staré); over príjemcov: ${[...new Set(old.map(topicLabel))].slice(0, 10).join(', ')}.`,
         dedupe_key: 'unpicked:old' });
+      for (const ev of old) this.state.reminded[ev.message_id] = { count: 0, ...this.state.reminded[ev.message_id], at: now, noticed: true };
     }
     this.state.save();
     return rang;

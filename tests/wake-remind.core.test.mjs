@@ -87,4 +87,9 @@ test('a reply to a thread is reminded to that thread; a message older than remin
   const old = (await client.notices()).notices.filter((n) => n.kind === 'unpicked');
   assert.equal(old.length, 1);
   assert.match(old[0].title, /1 správ\(y\) nevyzdvihnutých dlhšie ako 2 h/);
+  // Acked: not made again for the same message.
+  await client.decide({ notice_id: old[0].id, decision: 'ack' });
+  clock.now += 10 * MIN;
+  await waker.pollOnce(50);
+  assert.equal((await client.notices()).notices.filter((n) => n.kind === 'unpicked').length, 0, 'an acked summary is not made again');
 });

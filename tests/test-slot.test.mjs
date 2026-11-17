@@ -17,7 +17,7 @@ const RUN = "const fs=require('fs'),p=require('path');const [d,n]=process.argv.s
 
 function slotEnv(dir) {
   const env = { ...process.env, AGENTIC_TEST_SLOTS_DIR: path.join(dir, 'slots'), AGENTIC_TEST_SLOT_POLL_MS: '50' };
-  delete env.AGENTIC_TEST_SLOTS;
+  env.AGENTIC_TEST_SLOTS = '2'; // the waiting of a third run (the default is one run, P-079)
   delete env.AGENTIC_TEST_SLOT_HELD; // this suite itself runs inside a slot of npm test
   return env;
 }

@@ -112,8 +112,23 @@ export function topicLabel(ev) {
   return `thread/${ev.holder}`;
 }
 
+/**
+ * Sender label of an event (operator 2026-11-17: the bell says to whom and from whom): the sender's topic
+ * `project/topic`, else its key, else `thread/<id>`. Characters outside the label class become `-` (the flow
+ * recognises a bell only as the exact whole prompt).
+ */
+export function fromLabel(ev) {
+  const clean = (s) => String(s).replace(/[^A-Za-z0-9_.:@-]/g, '-').replace(/^[^A-Za-z0-9@]+/, '');
+  if (ev.from_project && ev.from_topic) return `${clean(ev.from_project)}/${clean(ev.from_topic)}`;
+  if (ev.sender && clean(ev.sender)) return clean(ev.sender);
+  if (ev.thread_id) return `thread/${clean(ev.thread_id)}`;
+  return null;
+}
+
+/** `you have mail in topic <to> from <from>` (without a known sender: no `from`). */
 export function wakeText(ev) {
-  return `${WAKE_TEMPLATE} ${topicLabel(ev)}`;
+  const from = fromLabel(ev);
+  return `${WAKE_TEMPLATE} ${topicLabel(ev)}${from ? ` from ${from}` : ''}`;
 }
 
 /** Exact ring text of an event (the whole prompt, never the body). */

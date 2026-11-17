@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Slot of a full test run (agent-alice/D-0069; overload 2026-11-15: ten topics ran their whole test suites at once, load 41
 // on 4 cores). `npm test` of agentic-comms runs its suite through this script: it waits until a slot is free, at most
-// AGENTIC_TEST_SLOTS (default 2) full runs on this machine, of any repo that runs its tests this way (agentic-flow keeps
+// AGENTIC_TEST_SLOTS (default 1) full runs on this machine, of any repo that runs its tests this way (agentic-flow keeps
 // the same script and the same slot dir, so the slots are shared by both repos).
 // A slot is the file slot-<n>.json in the shared state dir ~/.local/state/agentic/test-slots (AGENTIC_TEST_SLOTS_DIR),
 // taken with an exclusive create under a short directory lock; its run refreshes it every few seconds, so the slot of a
@@ -15,7 +15,10 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-export const DEFAULT_SLOTS = 2;
+// One full run at a time (P-079, operator 2026-11-17: several threads running full suites at once overloaded the machine,
+// 4 cores, load 8; one run of node --test already uses all cores). The run gets a lower CPU priority (AGENTIC_TEST_NICE=0
+// keeps the normal one), so the threads' live work stays responsive.
+export const DEFAULT_SLOTS = 1;
 const HEARTBEAT_MS = 5000;
 const STALE_MS = 60000;
 const LOCK_STALE_MS = 10000;
@@ -119,6 +122,8 @@ async function main(argv) {
   if (slot) process.on('exit', () => releaseSlot(slot));
   const [bin, ...rest] = cmd;
   const child = spawn(bin === 'node' ? process.execPath : bin, rest, { stdio: 'inherit', env, shell: process.platform === 'win32' && bin !== 'node' });
+  // Below normal priority for the run and what it starts (inherited on Linux and macOS; Windows: the run's own process).
+  if (env.AGENTIC_TEST_NICE !== '0' && child.pid) { try { os.setPriority(child.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* not allowed: normal priority */ } }
   const forward = (sig) => { try { child.kill(sig); } catch { /* gone */ } };
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => forward(sig));
   return new Promise((resolve) => {

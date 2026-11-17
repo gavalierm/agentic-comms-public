@@ -1157,7 +1157,7 @@ test('a waker with a non-wake key (carol) sees and confirms only the waits of me
 // an open turn record and the discussion, and a held steer/assist was returned only on a permanent ring failure.
 
 // keep: core
-test('a stale open turn record gives no busy: T3 not running → rung, nothing queued, a due wait rings; a ring queued behind run-1 does not stop the mail of run-2', async (t) => {
+test('a stale open turn record gives no busy: T3 not running → rung, nothing queued, a due wait rings; while T3 runs the thread its mail is held and rung after the run', async (t) => {
   const adapter = t3Adapter();
   const ctx = await setup(t, { adapter });
   const { client, waker } = ctx;
@@ -1171,20 +1171,22 @@ test('a stale open turn record gives no busy: T3 not running → rung, nothing q
   assert.equal(await waker.pollOnce(500), 1);
   assert.equal(adapter.calls.length, 2, 'the next mail rings too');
 
-  // T3 runs run-1: one ring queues behind it, the next mail of that run is not rung again.
+  // T3 runs run-1: the mail is held, not rung behind the run (that ring came after the mail was picked in the run and the
+  // workflow hook blocked it, operator 2026-11-18); nothing is queued.
   adapter.threads['thr-1'] = { run: 'run-1' };
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'three', thread_id: 'thr-s3' });
   await client.send({ project: 'p', topic: 't', level: 'assist', text: 'four', thread_id: 'thr-s4' });
   assert.equal(await waker.pollOnce(500), 2);
-  assert.equal(adapter.calls.length, 3);
-  assert.ok(waker.state.queued['thr-1']);
-  assert.equal(waker.state.queuedRun['thr-1'], 'run-1');
-  // The queued ring started run-2, the record stayed open (no Stop, the same record run): a steer rings into run-2.
-  adapter.threads['thr-1'] = { run: 'run-2' };
-  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop now', thread_id: 'thr-s5' });
-  assert.equal(await waker.pollOnce(500), 1);
-  assert.equal(adapter.calls.length, 4, 'rung: the ring queued behind run-1 has started');
-  assert.equal(waker.state.queuedRun['thr-1'], 'run-2');
+  assert.equal(adapter.calls.length, 2, 'held while T3 runs the thread');
+  assert.deepEqual(Object.values(waker.state.held).map((e) => e.held_reason), ['running', 'running']);
+  assert.deepEqual(waker.state.queued, {});
+  await waker.releaseHeld();
+  assert.equal(adapter.calls.length, 2, 'still running: still held');
+  // The run ended and the mail still waits: rung (both here: this fixture turns the idle dedupe off).
+  adapter.threads['thr-1'] = {};
+  await waker.releaseHeld();
+  assert.equal(adapter.calls.length, 4, 'rung after the run');
+  assert.deepEqual(waker.state.held, {});
 
   // A due wait of a sender with an open record: T3 decides, not the record.
   await client.turn({ thread: 'thr-a', state: 'open', machine: 'm1' });
@@ -1277,4 +1279,33 @@ test('archived or gone holder: a steer/assist is undelivered instead of held for
   assert.equal((await client.message(k.id)).status, 'pending', 'the new holder receives it');
   assert.ok(logs.some((l) => l.includes(`bounce ${k.id} nevrátené (holder thr-2)`)), logs.join('\n'));
   assert.ok(!adapter.calls.some((c) => c.holder === 'thr-1'), 'never rung into the gone thread');
+});
+
+// keep: core
+test('a workflow thread T3 runs gets no ring behind the run (closed record too); picked in the run: none after it; past turnBusyMaxMs: rung behind the run', async (t) => {
+  const adapter = t3Adapter();
+  const ctx = await setup(t, { adapter });
+  const { client, waker, clock } = ctx;
+  // Stop wrote a closed record, T3 still runs the thread (or a bell turn started before its hook opened a record).
+  await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  await client.turn({ thread: 'thr-1', state: 'closed', machine: 'm1' });
+  adapter.threads['thr-1'] = { run: 'run-1' };
+  await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(adapter.calls, [], 'held while T3 runs the thread');
+  // Picked in that run (the tool line showed it): no empty bell after it (operator 2026-11-18, "blocked by hook").
+  await client.receive({ project: 'p', topic: 't' });
+  adapter.threads['thr-1'] = {};
+  await waker.releaseHeld();
+  assert.deepEqual(adapter.calls, [], 'picked meanwhile: no ring');
+  assert.deepEqual(waker.state.held, {});
+  // A run that does not end: past turnBusyMaxMs from the first hold the ring goes behind the run, as before.
+  adapter.threads['thr-1'] = { run: 'run-2' };
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'two', thread_id: 'thr-s2' });
+  await waker.pollOnce(500);
+  assert.deepEqual(adapter.calls, []);
+  clock.t += waker.opts.turnBusyMaxMs + 1000;
+  await waker.releaseHeld();
+  assert.equal(adapter.calls.length, 1, 'rung behind the run after the cap');
+  assert.deepEqual(waker.state.held, {});
 });

@@ -30,10 +30,10 @@
 // archived, Stop lost). Where an open record, a hold or a queued mark decides, wake reads the thread's state from T3
 // (adapter `status`, as keepalive and continuation do): busy only while T3 runs it, a queued mark only while T3 runs the
 // run it was rung into. Without the state the open record counts only within its deadline (TURN_BUSY_MAX_MS).
-// A thread without any turn record (it runs outside the workflow, e.g. the maintainer's thread of send --maintainer) has
-// no hook that drops a stale bell at its turn start: while T3 runs it, its ring is held (`held_reason: running`) and rung
-// after the run ends, only when the mail still waits (operator 2026-11-16: a bell queued behind the running turn came
-// after the mail was picked and cost an empty turn).
+// A thread T3 runs now (with a turn record or without one, e.g. the maintainer's thread of send --maintainer): its ring is
+// held (`held_reason: running`) and rung after the run ends, only when the mail still waits (operator 2026-11-16: a bell
+// queued behind the running turn came after the mail was picked and cost an empty turn; 2026-11-18: in a workflow thread
+// the hook blocked that bell, shown as "blocked by hook"). Without the T3 state a workflow thread's ring queues as before.
 // A holder that T3 reports archived or gone gets no hold and no ring: its message becomes undelivered (bounce; the
 // service leaves it to a new holder of the topic), and the sender's wait is due (`undelivered <id>`, 1e); a held message
 // whose holder is archived later goes the same way at the next poll.
@@ -81,7 +81,7 @@ export const DEFAULTS = {
   limitPerHour: 6, stopOnRepeat: 2, maxEventAgeMs: 60 * 60 * 1000, waitMs: 25_000, reconnectMs: 1000, maxReconnectMs: 30_000,
   keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 10_000, continueCheckMs: 5_000, idleDedupeMs: 120_000,
   // goneCheckMs: a held message's holder is asked T3 whether it still exists at most this often (each poll costs a call).
-  queuedStartMs: 120_000, turnBusyMaxMs: TURN_BUSY_MAX_MS, goneCheckMs: 60_000,
+  queuedStartMs: 120_000, turnBusyMaxMs: TURN_BUSY_MAX_MS, goneCheckMs: 60_000, runningCheckMs: 5_000,
   // Reminder (operator 2026-11-17, critical: mail not picked up is lost mail): every remindEveryMs the messages still
   // pending after remindAfterMs ring their recipient again, at most remindMax times each (then one operator notice);
   // older than remindMaxAgeMs: one summary notice, no ring days later.
@@ -314,10 +314,9 @@ export class Waker {
     }
     const discussing = turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record);
     const queuedMark = turnsKnown ? this.state.queued[holder] : null;
-    // The thread's state decides where the turn record alone would: an open record (busy), a hold, a queued mark.
-    // No record at all: a thread outside the workflow; only T3 tells whether it runs now.
-    const outside = turnsKnown && !record;
-    const th = turnsKnown && ((record && record.state === 'open') || discussing || queuedMark || outside)
+    // T3 is asked for every event of a known holder: a closed record does not say the run ended (Stop before the run's end,
+    // a bell turn before its hook opened the record).
+    const th = turnsKnown
       ? await this.threadNow(holder, record, now) : { busy: false, gone: false, known: false, running: false, run: null };
     // Archived or gone: no later turn comes, no hold and no ring; the message goes back to its sender (undelivered).
     if (th.gone) return this.undeliverGone(ev, th.why, { holdOnError: discussing, now });
@@ -326,11 +325,6 @@ export class Waker {
     if (discussing) {
       this.hold(ev, now);
       return skip('discussion');
-    }
-    // Outside the workflow and running now: a ring would queue behind the run and arrive after the mail may be picked.
-    if (outside && th.busy) {
-      this.hold(ev, now, 'running');
-      return skip('running');
     }
     // A ring queued behind this run (pruned above) has not started yet: its turn will see this mail too. Behind an open
     // record only while the thread really runs that run: a stale record (interrupted, Stop lost) or another T3 run means
@@ -344,6 +338,14 @@ export class Waker {
         this.state.save();
         return skip('queued');
       }
+    }
+    // T3 runs the thread now (with or without a turn record): a ring would queue behind the run and arrive after the mail
+    // was picked in it, an empty bell the workflow hook blocks (operator 2026-11-18). Held and rung after the run, only while
+    // the mail waits (releaseHeld); at most turnBusyMaxMs from the first hold, then rung behind the run as before.
+    const runningSince = ev.running_since ? Date.parse(ev.running_since) : now;
+    if (th.known && th.running && now - runningSince < this.opts.turnBusyMaxMs) {
+      this.hold({ ...ev, running_since: new Date(runningSince).toISOString() }, now, 'running');
+      return skip('running');
     }
     // An idle thread rung with the same bell moments ago, whose turn has not opened since: that turn will see this mail
     // too (fable audit M1). Only with known turn records: a lost wake is worse than a double one.
@@ -484,8 +486,7 @@ export class Waker {
   }
 
   /**
-   * Keep an event until its holder's discussion ends, (`reason` running) until the run of a thread outside the workflow
-   * ends, or (`reason` limit) until its pair of topics has room under the hourly limit (newest HELD_MAX).
+   * Keep an event until its holder's discussion ends, (`reason` running) until T3 no longer runs the thread, or (`reason` limit) until its pair of topics has room under the hourly limit (newest HELD_MAX).
    */
   hold(ev, now = this.now(), reason = 'discussion') {
     const key = ev.message_id || `seq:${ev.seq}`;
@@ -512,6 +513,7 @@ export class Waker {
       return 0;
     }
     let released = 0;
+    const t3Seen = new Map();
     for (const [key, ev] of entries) {
       if (ev.held_reason === 'limit') {
         // Held above the hourly limit: rung once the pair's window has room again (handle counts the ring).
@@ -525,15 +527,23 @@ export class Waker {
           continue;
         }
       } else if (ev.held_reason === 'running') {
-        // Held while the thread ran (outside the workflow): rung only once T3 no longer runs it; archived or gone bounces.
-        const t3 = await this.t3State(String(ev.holder));
+        // Held while T3 ran the thread: rung once T3 no longer runs it (or after turnBusyMaxMs, behind the run); archived or
+        // gone bounces. Unknown T3 state: released when no fresh open turn record says it runs (a lost bell is worse).
+        const h = String(ev.holder);
+        if (!t3Seen.has(h)) t3Seen.set(h, await this.t3State(h));
+        const t3 = t3Seen.get(h);
         if (t3.gone) {
           delete this.state.held[key];
           this.state.save();
           await this.undeliverGone(ev, t3.why, { holdOnError: true });
           continue;
         }
-        if (!t3.known || t3.running) continue;
+        const since = Date.parse(ev.running_since || ev.held_at);
+        if (t3.known && t3.running && this.now() - since < this.opts.turnBusyMaxMs) continue;
+        if (!t3.known) {
+          const rec = turns.find((x) => x.thread === h) || null;
+          if (rec && rec.state === 'open' && turnFresh(rec, this.now(), this.opts.turnBusyMaxMs)) continue;
+        }
       } else if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) {
         const why = await this.heldGone(String(ev.holder));
         if (!why) continue;
@@ -1021,7 +1031,9 @@ export class Waker {
     let outage = false;
     while (!signal || !signal.aborted) {
       try {
-        await this.pollOnce();
+        // A ring held for a running thread comes within runningCheckMs of the run's end (no event marks that end).
+        const running = Object.values(this.state.held).some((e) => e && e.held_reason === 'running');
+        await this.pollOnce(running ? Math.min(this.opts.waitMs, this.opts.runningCheckMs) : this.opts.waitMs);
         if (outage) { this.log('comms available again'); outage = false; }
         backoff = this.opts.reconnectMs;
       } catch (e) {

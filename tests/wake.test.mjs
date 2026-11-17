@@ -188,6 +188,45 @@ test('limit 6 per hour per pair of topics: above it a notice, no ring; resumes a
   assert.equal(adapter.calls.length, 8);
 });
 
+test('a message above the hourly limit is held and rung once the window has room; a picked one is not rung', async (t) => {
+  const { client, waker, adapter, clock } = await setup(t);
+  for (let n = 1; n <= 7; n++) {
+    await client.send({ project: 'p', topic: 't', level: 'assist', text: `message ${n}`, from_project: 'q', from_topic: 'u' });
+    clock.t += 3 * 60 * 1000;   // past the idle dedupe: each one is a ring of its own
+  }
+  assert.equal(await waker.pollOnce(500), 7);
+  assert.equal(adapter.calls.length, 6);
+  const held = Object.values(waker.state.held);
+  assert.equal(held.length, 1);
+  assert.equal(held[0].held_reason, 'limit');
+  const notice = (await client.notices()).notices.find((n) => n.kind === 'wake-limit');
+  assert.match(notice.detail, /zazvoní, keď sa okno uvoľní/);
+  // Still a full window: nothing.
+  await waker.releaseHeld();
+  assert.equal(adapter.calls.length, 6);
+  // No new event and no new turn: the window frees and the held message rings by itself.
+  clock.t += 61 * 60 * 1000;
+  assert.equal(await waker.releaseHeld(), 1);
+  assert.equal(adapter.calls.length, 7);
+  assert.deepEqual(adapter.calls[6], { holder: 'thr-1', text: 'you have mail in topic p/t' });
+  assert.equal(Object.keys(waker.state.held).length, 0);
+});
+
+test('a held limited message the thread picked up meanwhile is not rung', async (t) => {
+  const { inst, client, waker, adapter, clock } = await setup(t);
+  const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
+  for (let n = 1; n <= 7; n++) {
+    await client.send({ project: 'p', topic: 't', level: 'assist', text: `message ${n}`, from_project: 'q', from_topic: 'u' });
+    clock.t += 3 * 60 * 1000;
+  }
+  await waker.pollOnce(500);
+  assert.equal(adapter.calls.length, 6);
+  await bob.receive({ project: 'p', topic: 't' });
+  clock.t += 61 * 60 * 1000;
+  assert.equal(await waker.releaseHeld(), 0);
+  assert.equal(adapter.calls.length, 6);
+});
+
 test('the same message twice in a row stops waking; a different one resumes', async (t) => {
   const { client, waker, adapter } = await setup(t);
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'same text', from_project: 'q', from_topic: 'u' });

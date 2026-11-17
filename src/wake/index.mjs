@@ -309,20 +309,28 @@ export class Waker {
     const dir = directionKey(ev);
     const pair = pairKey(ev);
     const prev = this.state.last[dir];
-    const repeats = prev && prev.hash === ev.text_hash ? prev.count + 1 : 1;
+    // A released event was counted when it came (its hold is not a second copy of the text).
+    const repeats = ev.released ? (prev?.count || 1) : prev && prev.hash === ev.text_hash ? prev.count + 1 : 1;
     // Repeat detection only for events with a body hash (blocker/reply).
-    if (ev.text_hash) this.state.last[dir] = { hash: ev.text_hash, count: repeats, at: now };
+    if (ev.text_hash && !ev.released) this.state.last[dir] = { hash: ev.text_hash, count: repeats, at: now };
     this.state.prune(now);
     const recent = this.state.rings[pair] || [];
 
     let limit = null;
-    if (ev.text_hash && repeats >= this.opts.stopOnRepeat) limit = { reason: 'repeat', detail: `rovnaká správa ${repeats}× za sebou (${dir})` };
+    if (ev.text_hash && !ev.released && repeats >= this.opts.stopOnRepeat) limit = { reason: 'repeat', detail: `rovnaká správa ${repeats}× za sebou (${dir})` };
     else if (recent.length >= this.opts.limitPerHour) limit = { reason: 'hour', detail: `${recent.length} zobudení za poslednú hodinu (${pair}), limit ${this.opts.limitPerHour}` };
 
     if (limit) {
       this.stats.limited += 1;
+      // report 2026-11-17 (a topic thread): a message above the hourly limit waited for a turn the thread never started (31 min,
+      // read only at the operator's next prompt). It is held and rung once the pair's window has room (releaseHeld);
+      // the limit stays a rate, never a lost ring. A repeated text stays stopped (a loop, not a rate).
+      if (limit.reason === 'hour' && ev.message_id) {
+        limit.free_at = new Date(Math.min(...recent) + HOUR).toISOString();
+        this.hold(ev, now, 'limit');
+      }
       this.state.save();
-      this.log(`limit ${ev.seq} (${limit.reason}): ${limit.detail}; správa ${ev.message_id} čaká na ďalší ťah`);
+      this.log(`limit ${ev.seq} (${limit.reason}): ${limit.detail}; správa ${ev.message_id} ${limit.free_at ? `zazvoní, keď sa okno uvoľní (${limit.free_at})` : 'čaká na ďalší ťah'}`);
       const notice = await this.notifyLimit(ev, limit);
       return { action: 'limited', reason: limit.reason, detail: limit.detail, notice };
     }
@@ -427,8 +435,8 @@ export class Waker {
   }
 
   /**
-   * Keep an event until its holder's discussion ends, or (`reason` running) until the run of a thread outside the workflow
-   * ends (newest HELD_MAX).
+   * Keep an event until its holder's discussion ends, (`reason` running) until the run of a thread outside the workflow
+   * ends, or (`reason` limit) until its pair of topics has room under the hourly limit (newest HELD_MAX).
    */
   hold(ev, now = this.now(), reason = 'discussion') {
     const key = ev.message_id || `seq:${ev.seq}`;
@@ -456,7 +464,18 @@ export class Waker {
     }
     let released = 0;
     for (const [key, ev] of entries) {
-      if (ev.held_reason === 'running') {
+      if (ev.held_reason === 'limit') {
+        // Held above the hourly limit: rung once the pair's window has room again (handle counts the ring).
+        if ((this.state.rings[pairKey(ev)] || []).length >= this.opts.limitPerHour) continue;
+        // A bell of the same topic rang the idle holder after the hold: that turn sees this mail too.
+        const idle = this.state.idle[String(ev.holder)];
+        if (idle && idle.text === ringText(ev) && idle.at > Date.parse(ev.held_at)) {
+          delete this.state.held[key];
+          this.state.save();
+          this.log(`held ${ev.message_id || key}: neskorší zvonček témy ho pokryl; nezvoní sa`);
+          continue;
+        }
+      } else if (ev.held_reason === 'running') {
         // Held while the thread ran (outside the workflow): rung only once T3 no longer runs it; archived or gone bounces.
         const t3 = await this.t3State(String(ev.holder));
         if (t3.gone) {
@@ -488,7 +507,7 @@ export class Waker {
           this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
         }
       }
-      this.log(`release ${ev.message_id || key} → ${ev.holder}: ${ev.held_reason === 'running' ? 'ťah vlákna skončil' : 'diskusia s operátorom skončila'}`);
+      this.log(`release ${ev.message_id || key} → ${ev.holder}: ${ev.held_reason === 'running' ? 'ťah vlákna skončil' : ev.held_reason === 'limit' ? 'okno limitu sa uvoľnilo' : 'diskusia s operátorom skončila'}`);
       released += 1;
       const { held_at: _a, held_reason: _r, ...orig } = ev;
       await this.handle({ ...orig, created_at: new Date(this.now()).toISOString(), released: true });
@@ -570,7 +589,7 @@ export class Waker {
         kind: 'wake-limit',
         title: `Limit budenia (${limit.reason === 'repeat' ? 'opakovaná správa' : '6 za hodinu'}): ${topicLabel(ev)}`,
         message_id: ev.message_id,
-        detail: `${limit.detail}; vlákno ${ev.holder} nebolo zobudené, správa čaká na ďalší ťah.`,
+        detail: `${limit.detail}; vlákno ${ev.holder} nebolo zobudené, ${limit.free_at ? `správa zazvoní, keď sa okno uvoľní (${limit.free_at})` : 'správa čaká na ďalší ťah'}.`,
         dedupe_key: `${limit.reason}:${limit.reason === 'repeat' ? directionKey(ev) : pairKey(ev)}`,
       });
     } catch (e) {

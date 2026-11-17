@@ -598,7 +598,8 @@ test('a ring queued behind a run: no second bell after a prompt steered into the
 test('idle holder: the same bell again before its turn opens is skipped; after the turn opened it rings', async (t) => {
   const { client, waker, adapter } = await setup(t, { idleDedupeMs: 120_000 });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
-  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'two', thread_id: 'thr-s2' });
+  // another sender (the bell names it, operator 2026-11-17): still the same bell to the same recipient
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'two', thread_id: 'thr-s2', from_project: 'q', from_topic: 'u' });
   assert.equal(await waker.pollOnce(500), 2);
   assert.equal(adapter.calls.length, 1, 'the turn of the first ring sees both messages');
   // The rung turn opened and closed: a later message rings again.

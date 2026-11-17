@@ -131,6 +131,15 @@ export function wakeText(ev) {
   return `${WAKE_TEMPLATE} ${topicLabel(ev)}${from ? ` from ${from}` : ''}`;
 }
 
+/**
+ * Recipient part of a bell: the wake text without its sender. A duplicate bell is a bell to the same recipient (that
+ * turn reads all its mail), whoever sent the mail; other bells are compared whole.
+ */
+export function bellKey(text) {
+  const t = String(text || '');
+  return t.startsWith(`${WAKE_TEMPLATE} `) ? t.replace(/ from \S+$/, '') : t;
+}
+
 /** Exact ring text of an event (the whole prompt, never the body). */
 export function ringText(ev) {
   return wakeText(ev);
@@ -334,7 +343,7 @@ export class Waker {
     // An idle thread rung with the same bell moments ago, whose turn has not opened since: that turn will see this mail
     // too (fable audit M1). Only with known turn records: a lost wake is worse than a double one.
     const idle = this.state.idle[holder];
-    if (!th.busy && turnsKnown && idle && idle.text === ringText(ev) && now - idle.at < this.opts.idleDedupeMs
+    if (!th.busy && turnsKnown && idle && bellKey(idle.text) === bellKey(ringText(ev)) && now - idle.at < this.opts.idleDedupeMs
       && !(record && record.opened_at && Date.parse(record.opened_at) >= idle.at)) {
       return skip('queued');
     }
@@ -504,7 +513,7 @@ export class Waker {
         if ((this.state.rings[pairKey(ev)] || []).length >= pairLimit(ev, this.opts.limitPerHour)) continue;
         // A bell of the same topic rang the idle holder after the hold: that turn sees this mail too.
         const idle = this.state.idle[String(ev.holder)];
-        if (idle && idle.text === ringText(ev) && idle.at > Date.parse(ev.held_at)) {
+        if (idle && bellKey(idle.text) === bellKey(ringText(ev)) && idle.at > Date.parse(ev.held_at)) {
           delete this.state.held[key];
           this.state.save();
           this.log(`held ${ev.message_id || key}: neskorší zvonček témy ho pokryl; nezvoní sa`);

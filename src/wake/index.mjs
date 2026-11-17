@@ -79,7 +79,7 @@ export function pairLimit(ev, limitPerHour) {
 
 export const DEFAULTS = {
   limitPerHour: 6, stopOnRepeat: 2, maxEventAgeMs: 60 * 60 * 1000, waitMs: 25_000, reconnectMs: 1000, maxReconnectMs: 30_000,
-  keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 60_000, idleDedupeMs: 120_000,
+  keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 10_000, continueCheckMs: 5_000, idleDedupeMs: 120_000,
   // goneCheckMs: a held message's holder is asked T3 whether it still exists at most this often (each poll costs a call).
   queuedStartMs: 120_000, turnBusyMaxMs: TURN_BUSY_MAX_MS, goneCheckMs: 60_000,
   // Reminder (operator 2026-11-17, critical: mail not picked up is lost mail): every remindEveryMs the messages still
@@ -796,7 +796,12 @@ export class Waker {
     return res('failed', 'ring');
   }
 
+  // The continuation is checked every continueCheckMs (one local request; T3 status only for a due turn), the keepalive
+  // every keepaliveIntervalMs (T3 status of every open turn). Cause (operator 2026-11-17, P-079): one 60 s loop for both
+  // left a thread "čakám (na pokračovanie)" idle up to 2 min.
   async keepaliveLoop(signal) {
+    let lastKeepalive = 0;
+    const every = Math.max(1000, Math.min(this.opts.continueCheckMs ?? this.opts.keepaliveIntervalMs, this.opts.keepaliveIntervalMs));
     while (!signal || !signal.aborted) {
       try {
         await this.continueOnce(signal);
@@ -804,13 +809,16 @@ export class Waker {
         if (signal && signal.aborted) break;
         this.log(`continue: ${e.code === 'UNAVAILABLE' ? 'comms unavailable' : `error: ${e.message}`}`);
       }
-      try {
-        await this.keepaliveOnce(signal);
-      } catch (e) {
-        if (signal && signal.aborted) break;
-        this.log(`keepalive: ${e.code === 'UNAVAILABLE' ? 'comms unavailable' : `error: ${e.message}`}`);
+      if (Date.now() - lastKeepalive >= this.opts.keepaliveIntervalMs) {
+        lastKeepalive = Date.now();
+        try {
+          await this.keepaliveOnce(signal);
+        } catch (e) {
+          if (signal && signal.aborted) break;
+          this.log(`keepalive: ${e.code === 'UNAVAILABLE' ? 'comms unavailable' : `error: ${e.message}`}`);
+        }
       }
-      await sleep(this.opts.keepaliveIntervalMs, signal);
+      await sleep(every, signal);
     }
   }
 

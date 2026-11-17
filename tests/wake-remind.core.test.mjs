@@ -37,7 +37,7 @@ test('a message still pending rings again after remindAfterMs, at most remindMax
   const m = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-a' });
   await waker.pollOnce(300);
   assert.equal(calls.length, 1, 'the first ring: ' + logs.join(' / '));
-  const bell = { holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` };
+  const bell = { holder: 'thr-1', text: `you have mail from alice in topic p/t` };
   clock.now += 10 * MIN;
   await waker.pollOnce(50);
   assert.equal(calls.length, 1, 'not again before remindAfterMs');
@@ -79,7 +79,7 @@ test('a reply to a thread is reminded to that thread; a message older than remin
   clock.now += 31 * MIN;
   await waker.pollOnce(50);
   assert.equal(calls.filter((c) => c.holder === 'thr-a').length, 2, 'the reply is reminded to the sender thread');
-  assert.equal(calls.at(-1).text, `${WAKE_TEMPLATE} thread/thr-a from p/t`);
+  assert.equal(calls.at(-1).text, `you have mail from p/t in topic thread/thr-a`);
   clock.now += 3 * 60 * MIN;
   const before = calls.length;
   await waker.pollOnce(50);

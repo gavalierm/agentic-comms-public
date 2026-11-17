@@ -107,14 +107,14 @@ test('blocker rings the topic holder with the fixed template, never the body', a
   const { client, waker, adapter } = await setup(t);
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'SECRET BODY: prevezmi tému X', thread_id: 'thr-sender' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
   assert.ok(!adapter.calls[0].text.includes('SECRET'));
   assert.equal(wakeText({ project: 'p', topic: 't' }), 'you have mail in topic p/t');
   assert.equal(wakeText({ holder: 'thr-9' }), 'you have mail in topic thread/thr-9');
   // the sender after the recipient (operator 2026-11-17): its topic, else its key, else its thread; never the body
-  assert.equal(wakeText({ project: 'p', topic: 't', from_project: 'q', from_topic: 'u', sender: 'bob' }), 'you have mail in topic p/t from q/u');
-  assert.equal(wakeText({ holder: 'thr-9', sender: 'agent bob' }), 'you have mail in topic thread/thr-9 from agent-bob');
-  assert.equal(wakeText({ project: 'p', topic: 't', thread_id: 'thr-x' }), 'you have mail in topic p/t from thread/thr-x');
+  assert.equal(wakeText({ project: 'p', topic: 't', from_project: 'q', from_topic: 'u', sender: 'bob' }), 'you have mail from q/u in topic p/t');
+  assert.equal(wakeText({ holder: 'thr-9', sender: 'agent bob' }), 'you have mail from agent-bob in topic thread/thr-9');
+  assert.equal(wakeText({ project: 'p', topic: 't', thread_id: 'thr-x' }), 'you have mail from thread/thr-x in topic p/t');
   // Cursor persisted; no replay on the next poll.
   assert.equal(await waker.pollOnce(0), 0);
   assert.equal(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).cursor, 1);
@@ -127,7 +127,7 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
   await client.registerTopic({ project: 'q', topic: 'u', subject: 'S2', holder: 'thr-q' });
   const a = await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-a', from_project: 'q', from_topic: 'u' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail in topic p/t from q/u' }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail from q/u in topic p/t' }]);
   adapter.calls.length = 0;
 
   // Model 2: the recipient picks the message up and answers with resolve (send with reply_to is 400).
@@ -135,13 +135,13 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
   await bob.receive({ project: 'p', topic: 't' });
   await bob.resolve({ project: 'p', topic: 't', id: a.id, state: 'hotovo', text: 'answer' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: 'you have mail in topic q/u from p/t' }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: 'you have mail from p/t in topic q/u' }]);
   const s = await bob.send({ project: 'p', topic: 't', level: 'steer', text: 'stop that', thread_id: 'thr-a' });
   assert.equal(s.level, 'steer');
   adapter.calls.length = 0;
   const st = await waker.pollOnce(500);
   assert.equal(st, 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail in topic p/t from bob' }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail from bob in topic p/t' }]);
   adapter.calls.length = 0;
 
   // Blocker from a main thread without a topic: the reply names the thread.
@@ -151,8 +151,8 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
   await bob.resolve({ project: 'p', topic: 't', id: b.id, state: 'hotovo', text: 'done' });
   assert.equal(await waker.pollOnce(500), 1);
   assert.deepEqual(adapter.calls, [
-    { holder: 'thr-1', text: 'you have mail in topic p/t from alice' },
-    { holder: 'thr-main', text: 'you have mail in topic thread/thr-main from p/t' },
+    { holder: 'thr-1', text: 'you have mail from alice in topic p/t' },
+    { holder: 'thr-main', text: 'you have mail from p/t in topic thread/thr-main' },
   ]);
 });
 
@@ -213,7 +213,7 @@ test('a message above the hourly limit is held and rung once the window has room
   clock.t += 61 * 60 * 1000;
   assert.equal(await waker.releaseHeld(), 1);
   assert.equal(adapter.calls.length, 7);
-  assert.deepEqual(adapter.calls[6], { holder: 'thr-1', text: 'you have mail in topic p/t from q/u' });
+  assert.deepEqual(adapter.calls[6], { holder: 'thr-1', text: 'you have mail from q/u in topic p/t' });
   assert.equal(Object.keys(waker.state.held).length, 0);
 });
 
@@ -272,12 +272,12 @@ test('holder mode operator: blocker rings the holder and creates the notice, rep
   const bob = makeClient(inst, { key: inst.store.addKey('bob').key });
   const b = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'need you', thread_id: 'thr-a' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail in topic p/t from alice' }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: 'you have mail from alice in topic p/t' }]);
   assert.equal((await client.notices()).notices.filter((n) => n.kind === 'blocker').length, 1);
   await bob.receive({ project: 'p', topic: 't' });
   await bob.resolve({ project: 'p', topic: 't', id: b.id, state: 'hotovo', text: 'here' });
   await waker.pollOnce(500);
-  assert.deepEqual(adapter.calls.slice(1), [{ holder: 'thr-a', text: 'you have mail in topic thread/thr-a from p/t' }]);
+  assert.deepEqual(adapter.calls.slice(1), [{ holder: 'thr-a', text: 'you have mail from p/t in topic thread/thr-a' }]);
   // A topic without holder cannot be rung; without an adapter nothing is rung.
   await client.registerTopic({ project: 'p', topic: 'free', subject: 'F' });
   await client.send({ project: 'p', topic: 'free', level: 'blocker', text: 'x' });
@@ -409,7 +409,7 @@ test('bin/wake.mjs run: rings through the command, survives a mail restart, stop
   // Rings only; status probes start with `status`.
   const lines = () => (fs.existsSync(logFile) ? fs.readFileSync(logFile, 'utf8').trim().split('\n').filter(Boolean).filter((l) => JSON.parse(l)[0] !== 'status') : []);
   await waitFor(() => lines().length >= 1);
-  assert.deepEqual(JSON.parse(lines()[0]), ['thr-1', 'you have mail in topic p/t from alice']);
+  assert.deepEqual(JSON.parse(lines()[0]), ['thr-1', 'you have mail from alice in topic p/t']);
   // The rung thread took its turn (else the same bell again would be skipped as queued).
   await sleep(5);
   const o = await c.turn({ thread: 'thr-1', state: 'open' });
@@ -508,7 +508,7 @@ test('due wait after the deadline: rings the sender once with `no reply <id>`, n
   await bob.receive({ project: 'p', topic: 't' });
   await bob.resolve({ project: 'p', topic: 't', id: m.id, state: 'hotovo', text: 'late' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls[2], { holder: 'thr-a', text: `${WAKE_TEMPLATE} q/u from p/t` });
+  assert.deepEqual(adapter.calls[2], { holder: 'thr-a', text: `you have mail from p/t in topic q/u` });
   // Answered or acked: no wait any more, never due; the unanswered m3 still is.
   await bob.resolve({ project: 'p', topic: 't', id: m2.id, state: 'hotovo', ack: true });
   const farDue = svc.due('alice', Date.now() + 365 * 86400_000).due.map((x) => x.id);
@@ -764,7 +764,7 @@ test('ring to an archived thread bounces: the sender gets `undelivered <id>` via
   const { inst, client, waker, clock } = ctx;
   const m = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'restart?', thread_id: 'thr-sender' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
   const st = await client.message(m.id);
   assert.deepEqual([st.status, st.undelivered_holder, st.wait_reason], ['undelivered', 'thr-1', 'undelivered']);
   assert.match(st.undelivered_reason, /archived/);
@@ -862,8 +862,8 @@ test('operator-mode topic: blocker rings the holder; assist to a main thread hel
   clock.t = Date.now() + 1000;
   await waker.pollOnce(100);
   assert.deepEqual(adapter.calls.map((c) => [c.holder, c.text]), [
-    ['thr-archived', 'you have mail in topic @alice/main from bob/units'],
-    ['thr-1', 'you have mail in topic p/t from bob/units'],
+    ['thr-archived', 'you have mail from bob/units in topic @alice/main'],
+    ['thr-1', 'you have mail from bob/units in topic p/t'],
     ['thr-bob', `${UNDELIVERED_TEMPLATE} ${assist.id}`],
   ]);
   assert.equal((await client.message(assist.id)).wait_due_at, null);
@@ -989,7 +989,7 @@ test('discussion with the operator: steer and assist are held, a blocker rings; 
   assert.equal(Object.keys(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).held).length, 2, 'held, persisted');
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'urgent', thread_id: 'thr-s3' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }], 'a blocker passes');
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }], 'a blocker passes');
   adapter.calls.length = 0;
   // The turn ends with a question to the operator: the discussion stays open, nothing rings.
   await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o.turn.opened_at, discussion: 'open' });
@@ -999,7 +999,7 @@ test('discussion with the operator: steer and assist are held, a blocker rings; 
   const o2 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
   await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o2.turn.opened_at, discussion: 'closed' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }, { holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }, { holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
   assert.deepEqual(waker.state.held, {});
 });
 
@@ -1036,7 +1036,7 @@ test('held ring: dropped when picked up meanwhile; released by the next poll wit
   // the event is missed (older service): the poll after it still releases the held ring
   waker.state.cursor = (await client.events('latest', 0)).next;
   assert.equal(await waker.pollOnce(100), 0);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }], 'only the message not picked up rings');
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }], 'only the message not picked up rings');
   assert.deepEqual(waker.state.held, {});
 });
 
@@ -1165,7 +1165,7 @@ test('a stale open turn record gives no busy: T3 not running → rung, nothing q
   await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }]);
+  assert.deepEqual(adapter.calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
   assert.deepEqual(waker.state.queued, {}, 'not queued behind a run nobody runs');
   await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', thread_id: 'thr-s2' });
   assert.equal(await waker.pollOnce(500), 1);
@@ -1226,7 +1226,7 @@ test('without the thread state an open record counts only within its deadline: p
   // Wake: a blocker (it passes the discussion) rings thr-1 as an idle thread; no ring is queued behind its record.
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'now', thread_id: 'thr-c' });
   await waker.pollOnce(500);
-  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-1'), [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }]);
+  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-1'), [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
   assert.deepEqual(waker.state.queued, {});
 });
 

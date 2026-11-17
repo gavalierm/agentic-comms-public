@@ -82,7 +82,7 @@ test('run(): jobs run at their interval next to the long-poll; failing, missing 
   // After all the failures the mail part still works: a blocker rings the holder.
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'x' });
   await waitFor(() => adapter.calls.length >= 1, 10_000);
-  assert.deepEqual(adapter.calls[0], { holder: 'thr-1', text: `${wake.WAKE_TEMPLATE} p/t from alice` });
+  assert.deepEqual(adapter.calls[0], { holder: 'thr-1', text: `you have mail from alice in topic p/t` });
 
   // The last finished run of each job is persisted (read while running: an aborted run at the stop would overwrite it).
   const st = JSON.parse(fs.readFileSync(path.join(dir, 'wake-state.json'), 'utf8'));

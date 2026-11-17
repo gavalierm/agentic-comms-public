@@ -125,10 +125,13 @@ export function fromLabel(ev) {
   return null;
 }
 
-/** `you have mail in topic <to> from <from>` (without a known sender: no `from`). */
+/**
+ * `you have mail from <from> in topic <to>`: from, then to (operator 2026-11-17); without a known sender
+ * `you have mail in topic <to>`. Needs workflow v2.0.23 (it recognises the from-first bell).
+ */
 export function wakeText(ev) {
   const from = fromLabel(ev);
-  return `${WAKE_TEMPLATE} ${topicLabel(ev)}${from ? ` from ${from}` : ''}`;
+  return from ? WAKE_TEMPLATE.replace(/ in topic$/, ` from ${from} in topic`) + ` ${topicLabel(ev)}` : `${WAKE_TEMPLATE} ${topicLabel(ev)}`;
 }
 
 /**
@@ -137,7 +140,9 @@ export function wakeText(ev) {
  */
 export function bellKey(text) {
   const t = String(text || '');
-  return t.startsWith(`${WAKE_TEMPLATE} `) ? t.replace(/ from \S+$/, '') : t;
+  const head = WAKE_TEMPLATE.replace(/ in topic$/, '');
+  if (!t.startsWith(`${head} `)) return t;
+  return t.replace(new RegExp(`^${head} from \\S+ in topic `), `${WAKE_TEMPLATE} `).replace(/ from \S+$/, '');
 }
 
 /** Exact ring text of an event (the whole prompt, never the body). */

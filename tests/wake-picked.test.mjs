@@ -44,5 +44,5 @@ test('waiting message (pending, not picked up): bell', async (t) => {
   const { client, waker, calls } = await setup(t);
   await client.send({ project: 'p', topic: 't', level: 'assist', text: 'help?', thread_id: 'thr-a' });
   assert.equal(await waker.pollOnce(500), 1);
-  assert.deepEqual(calls, [{ holder: 'thr-1', text: `${WAKE_TEMPLATE} p/t from alice` }]);
+  assert.deepEqual(calls, [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
 });

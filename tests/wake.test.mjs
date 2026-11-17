@@ -153,7 +153,8 @@ test('assist and steer wake the holder; a reply to any level wakes the sender th
 });
 
 test('limit 6 per hour per pair of topics: above it a notice, no ring; resumes after an hour', async (t) => {
-  const { inst, client, waker, adapter, clock } = await setup(t);
+  // Only the limit: the reminder of the messages still pending after an hour is tested in wake-remind.core.test.mjs.
+  const { inst, client, waker, adapter, clock } = await setup(t, { remindAfterMs: 1e12 });
   for (let n = 1; n <= 8; n++) {
     await client.send({ project: 'p', topic: 't', level: 'assist', text: `message ${n}`, from_project: 'q', from_topic: 'u' });
   }

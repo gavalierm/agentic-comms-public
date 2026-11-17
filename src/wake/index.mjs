@@ -6,6 +6,8 @@
 // the same message arrives `stopOnRepeat` times in a row; above the limit the
 // message stays in the mailbox and the operator gets a notice (P-046).
 // The mail works without this module: every message waits for the next turn.
+// Reminder (remindOnce, operator 2026-11-17: mail not picked up is lost mail): a message still pending remindAfterMs
+// after its last ring rings again through handle(), at most remindMax times, then one operator notice `unpicked`.
 // The sender's wait is a state of the message on the service, not an event (1e): every cycle reads
 // `GET /obligations?due=1`, rings the sender's thread when it is not busy (`no reply <id>`; wait reason
 // `undelivered` → `undelivered <id>`, `recipient-closed` → `recipient closed <id>`) and confirms with
@@ -80,6 +82,10 @@ export const DEFAULTS = {
   keepaliveIntervalMs: 60_000, keepaliveMaxPerHour: 3, keepaliveDelayMs: 60_000, continueDelayMs: 60_000, idleDedupeMs: 120_000,
   // goneCheckMs: a held message's holder is asked T3 whether it still exists at most this often (each poll costs a call).
   queuedStartMs: 120_000, turnBusyMaxMs: TURN_BUSY_MAX_MS, goneCheckMs: 60_000,
+  // Reminder (operator 2026-11-17, critical: mail not picked up is lost mail): every remindEveryMs the messages still
+  // pending after remindAfterMs ring their recipient again, at most remindMax times each (then one operator notice);
+  // older than remindMaxAgeMs: one summary notice, no ring days later.
+  remindEveryMs: 5 * 60_000, remindAfterMs: 30 * 60_000, remindMax: 3, remindMaxAgeMs: 48 * 60 * 60_000,
 };
 
 /** The run of a turn record: `run_at` (kept across prompts steered into a running turn), else `opened_at` (older mail). */
@@ -163,6 +169,8 @@ export class WakeState {
     this.held = d.held || {};
     // job name → { started_at, finished_at, ok, code, ms, error }: the last run of a periodic job (its next run survives a restart).
     this.jobs = d.jobs || {};
+    // message id → { count, at, noticed }: the reminder rings of a message still pending (Waker.remindOnce).
+    this.reminded = d.reminded || {};
     this.updated_at = d.updated_at || null;
   }
 
@@ -200,7 +208,7 @@ export class WakeState {
 
   save() {
     this.updated_at = nowIso();
-    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, queued_run: this.queuedRun, idle: this.idle, held: this.held, jobs: this.jobs, updated_at: this.updated_at });
+    if (this.file) writeJson(this.file, { cursor: this.cursor, rings: this.rings, last: this.last, keepalive: this.keepalive, continued: this.continued, queued: this.queued, queued_run: this.queuedRun, idle: this.idle, held: this.held, jobs: this.jobs, reminded: this.reminded, updated_at: this.updated_at });
   }
 }
 
@@ -361,6 +369,8 @@ export class Waker {
         this.state.queued[holder] = runOf(record);
         if (th.run) this.state.queuedRun[holder] = th.run; else delete this.state.queuedRun[holder];
       } else this.state.idle[holder] = { at: now, text };
+      // The reminder counts from the last ring of the message (first ring, released hold or reminder).
+      if (ev.message_id) this.state.reminded[ev.message_id] = { count: 0, ...this.state.reminded[ev.message_id], at: now };
       this.state.save();
       this.log(`rang ${ev.seq} ${ev.type} → ${ev.holder}: "${text}" (${recent.length}/${this.opts.limitPerHour} za hodinu, ${pair})${th.busy ? '; vlákno beží, zvonček zaradený' : ''}`);
     } else {
@@ -877,7 +887,74 @@ export class Waker {
     if (Object.keys(this.state.held).length) {
       try { await this.releaseHeld(); } catch (e) { this.log(`release: ${e.message}`); }
     }
+    try { await this.remindOnce(); } catch (e) { this.log(`remind: ${e.message}`); }
     return r.events.length;
+  }
+
+  /**
+   * Reminder: a message still pending after `remindAfterMs` rings its recipient again through handle() (the same checks
+   * as its first ring: picked, busy, discussion, hourly limit, archived → undelivered, other machine), at most `remindMax`
+   * rings, then one operator notice; a message older than `remindMaxAgeMs` gets no ring, only one summary notice of all
+   * such messages. Cause (operator 2026-11-17, critical): a ring above the hourly limit, an event older than
+   * `maxEventAgeMs` (wake down) or a bell turn that could not read the mail left messages unread for days, and nobody
+   * rang again. Returns the number rung. An older service without `/unpicked` (404) turns it off until a restart.
+   */
+  async remindOnce() {
+    const now = this.now();
+    if (this.remindOff || !this.adapter || now - (this.lastRemind || 0) < this.opts.remindEveryMs) return 0;
+    this.lastRemind = now;
+    let events;
+    try { ({ events } = await this.client.unpicked(0)); } catch (e) {
+      if (e.status === 404 || /404|not found/i.test(String(e.message))) { this.remindOff = true; this.log('remind: služba nemá /unpicked; pripomienky vypnuté do reštartu'); return 0; }
+      throw e;
+    }
+    const ids = new Set(events.map((ev) => ev.message_id));
+    for (const id of Object.keys(this.state.reminded)) if (!ids.has(id)) delete this.state.reminded[id];
+    const mine = (ev) => !(ev.holder_machine && this.opts.machine && normalizeMachine(ev.holder_machine) !== normalizeMachine(this.opts.machine));
+    const old = [];
+    let rang = 0;
+    for (const ev of events) {
+      if (!ev.message_id || !mine(ev) || this.state.held[ev.message_id]) continue;
+      const age = now - Date.parse(ev.created_at);
+      if (age < this.opts.remindAfterMs) continue;
+      if (age > this.opts.remindMaxAgeMs) { old.push(ev); continue; }
+      const r = this.state.reminded[ev.message_id] || { count: 0, at: 0 };
+      if (r.count >= this.opts.remindMax) {
+        if (!r.noticed) {
+          r.noticed = true;
+          this.state.reminded[ev.message_id] = r;
+          await this.notice({ kind: 'unpicked', title: `Správa nevyzdvihnutá po ${r.count} pripomienkach: ${topicLabel(ev)}`, message_id: ev.message_id,
+            detail: `${ev.type} ${ev.message_id} od ${ev.sender || '?'} čaká od ${ev.created_at}; vlákno ${ev.holder || '(bez držiteľa)'} ju po ${r.count} zvončekoch nevyzdvihlo. Over vlákno (beží? vie čítať poštu?) alebo tému prevezmi.`,
+            dedupe_key: `unpicked:${ev.message_id}` });
+        }
+        continue;
+      }
+      if (now - r.at < this.opts.remindAfterMs) continue;
+      if (!ev.holder) {
+        if (!r.noticed) {
+          r.noticed = true; r.at = now;
+          this.state.reminded[ev.message_id] = r;
+          await this.notice({ kind: 'unpicked', title: `Správa bez príjemcu: ${topicLabel(ev)}`, message_id: ev.message_id,
+            detail: `${ev.type} ${ev.message_id} od ${ev.sender || '?'} čaká od ${ev.created_at} v schránke ${topicLabel(ev)}, ktorú nedrží žiadne vlákno: nikto ju nezvolá. Tému prevezmi alebo správu presmeruj.`,
+            dedupe_key: `unpicked:${ev.message_id}` });
+        }
+        continue;
+      }
+      const res = await this.handle({ ...ev, created_at: new Date(now).toISOString(), released: true, reminder: true });
+      this.state.reminded[ev.message_id] = { count: r.count + (res.action === 'rang' ? 1 : 0), at: now };
+      if (res.action === 'rang') { rang += 1; this.log(`remind ${ev.message_id}: ${r.count + 1}. pripomienka → ${ev.holder}`); }
+    }
+    if (old.length) {
+      await this.notice({ kind: 'unpicked', title: `${old.length} správ(y) nevyzdvihnutých dlhšie ako ${Math.round(this.opts.remindMaxAgeMs / HOUR)} h`, message_id: old[0].message_id,
+        detail: `Najstaršia ${old[0].message_id} (${topicLabel(old[0])}, od ${old[0].created_at}). Bez zvončeka (staré); over príjemcov: ${[...new Set(old.map(topicLabel))].slice(0, 10).join(', ')}.`,
+        dedupe_key: 'unpicked:old' });
+    }
+    this.state.save();
+    return rang;
+  }
+
+  async notice(body) {
+    try { return await this.client.createNotice(body); } catch (e) { this.log(`notice failed: ${e.message}`); return null; }
   }
 
   /** Run until the signal aborts; reconnects with back-off while the mail is unavailable. */
@@ -1074,6 +1151,8 @@ export function resolveWakeConfig(opts = {}, env = process.env) {
     maxEventAgeMs: num(opts.maxEventAgeMs, env.WAKE_MAX_EVENT_AGE_MS, wake.max_event_age_ms, DEFAULTS.maxEventAgeMs),
     waitMs: num(opts.waitMs, env.WAKE_WAIT_MS, wake.wait_ms, DEFAULTS.waitMs),
     reconnectMs: num(opts.reconnectMs, env.WAKE_RECONNECT_MS, wake.reconnect_ms, DEFAULTS.reconnectMs),
+    remindAfterMs: num(opts.remindAfterMs, env.WAKE_REMIND_AFTER_MS, wake.remind_after_ms, DEFAULTS.remindAfterMs),
+    remindMax: num(opts.remindMax, env.WAKE_REMIND_MAX, wake.remind_max, DEFAULTS.remindMax),
     stateDir,
     stateFile: path.join(stateDir, 'wake-state.json'),
     wakeFile,
@@ -1115,6 +1194,7 @@ export function createWaker(cfg, { log = () => {}, now } = {}) {
   return new Waker({
     client, adapter, stateFile: cfg.stateFile, log, now,
     limitPerHour: cfg.limitPerHour, stopOnRepeat: cfg.stopOnRepeat, maxEventAgeMs: cfg.maxEventAgeMs, waitMs: cfg.waitMs, reconnectMs: cfg.reconnectMs,
+    remindAfterMs: cfg.remindAfterMs, remindMax: cfg.remindMax,
     machine: cfg.machine,
     keepaliveSince, keepaliveClient: keepaliveSince ? new Client(cfg.comms) : null, keepaliveIntervalMs: cfg.keepaliveIntervalMs,
     jobs: cfg.jobs || [],

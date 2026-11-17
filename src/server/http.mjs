@@ -61,6 +61,8 @@ export function createHandler(service, store) {
           if (p.get('due') === '1') return sendJson(res, 200, service.due(sender));
           return sendJson(res, 200, service.obligations({ thread: p.get('thread'), topics: p.get('topics'), project: p.get('project'), persona: p.get('persona'), since: p.get('since') }));
         }
+        case 'GET /unpicked':
+          return sendJson(res, 200, { events: service.unpicked({ olderMs: Number.parseInt(url.searchParams.get('older_ms') || '0', 10) || 0 }) });
         case 'POST /wait-rang':
           return sendJson(res, 200, service.waitRang(sender, body));
         case 'POST /wait-adopt':

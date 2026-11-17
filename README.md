@@ -313,6 +313,8 @@ Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpi
 | `--limit-per-hour <n>` | `WAKE_LIMIT_PER_HOUR` | `limit_per_hour` | 6 |
 | `--stop-on-repeat <n>` | `WAKE_STOP_ON_REPEAT` | `stop_on_repeat` | 2 |
 | `--max-event-age-ms <ms>` | `WAKE_MAX_EVENT_AGE_MS` | `max_event_age_ms` | 3 600 000 |
+| – | `WAKE_REMIND_AFTER_MS` | `remind_after_ms` | 1 800 000 (pripomienka: správa stále `pending` po tomto čase od posledného zvončeka zazvoní znova) |
+| – | `WAKE_REMIND_MAX` | `remind_max` | 3 (pripomienok na správu; potom jeden oznam `unpicked` operátorovi) |
 | `--wait-ms <ms>` | `WAKE_WAIT_MS` | `wait_ms` | 25 000 (dĺžka long-pollu) |
 | `--reconnect-ms <ms>` | `WAKE_RECONNECT_MS` | `reconnect_ms` | 1 000 (prvý pokus; zdvojuje sa do 30 s) |
 | `--state-dir <cesta>` | `WAKE_STATE_DIR` | `state_dir` | `<data-dir>/client/wake` |
@@ -320,6 +322,8 @@ Budenie beží bez okna: stav overíte `wake.mjs status` (pole `running`), výpi
 | `--keepalive-since-command "<príkaz>"` | `WAKE_KEEPALIVE_SINCE_COMMAND` | `keepalive.since_command` | žiadny = keepalive vypnutý |
 | `--keepalive-interval-ms <ms>` | `WAKE_KEEPALIVE_INTERVAL_MS` | `keepalive.interval_ms` | 60 000 |
 | – | – | `jobs` | žiadne (periodické úlohy, pozri nižšie) |
+
+**Pripomienka nevyzdvihnutej pošty (operátor 2026-11-17: nevyzdvihnutá pošta je stratená pošta).** Každých 5 min sa `wake run` spýta služby na správy stále v schránke (`GET /unpicked`, bez tela) a tie, ktoré od posledného zvončeka čakajú dlhšie ako `remind_after_ms`, zazvoní znova tou istou cestou ako prvý zvonček (kontrola vyzdvihnutia, beh vlákna, diskusia s operátorom, hodinový limit, archivované vlákno = nedoručená a odosielateľ sa to dozvie, iný stroj). Po `remind_max` pripomienkach, pri schránke bez držiteľa a pri správach starších ako 48 h nezvoní, ale vytvorí oznam `unpicked` (ack alebo zahodenie správy). Pokrýva zvonček zahodený nad limitom, udalosť staršiu ako `max_event_age_ms` (budenie nebežalo) aj ťah, ktorý poštu nevedel prečítať.
 
 **Periodické úlohy (`jobs`, D-0023, D-0024).** `wake run` spúšťa príkazy zo zoznamu `jobs` (iba zo súboru: `wake.json` alebo `wake.jobs` v `--config`, bez voľby a premennej) vedľa long-pollu a keepalive, nezávisle od dostupnosti pošty. Položka: `name` (povinné, písmená, číslice, `.`, `_`, `-`, najviac 64 znakov, jedinečné), `command` (povinné, reťazec pre shell), `interval_ms` (predvolené 900 000; menej ako 60 000 sa zvýši na 60 000 s riadkom v logu), `timeout_ms` (predvolené 300 000, najviac `interval_ms`). Neplatná položka sa preskočí s riadkom v logu pri štarte, ostatné bežia. Príkaz sa spúšťa cez shell ako `keepalive.since_command`; po časovom limite alebo pri ukončení budenia sa ukončí celá skupina procesov. Úloha beží prvýkrát pri štarte (alebo keď od jej posledného štartu uplynul interval; čas posledného behu je v stave `wake-state.json` a prežije reštart), potom raz za `interval_ms`; jeden beh úlohy naraz (beh dlhší ako interval posunie ďalší o interval od konca). Výsledok každého behu je jeden riadok v logu (`úloha <meno>: ok (<ms> ms)` alebo `úloha <meno>: zlyhala (kód N): <koniec výstupu>`); zlyhanie budenie nikdy nezastaví. `wake config` vypíše `jobs` aj `jobProblems`, `wake status` posledný beh každej úlohy. Zmena `wake.json` (aj `jobs`) reštartuje `wake run` (samoreštart).
 

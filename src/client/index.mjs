@@ -240,6 +240,8 @@ export class Client {
   message(id, q = {}) { return this.call('GET', '/message', { query: { id, ...q } }); }
   /** Pending messages of a mailbox without reading them (no pickup, no count cache): the wake module's check before a ring. */
   pendingMail(q) { return this.call('GET', '/count', { query: q }); }
+  /** Wake events of the messages still pending after `olderMs` (the wake module's reminder; no body). */
+  unpicked(olderMs = 0) { return this.call('GET', '/unpicked', { query: { older_ms: String(olderMs) } }); }
   /** Waits due now (1e): the key `wake` all of them, another key those of its own messages. */
   due() { return this.call('GET', '/obligations', { query: { due: '1' } }); }
   /**

@@ -35,6 +35,11 @@ export const NOTICE_OPTIONS = {
   'turn-stalled': [
     { id: 'ack', label: 'Beriem na vedomie' },
   ],
+  // A message still pending after the wake's reminders (or without a holder, or too old to ring): nobody picks it up.
+  unpicked: [
+    { id: 'ack', label: 'Beriem na vedomie' },
+    { id: 'discard', label: 'Zahodiť správu' },
+  ],
   // A question to the operator (answer state `otázka`) has waited QUESTION_NOTICE_MS without a final reply (P-061).
   'question-open': [
     { id: 'ack', label: 'Beriem na vedomie' },
@@ -42,7 +47,7 @@ export const NOTICE_OPTIONS = {
 };
 
 /** Notice kinds that a client (the wake module) may create through POST /notice. */
-export const EXTERNAL_NOTICE_KINDS = ['wake-limit', 'turn-interrupted', 'turn-stalled'];
+export const EXTERNAL_NOTICE_KINDS = ['wake-limit', 'turn-interrupted', 'turn-stalled', 'unpicked'];
 /** Notice kinds about a thread, not a message (no `message_id`). */
 const THREAD_NOTICE_KINDS = ['turn-interrupted', 'turn-stalled'];
 /** Deadlines per level (`ttl` in instance.json overrides, `ttl` of a message shortens): DEFAULT_TTL / MAX_TTL in util.
@@ -1085,6 +1090,28 @@ export class Service {
   }
 
   /**
+   * Wake events of the messages still in a mailbox (pending) at least `olderMs` old, oldest first: the wake module's
+   * reminder rings their recipient again (operator 2026-11-17, critical: a message nobody picks up is lost mail; a ring
+   * dropped above the hourly limit, an event older than the wake's max age or a bell turn that could not read the mail
+   * left messages pending for days). The shape of the delivery event (afterDelivery, replyEvent), never the body.
+   */
+  unpicked({ olderMs = 0, now = Date.now() } = {}) {
+    const out = [];
+    for (const m of this.store.messages((x) => x.status === 'pending')) {
+      if (now - Date.parse(m.created_at) < olderMs) continue;
+      const t = m.to_thread ? null : (m.project && m.topic ? this.store.topic(m.project, m.topic) : null);
+      const orig = m.reply_to && m.to_thread ? this.store.message(m.reply_to) : null;
+      out.push({
+        type: m.reply_to ? 'reply' : m.level, ...eventBase(m), created_at: m.created_at,
+        ...(m.reply_to ? { reply_to: m.reply_to, reply_state: m.reply_state || null } : {}),
+        holder: m.to_thread || (t ? t.holder : null), holder_mode: m.to_thread ? null : (t ? t.holder_mode || null : null),
+        holder_machine: m.to_thread ? (m.to_thread_machine || orig?.thread_machine || null) : (t ? t.holder_machine || null : null),
+      });
+    }
+    return out.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+  }
+
+  /**
    * Code answer for an unpicked message past its deadline, or null (`no reply`):
    * - `otázka`: the recipient waits for the operator: its open turn is in the dialog (`waiting_operator`), or, for a
    *   steer/assist, its last turn ended with a question (closed turn with `discussion`, D-0015, D-0022);
@@ -1376,7 +1403,7 @@ export class Service {
       this.apply(msg, 'pending', 'decide', 'operator');
       this.afterDelivery(msg);
       result = { delivered_to: dest };
-    } else if (n.kind === 'blocker' || n.kind === 'unregistered-persona') {
+    } else if (n.kind === 'blocker' || n.kind === 'unregistered-persona' || n.kind === 'unpicked') {
       decided();
       if (decision === 'discard' && msg && msg.status === 'pending') this.apply(msg, 'discarded', 'decide', 'operator');
       return { notice_id: n.id, decision };

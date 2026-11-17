@@ -19,6 +19,11 @@ import { fileURLToPath } from 'node:url';
 // 4 cores, load 8; one run of node --test already uses all cores). The run gets a lower CPU priority (AGENTIC_TEST_NICE=0
 // keeps the normal one), so the threads' live work stays responsive.
 export const DEFAULT_SLOTS = 1;
+/** Test files run at once inside one run: AGENTIC_TEST_CONCURRENCY, else half the cores (at least 1). */
+export function testConcurrency(env = process.env, cores = (os.availableParallelism?.() || os.cpus().length)) {
+  const n = Number(env.AGENTIC_TEST_CONCURRENCY);
+  return Number.isInteger(n) && n > 0 ? n : Math.max(1, Math.floor(cores / 2));
+}
 const HEARTBEAT_MS = 5000;
 const STALE_MS = 60000;
 const LOCK_STALE_MS = 10000;
@@ -121,6 +126,11 @@ async function main(argv) {
   beat?.unref();
   if (slot) process.on('exit', () => releaseSlot(slot));
   const [bin, ...rest] = cmd;
+  // At most half the cores for test files at once (operator 2026-11-17: a release took the whole CPU of 4 cores; node
+  // --test runs cores-1 files, each starting more processes). AGENTIC_TEST_CONCURRENCY sets it; an explicit flag wins.
+  if (bin === 'node' && rest.includes('--test') && !rest.some((a) => a.startsWith('--test-concurrency'))) {
+    rest.splice(rest.indexOf('--test') + 1, 0, `--test-concurrency=${testConcurrency(env)}`);
+  }
   const child = spawn(bin === 'node' ? process.execPath : bin, rest, { stdio: 'inherit', env, shell: process.platform === 'win32' && bin !== 'node' });
   // Below normal priority for the run and what it starts (inherited on Linux and macOS; Windows: the run's own process).
   if (env.AGENTIC_TEST_NICE !== '0' && child.pid) { try { os.setPriority(child.pid, os.constants.priority.PRIORITY_BELOW_NORMAL); } catch { /* not allowed: normal priority */ } }

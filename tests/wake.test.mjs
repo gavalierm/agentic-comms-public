@@ -8,7 +8,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, addKey, cleanup, sleep, tmpDir } from './helpers.mjs';
-import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, RECIPIENT_CLOSED_TEMPLATE, WAKE_TYPES, wakeText, dueText, pairKey, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
+import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, RECIPIENT_CLOSED_TEMPLATE, WAKE_TYPES, wakeText, dueText, pairKey, pairLimit, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
 import { acquireWakeLock, readWakeLock, lockHeld, lockFile } from '../src/wake/lock.mjs';
 import { parseTimestamp, parseDuration, TURN_BUSY_MAX_MS } from '../src/common/util.mjs';
 import { createT3Adapter, parseCommand, platformCommand } from '../src/adapters/t3/index.mjs';
@@ -229,6 +229,26 @@ test('a steer and a blocker get twice the hourly pair limit; they count in the s
   await waker.pollOnce(500);
   assert.equal(adapter.calls.length, 12, 'urgent rings stop at twice the limit');
   assert.equal(waker.stats.limited, 2);
+});
+
+test('a reply to a blocker gets the urgent limit; the release time is when enough rings left the window (2026-11-18)', async (t) => {
+  assert.equal(pairLimit({ type: 'reply', original_level: 'blocker' }, 6), 12);
+  assert.equal(pairLimit({ type: 'reply', original_level: 'steer' }, 6), 12);
+  assert.equal(pairLimit({ type: 'reply', original_level: 'assist' }, 6), 6);
+  const { client, waker, clock } = await setup(t);
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'first', from_project: 'q', from_topic: 'u' });
+  await waker.pollOnce(500);
+  const [pair] = Object.keys(waker.state.rings);
+  // 8 rings of the pair in the last hour, one a minute from 50 min ago (the incident: 8 over a limit of 6).
+  const start = clock.t - 50 * 60 * 1000;
+  waker.state.rings[pair] = Array.from({ length: 8 }, (_, i) => start + i * 60 * 1000);
+  clock.t += 3 * 60 * 1000;
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'second', from_project: 'q', from_topic: 'u' });
+  await waker.pollOnce(500);
+  const notice = (await client.notices()).notices.find((n) => n.kind === 'wake-limit');
+  assert.match(notice.title, /6 za hodinu/);
+  // Three of the 8 rings must leave for 5 < 6: the third oldest + 1 h, not the oldest + 1 h.
+  assert.ok(notice.detail.includes(new Date(start + 2 * 60 * 1000 + 60 * 60 * 1000).toISOString()), notice.detail);
 });
 
 test('a held limited message the thread picked up meanwhile is not rung', async (t) => {

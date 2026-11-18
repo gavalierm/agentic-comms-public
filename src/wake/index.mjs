@@ -70,11 +70,13 @@ export const CONTINUE_TEMPLATE = 'turn ended with a next step, continue from han
 /**
  * Hourly ring limit of a pair for an event: a blocker and a steer get twice the limit (report 2026-11-17: a steer to a thread
  * working with another one waited 20 min behind six assists of the hour). They still count in the pair, so a loop still
- * stops; repeated text stops by `stopOnRepeat`.
+ * stops; repeated text stops by `stopOnRepeat`. A reply to a blocker or a steer likewise (2026-11-18: the answer a blocked
+ * sender waited for lay 36 min behind the limit of 6 while the blocker itself had 12).
  */
 export const URGENT_TYPES = ['blocker', 'steer'];
 export function pairLimit(ev, limitPerHour) {
-  return URGENT_TYPES.includes(ev?.type) ? limitPerHour * 2 : limitPerHour;
+  const urgent = URGENT_TYPES.includes(ev?.type) || (ev?.type === 'reply' && URGENT_TYPES.includes(ev?.original_level));
+  return urgent ? limitPerHour * 2 : limitPerHour;
 }
 
 export const DEFAULTS = {
@@ -366,8 +368,9 @@ export class Waker {
     const recent = this.state.rings[pair] || [];
 
     let limit = null;
+    const lim = pairLimit(ev, this.opts.limitPerHour);
     if (ev.text_hash && !ev.released && repeats >= this.opts.stopOnRepeat) limit = { reason: 'repeat', detail: `rovnaká správa ${repeats}× za sebou (${dir})` };
-    else if (recent.length >= pairLimit(ev, this.opts.limitPerHour)) limit = { reason: 'hour', detail: `${recent.length} zobudení za poslednú hodinu (${pair}), limit ${pairLimit(ev, this.opts.limitPerHour)}` };
+    else if (recent.length >= lim) limit = { reason: 'hour', limit: lim, detail: `${recent.length} zobudení za poslednú hodinu (${pair}), limit ${lim}` };
 
     if (limit) {
       this.stats.limited += 1;
@@ -375,7 +378,9 @@ export class Waker {
       // read only at the operator's next prompt). It is held and rung once the pair's window has room (releaseHeld);
       // the limit stays a rate, never a lost ring. A repeated text stays stopped (a loop, not a rate).
       if (limit.reason === 'hour' && ev.message_id) {
-        limit.free_at = new Date(Math.min(...recent) + HOUR).toISOString();
+        // The window has room once recent.length - lim + 1 rings left it: the last of them is index recent.length - lim
+        // (2026-11-18: the oldest ring + 1 h said 07:52 for 8 rings over a limit of 6; three had to leave, 07:57).
+        limit.free_at = new Date([...recent].sort((a, b) => a - b)[recent.length - lim] + HOUR).toISOString();
         this.hold(ev, now, 'limit');
       }
       this.state.save();
@@ -646,7 +651,7 @@ export class Waker {
     try {
       return await this.client.createNotice({
         kind: 'wake-limit',
-        title: `Limit budenia (${limit.reason === 'repeat' ? 'opakovaná správa' : '6 za hodinu'}): ${topicLabel(ev)}`,
+        title: `Limit budenia (${limit.reason === 'repeat' ? 'opakovaná správa' : `${limit.limit} za hodinu`}): ${topicLabel(ev)}`,
         message_id: ev.message_id,
         detail: `${limit.detail}; vlákno ${ev.holder} nebolo zobudené, ${limit.free_at ? `správa zazvoní, keď sa okno uvoľní (${limit.free_at})` : 'správa čaká na ďalší ťah'}.`,
         dedupe_key: `${limit.reason}:${limit.reason === 'repeat' ? directionKey(ev) : pairKey(ev)}`,

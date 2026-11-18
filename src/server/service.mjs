@@ -1,11 +1,13 @@
-// Business logic of the mail service (mail model 2, D-0087): send / receive / resolve / withdraw / obligations / waits /
-// notices / decide / register-topic / wake events / deadlines (TTL) / turns (keepalive). Independent of HTTP.
-// The state of a message is its `status`, written only by transition() (lifecycle.mjs).
+// Business logic of the mail service (mail model 3; status model D-0087): send / receive / resolve / withdraw / obligations /
+// waits / notices / decide / register-topic / wake events / deadlines (TTL) / turns (keepalive). Independent of HTTP.
+// The state of a message is its `status`, written only by transition() (lifecycle.mjs). A topic is the key brain + machine +
+// project + topic (docs/MODEL.md, model 3); every lookup of a record goes through resolveKey() (moved_to).
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { LEVELS, REPLY_STATES, FINAL_REPLY_STATE, LEVEL_REMOVED_TEXT, DEFAULT_TTL, MAX_TTL, isValidName, isValidThread, newId, nowIso, textHash, HttpError, PERSONA_MAIN_TOPIC, personaProject, normalizeMachine, parseDuration, discussionOpen, turnFresh, DISCUSSION_HELD_LEVELS, readJson } from '../common/util.mjs';
 import { notifyOperator } from '../notify/index.mjs';
-import { MAIL_MODEL, transition, findTransition, isFinal, stateOf } from './lifecycle.mjs';
+import { MAIL_MODEL, HISTORY_MAX, transition, findTransition, isFinal, stateOf } from './lifecycle.mjs';
+import { topicKey, sameTopicKey } from './store.mjs';
 
 export const SERVER_VERSION = readJson(fileURLToPath(new URL('../../package.json', import.meta.url)), {}).version || null;
 
@@ -44,12 +46,22 @@ export const NOTICE_OPTIONS = {
   'question-open': [
     { id: 'ack', label: 'Beriem na vedomie' },
   ],
+  // A brain registered a topic that a record from before model 3 (brain null) with open mail still holds (model 3): the new
+  // record exists, the old one keeps its mail until the operator moves it (it may be another brain's mail).
+  'legacy-topic': [
+    { id: 'move', label: 'Presunúť poštu staršej témy do novej' },
+    { id: 'ack', label: 'Nechať (staršia téma ostáva)' },
+  ],
 };
 
 /** Notice kinds that a client (the wake module) may create through POST /notice. */
 export const EXTERNAL_NOTICE_KINDS = ['wake-limit', 'turn-interrupted', 'turn-stalled', 'unpicked'];
 /** Notice kinds about a thread, not a message (no `message_id`). */
 const THREAD_NOTICE_KINDS = ['turn-interrupted', 'turn-stalled'];
+/** Machine of a topic registered without any (no machine, holder machine or X-Comms-Machine): the migration's value too. */
+export const UNKNOWN_MACHINE = 'unknown';
+/** Longest chain of `moved_to` that resolveKey() follows. */
+export const MOVE_MAX_STEPS = 5;
 /** Deadlines per level (`ttl` in instance.json overrides, `ttl` of a message shortens): DEFAULT_TTL / MAX_TTL in util.
  * Every message except a reply has a deadline for its pickup; a reply has none. */
 export { DEFAULT_TTL, MAX_TTL };
@@ -261,17 +273,23 @@ export class Service {
     return this.lastRecentSeq;
   }
 
-  /** Key of the thread record that receives rows about a message for its sender: the sender's thread, else its source topic. */
+  /**
+   * Key of the thread record that receives rows about a message for its sender: the sender's thread, else its source topic
+   * `topic:<brain>/<project>/<topic>` (no machine: a move keeps the rows; the brain of the record the key resolves to).
+   */
   senderKey(m) {
     if (m.thread_id) return m.thread_id;
-    if (m.from_project && m.from_topic) return `topic:${m.from_project}/${m.from_topic}`;
+    if (m.from_project && m.from_topic) {
+      const rec = this.resolveKey(senderTopicKey(m));
+      return recentTopicKey(rec ? rec.brain : m.from_brain, m.from_project, m.from_topic);
+    }
     return null;
   }
 
   /** Key for the recipient: the thread it is addressed to, else its mailbox topic. */
   recipientKey(m) {
     if (m.to_thread) return m.to_thread;
-    if (m.project && m.topic) return `topic:${m.project}/${m.topic}`;
+    if (m.project && m.topic) return recentTopicKey(m.to_brain, m.project, m.topic);
     return null;
   }
 
@@ -285,10 +303,88 @@ export class Service {
   }
 
   // --- topics ------------------------------------------------------------------
+  /** Open records of (brain, project, topic), newest first (I11: at most one; two only inside a move stopped midway). */
+  openTopics(brain, project, topic) {
+    return this.store.topics().filter((t) => (t.brain ?? null) === (brain ?? null) && t.project === project && t.topic === topic && t.state !== 'closed')
+      .sort(byUpdatedDesc);
+  }
+
+  openTopic(brain, project, topic) {
+    return this.openTopics(brain, project, topic)[0] || null;
+  }
+
+  /** Follow `moved_to` (at most MOVE_MAX_STEPS) from a record; the last record reached. */
+  followMoved(rec) {
+    for (let i = 0; rec && rec.moved_to && i < MOVE_MAX_STEPS; i++) {
+      const next = this.store.topic(rec.moved_to);
+      if (!next) break;
+      rec = next;
+    }
+    return rec || null;
+  }
+
+  /**
+   * The one resolver of a key (model 3): key → its record, followed along `moved_to`. A key without its record (no machine,
+   * or a machine the record never had) is the open record of the same brain, project and topic (I11), else a moved one of
+   * them. Every lookup of a topic record goes through here.
+   */
+  resolveKey(key) {
+    if (!key || !key.project || !key.topic) return null;
+    let rec = key.machine ? this.store.topic(key) : null;
+    // No record, or one closed without a move (the topic was closed here and later registered anew elsewhere): the open
+    // record of the same brain, project and topic wins (I11: at most one), else this record, else the newest of them.
+    if (!rec || (rec.state === 'closed' && !rec.moved_to)) {
+      const same = this.store.topics().filter((t) => (t.brain ?? null) === (key.brain ?? null) && t.project === key.project && t.topic === key.topic);
+      rec = same.filter((t) => t.state !== 'closed').sort(byUpdatedDesc)[0] || rec || same.sort(byUpdatedDesc)[0] || null;
+    }
+    return this.followMoved(rec);
+  }
+
+  /**
+   * Address resolution of `send` and `decide --target` (model 3): project + topic, optional `brain` (id or a unique
+   * brain_name) and `machine`. (1) brain and machine: that topic; (2) brain: the open topic of the brain; (3) no brain: the
+   * open topic of the sender's own brain, else the only open topic of another brain (`resolved: <brain_name>@<machine>`),
+   * more → 409 `ambiguous`, nothing written. No open topic: a closed record (send answers 410) or null (unregistered).
+   * Returns { rec, brain, resolved }.
+   */
+  resolveAddress({ brain = null, machine = null, project, topic }, fromBrain = null) {
+    const all = this.store.topics().filter((t) => t.project === project && t.topic === topic);
+    const live = (list) => list.filter((t) => t.state !== 'closed').sort(byUpdatedDesc);
+    const closed = (list) => list.filter((t) => t.state === 'closed' && !t.moved_to).sort(byUpdatedDesc)[0] || null;
+    if (present(brain)) {
+      let id = String(brain);
+      if (!all.some((t) => t.brain === id)) {
+        const named = [...new Set(all.filter((t) => t.brain && t.brain_name === id).map((t) => t.brain))];
+        if (named.length > 1) throw ambiguousError(project, topic, live(all.filter((t) => named.includes(t.brain))));
+        if (named.length === 1) id = named[0];
+      }
+      const mine = all.filter((t) => t.brain === id);
+      if (present(machine)) return { rec: this.followMoved(this.store.topic({ brain: id, machine: normalizeMachine(machine), project, topic })), brain: id, resolved: null };
+      return { rec: live(mine)[0] || closed(mine), brain: id, resolved: null };
+    }
+    if (fromBrain != null) {
+      const own = live(all.filter((t) => t.brain === fromBrain));
+      if (own.length) return { rec: own[0], brain: fromBrain, resolved: null };
+    }
+    const others = live(all.filter((t) => fromBrain == null || t.brain !== fromBrain));
+    const brains = [...new Set(others.map((t) => t.brain ?? null))];
+    if (brains.length > 1) throw ambiguousError(project, topic, others);
+    if (others.length) return { rec: others[0], brain: others[0].brain ?? null, resolved: whereLabel(others[0]) };
+    const own = fromBrain != null ? closed(all.filter((t) => t.brain === fromBrain)) : null;
+    return { rec: own || closed(all), brain: fromBrain, resolved: null };
+  }
+
   /**
    * Register a topic. `main: true` with `persona` registers the persona's main thread
    * (`@<persona>/main`, P-045). `persona` = owner of the topic; `visibility: private` hides
    * the topic from senders other than the owner (P-041).
+   *
+   * Model 3: the record is the key brain + machine + project + topic. `brain` (body or X-Comms-Brain) is required; the
+   * machine is `machine`, else `holder_machine`, else X-Comms-Machine (else `unknown`). At most one open record per
+   * (brain, project, topic) across machines (I11): registering on another machine moves the topic (same holder without
+   * takeover; another holder only with `takeover`, else 409): new record, the mailbox's non-final messages, the recent rows,
+   * then the old record closed with `moved_to`. A record from before model 3 (brain null) is claimed the same way only by
+   * its holder or when it has no open mail; else a new record and an operator notice (`legacy-topic`).
    *
    * Holder: a registration that would change a non-null holder (including clearing it with
    * an absent holder) is refused with 409 unless `takeover: true`; the same holder is
@@ -305,7 +401,8 @@ export class Service {
    * `sender` (authenticated key) must be the persona when the instance has a key for that
    * persona; without such a key the persona is not managed by keys (admin mode) and anyone may register it.
    */
-  registerTopic({ project, topic, subject, holder = null, holder_mode = null, holder_machine = null, persona = null, visibility = null, main = false, takeover = false, release = false, close = false } = {}, sender = null) {
+  registerTopic(body = {}, sender = null, ctx = {}) {
+    let { project, topic, subject, holder = null, holder_mode = null, holder_machine = null, persona = null, visibility = null, main = false, takeover = false, release = false, close = false } = body;
     if (main && close) throw new HttpError(400, 'hlavné vlákno persony (main) sa neuzatvára');
     if (persona != null) requireName(persona, 'persona');
     if (main) {
@@ -319,42 +416,155 @@ export class Service {
     }
     if (holder_mode != null && !HOLDER_MODES.includes(holder_mode)) throw new HttpError(400, `režim držiteľa (holder_mode) musí byť ${HOLDER_MODES.join('|')}`);
     if (visibility != null && !VISIBILITIES.includes(visibility)) throw new HttpError(400, `viditeľnosť (visibility) musí byť ${VISIBILITIES.join('|')}`);
-    const prior = this.store.topic(project, topic);
-    if (close && !prior) throw new HttpError(404, `téma ${project}/${topic} nie je registrovaná; nie je čo uzavrieť`);
+    const brain = requestBrain(body.brain, ctx);
+    if (!brain) throw new HttpError(400, 'registrácia témy vyžaduje brain (X-Comms-Brain alebo brain): téma je brain + stroj + projekt + téma (model 3)');
+    const open = this.openTopic(brain, project, topic);
+    // A registration that names no machine at all keeps the open record's machine (no move); `unknown` only without one.
+    const machine = normalizeMachine(body.machine) || normalizeMachine(holder_machine) || normalizeMachine(ctx.machine) || (open ? open.machine : UNKNOWN_MACHINE);
+    const exact = this.store.topic({ brain, machine, project, topic });
+    if (close && !open && !exact) throw new HttpError(404, `téma ${project}/${topic} nie je registrovaná; nie je čo uzavrieť`);
     if (close) release = true;
-    const prevHolder = prior && prior.holder ? prior.holder : null;
     const newHolder = release ? null : (holder || null);
-    const sameHolder = newHolder != null && newHolder === prevHolder;
 
-    if (prevHolder && newHolder !== prevHolder) {
+    // The record this registration continues (`prior`) and, for a move, the record it moves from (`source`).
+    let prior = null;
+    let source = null;
+    let legacy = null;
+    if (release) {
+      prior = open || exact; // a release or close acts on the brain's open record wherever it is (no move)
+    } else if (open && open.machine !== machine) {
+      source = open; // I11: the open topic of this brain on another machine moves here
+    } else if (open) {
+      prior = open;
+    } else {
+      legacy = this.openTopic(null, project, topic);
+      if (legacy && ((newHolder && legacy.holder === newHolder) || !this.hasOpenMail(legacy))) { source = legacy; legacy = null; }
+      prior = exact;
+    }
+    const base = source || prior;
+    const prevHolder = base && base.holder ? base.holder : null;
+    const sameHolder = newHolder != null && newHolder === prevHolder;
+    // A record from before model 3 is claimed by its holder or when it has no open mail (no takeover: it has no brain).
+    const legacyClaim = !!source && source.brain == null;
+    if (prevHolder && newHolder !== prevHolder && !legacyClaim) {
       const ownRelease = release && (!holder || holder === prevHolder);
-      if (!ownRelease && !takeover) throw new HttpError(409, `téma ${project}/${topic} už má držiteľa ${prevHolder}; prepísanie alebo uvoľnenie cudzieho držiteľa vyžaduje takeover: true`);
+      if (!ownRelease && !takeover) throw new HttpError(409, `téma ${project}/${topic} už má držiteľa ${prevHolder}${source && source.machine !== machine ? ` na stroji ${source.machine}` : ''}; prepísanie alebo uvoľnenie cudzieho držiteľa vyžaduje takeover: true`);
     }
 
-    const effPersona = persona != null ? persona : (prior && prior.persona) || null;
-    const effVisibility = main ? null : (visibility != null ? visibility : (prior && prior.visibility) || 'public');
+    const effPersona = persona != null ? persona : (base && base.persona) || null;
+    const effVisibility = main ? null : (visibility != null ? visibility : (base && base.visibility) || 'public');
     if (effVisibility === 'private' && !effPersona) throw new HttpError(400, 'súkromná téma musí mať personu (vlastníka)');
     if (effPersona) this.requirePersonaSender(effPersona, sender);
 
     const subjectGiven = typeof subject === 'string' && subject.trim() !== '';
-    const subjectOut = subjectGiven ? subject.trim() : (prior && prior.subject) || (main ? `main thread of ${persona}` : null);
+    const subjectOut = subjectGiven ? subject.trim() : (base && base.subject) || (main ? `main thread of ${persona}` : null);
     if (!subjectOut) throw new HttpError(400, 'téma musí mať predmet (subject)');
 
+    const key = release && prior ? topicKey(prior) : { brain, machine, project, topic };
+    const now = nowIso();
     const rec = {
-      project, topic, subject: subjectOut,
+      brain: key.brain, brain_name: brainNameOf(body.brain_name ?? ctx.brain_name) || (base && base.brain === key.brain ? base.brain_name || null : null),
+      machine: key.machine, project, topic, subject: subjectOut,
       holder: newHolder,
-      holder_mode: newHolder ? (holder_mode != null ? holder_mode : (sameHolder ? prior.holder_mode : null)) : null,
-      holder_machine: newHolder ? (holder_machine != null ? normalizeMachine(holder_machine) : (sameHolder ? prior.holder_machine : null)) : null,
+      holder_mode: newHolder ? (holder_mode != null ? holder_mode : (sameHolder ? base.holder_mode : null)) : null,
+      // A move to another machine rings the holder there: its machine, unless the registration names the holder's.
+      holder_machine: newHolder ? (holder_machine != null ? normalizeMachine(holder_machine) : (source && source.machine !== key.machine ? key.machine : (sameHolder ? base.holder_machine : null))) : null,
       persona: effPersona, visibility: effVisibility,
-      registered_at: prior ? prior.registered_at : nowIso(),
-      updated_at: nowIso(),
+      registered_at: base ? base.registered_at : now,
+      updated_at: now,
       state: close ? 'closed' : 'open',
-      closed_at: close ? (prior && prior.state === 'closed' && prior.closed_at ? prior.closed_at : nowIso()) : null,
+      closed_at: close ? (prior && prior.state === 'closed' && prior.closed_at ? prior.closed_at : now) : null,
+      // A registration that (re)opens a record clears its moved_to; a move names its source for repair().
+      moved_to: null,
+      moved_from: source ? topicKey(source) : null,
     };
     this.store.saveTopic(rec);
-    if (main) this.closePersonaNotices(persona);
-    if (!close) return { registered: true, created: !prior, topic: rec };
-    return { registered: true, created: false, topic: rec, closed: true, ...this.closeTopicMail(rec, prevHolder) };
+    const out = { registered: true, created: !base, topic: rec };
+    if (source) {
+      out.moved = this.moveTopicMail(source, rec);
+      out.moved_from = whereLabel(source);
+      this.log(`topic ${project}/${topic} moved ${whereLabel(source)} → ${whereLabel(rec)}: ${out.moved.length} message(s)`);
+    }
+    if (legacy) out.legacy_notice_id = this.legacyNotice(legacy, rec, sender);
+    if (main) {
+      // Mail for the persona before any main existed (to_brain null, no machine) is taken by the first registration of main.
+      for (const m of this.store.messages((x) => !isFinal(x.status) && x.status !== 'held' && x.project === project && x.topic === topic && x.to_brain == null && x.to_machine == null)) {
+        this.moveMessage(m, rec, { event: false });
+      }
+      this.closePersonaNotices(persona);
+    }
+    if (!close) return out;
+    return { ...out, created: false, closed: true, ...this.closeTopicMail(rec, prevHolder) };
+  }
+
+  /** The record's mailbox has a non-final message. */
+  hasOpenMail(rec) {
+    return this.store.messages((m) => !isFinal(m.status) && m.project === rec.project && m.topic === rec.topic && sameTopicKey(recipientTopicKey(m), rec)).length > 0;
+  }
+
+  /**
+   * A move of a topic (I11, legacy claim), after the new record is written: (2) every non-final message of the old
+   * mailbox gets the new key (status unchanged, history `move`; idempotent per message), (3) the recent rows go to the new
+   * brain's key, (4) the old record is closed with `moved_to`, the last write. Returns the ids moved.
+   */
+  moveTopicMail(oldRec, newRec) {
+    const oldKey = topicKey(oldRec);
+    const moved = [];
+    for (const m of this.store.messages((x) => !isFinal(x.status) && x.project === oldKey.project && x.topic === oldKey.topic && sameTopicKey(recipientTopicKey(x), oldKey))) {
+      this.moveMessage(m, newRec);
+      moved.push(m.id);
+    }
+    const from = recentTopicKey(oldKey.brain, oldKey.project, oldKey.topic);
+    const to = recentTopicKey(newRec.brain, newRec.project, newRec.topic);
+    if (from !== to) {
+      const a = this.store.threadRecord(from);
+      if ((a.recent || []).length) {
+        const b = this.store.threadRecord(to);
+        const seen = new Set((b.recent || []).map((r) => r.seq));
+        b.recent = [...(b.recent || []), ...a.recent.filter((r) => !seen.has(r.seq))].sort((x, y) => x.seq - y.seq).slice(-RECENT_MAX);
+        this.store.saveThreadRecord(b);
+      }
+      this.store.removeThreadRecord(from);
+    }
+    const now = nowIso();
+    Object.assign(oldRec, { state: 'closed', closed_at: now, updated_at: now, holder: null, holder_mode: null, holder_machine: null, moved_to: topicKey(newRec), moved_from: null });
+    this.store.saveTopic(oldRec);
+    return moved;
+  }
+
+  /** One message to another key (a move): `status` unchanged, history `move`; a pending one rings the new holder. */
+  moveMessage(m, rec, { event = true } = {}) {
+    const at = nowIso();
+    m.to_brain = rec.brain ?? null;
+    m.to_machine = rec.machine ?? null;
+    m.to_brain_name = rec.brain_name || null;
+    m.history = [...(m.history || []), { at, from: m.status, to: m.status, op: 'move', by: 'code' }].slice(-HISTORY_MAX);
+    this.store.saveMessage(m);
+    if (event && m.status === 'pending') {
+      const orig = m.reply_to ? this.store.message(m.reply_to) : null;
+      this.emitEvent({
+        type: m.reply_to ? 'reply' : m.level, ...eventBase(m),
+        ...(m.reply_to ? { reply_to: m.reply_to, reply_state: m.reply_state || null, original_level: orig ? orig.level : null } : {}),
+        holder: m.to_thread || rec.holder || null, holder_mode: m.to_thread ? null : rec.holder_mode || null,
+        holder_machine: m.to_thread ? m.to_thread_machine || null : rec.holder_machine || null, moved: true,
+      });
+    }
+    return m;
+  }
+
+  /** Operator notice: a brain registered a topic whose record from before model 3 still holds open mail (one per record). */
+  legacyNotice(legacy, rec, sender) {
+    const dedupe_key = `legacy:${keyText(topicKey(legacy))}`;
+    const open = this.store.notices((n) => n.state === 'open' && n.kind === 'legacy-topic' && n.dedupe_key === dedupe_key);
+    if (open.length) return open[0].id;
+    const n = this.createNotice({
+      kind: 'legacy-topic',
+      title: `Staršia téma ${rec.project}/${rec.topic} (bez brainu, ${legacy.machine}) má otvorenú poštu; ${whereLabel(rec)} dostal novú tému`,
+      message: { id: null, project: rec.project, topic: rec.topic, level: null, sender, thread_id: rec.holder || null, to_brain: rec.brain, to_machine: rec.machine, to_brain_name: rec.brain_name },
+      extra: { dedupe_key, legacy_key: topicKey(legacy), new_key: topicKey(rec), detail: `presunúť = pošta staršej témy (držiteľ ${legacy.holder || '-'}) pôjde do ${whereLabel(rec)}; nechať = ostane, rozlíšenie bez brainu ju počíta ako tému iného brainu` },
+    });
+    this.log(`legacy topic ${rec.project}/${rec.topic} (${legacy.machine}) has open mail: new record ${whereLabel(rec)}, notice ${n.id}`);
+    return n.id;
   }
 
   /**
@@ -365,9 +575,8 @@ export class Service {
   closeTopicMail(rec, prevHolder) {
     const undelivered = [];
     const recipientClosed = [];
-    const threadGone = prevHolder && !this.store.topics().some((t) => t.holder === prevHolder && t.state !== 'closed'
-      && !(t.project === rec.project && t.topic === rec.topic));
-    const inBox = (m) => (m.project === rec.project && m.topic === rec.topic) || (threadGone && m.to_thread === prevHolder && !m.topic);
+    const threadGone = prevHolder && !this.store.topics().some((t) => t.holder === prevHolder && t.state !== 'closed' && !sameTopicKey(t, rec));
+    const inBox = (m) => (m.project === rec.project && m.topic === rec.topic && sameTopicKey(recipientTopicKey(m), rec)) || (threadGone && m.to_thread === prevHolder && !m.topic);
     const reason = `topic ${rec.project}/${rec.topic} closed ${rec.closed_at}`;
     for (const m of this.store.messages((x) => inBox(x) && !isFinal(x.status))) {
       if (m.status === 'pending' || m.status === 'held') {
@@ -405,7 +614,7 @@ export class Service {
 
   // --- send ----------------------------------------------------------------------
   /** A new message (never a reply: a reply is `resolve`). `client_op_id` repeated → the original confirmation. */
-  send(sender, body = {}) {
+  send(sender, body = {}, ctx = {}) {
     if (!sender) throw new HttpError(401, 'neplatný kľúč');
     const opId = this.checkOpId(body.client_op_id);
     if (opId) {
@@ -417,11 +626,17 @@ export class Service {
     if (present(body.reply_to)) throw new HttpError(400, 'odpoveď sa posiela cez resolve (id pôvodnej správy, stav, text), nie cez send s reply_to');
     if (present(body.reply_state)) throw new HttpError(400, 'stav odpovede (reply_state) patrí resolve, nie send');
     if (present(body.cancels)) throw new HttpError(400, 'zrušenie konečnej odpovede ide cez resolve s cancels na pôvodnú správu');
-    return this.deliver(sender, body, opId);
+    return this.deliver(sender, body, opId, ctx);
   }
 
-  deliver(sender, body, opId) {
+  deliver(sender, body, opId, ctx = {}) {
     const { project = null, topic = null, persona = null, maintainer = false, to_thread = null, level, text, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null, supersede_key = null } = body;
+    // Model 3: the sender's brain and machine (a queued item carries those of its time, else the headers); the target's
+    // `brain` (id or brain_name) and `machine` are optional (address resolution, resolveAddress).
+    // An explicit null (a queued item of a sender without a brain) is no brain, not the flushing client's header.
+    const fromBrain = body.from_brain === null ? null : requestBrain(body.from_brain, ctx);
+    const fromMachine = body.from_machine === null ? null : normalizeMachine(present(body.from_machine) ? body.from_machine : ctx.machine);
+    const addr = { brain: present(body.brain) ? requireBrainValue(body.brain) : null, machine: present(body.machine) ? normalizeMachine(body.machine) : null };
     if (level === 'info') throw new HttpError(400, LEVEL_REMOVED_TEXT);
     if (level == null || level === '') throw new HttpError(400, `úroveň (level) je povinná: ${LEVELS.join('|')}`);
     if (!LEVELS.includes(level)) throw new HttpError(400, `neznáma úroveň „${level}“; platné úrovne: ${LEVELS.join('|')}`);
@@ -431,6 +646,7 @@ export class Service {
     const created_at = nowIso();
     const msg = {
       id: newId(), project: null, topic: null, persona: null, ref_project: null, ref_topic: null, to_thread: null,
+      to_brain: null, to_machine: null, to_brain_name: null, from_brain: fromBrain, from_machine: fromMachine,
       level, text, sender, thread_id: thread_id || null, thread_machine: normalizeMachine(thread_machine), from_project, from_topic, reply_to: null,
       reply_state: null, wait_for: null, cancels: null,
       supersede_key: present(supersede_key) ? String(supersede_key).slice(0, 200) : null,
@@ -439,6 +655,7 @@ export class Service {
     };
     // A blocker and an assist wait for an answer from the start (1b); a steer only for its pickup.
     if (level !== 'steer') this.setWait(msg, WAIT_BASE_S[level], 'no-reply', Date.parse(created_at));
+    let resolved = null;
 
     if (present(to_thread)) {
       // Thread address (operator 2026-11-18): a new message to a thread by its id, only from the maintainer's thread; the
@@ -486,28 +703,35 @@ export class Service {
       if (topic != null && project == null) throw new HttpError(400, 'téma (topic) vyžaduje projekt (project)');
       if (project != null) requireName(project, 'project');
       if (topic != null) requireName(topic, 'topic');
-      const t = project && topic ? this.store.topic(project, topic) : null;
-      if (!(t && t.state !== 'closed' && t.persona === persona && (t.visibility !== 'private' || sender === persona))) {
-        return this.toPersonaMain(msg, persona, { project, topic }, opId);
+      const t = project && topic ? this.personaTopic(persona, project, topic, addr, fromBrain) : null;
+      if (!(t && (t.visibility !== 'private' || sender === persona))) {
+        return this.toPersonaMain(msg, persona, { project, topic }, opId, fromBrain);
       }
       msg.project = project;
       msg.topic = topic;
       msg.persona = persona;
+      setRecipient(msg, t);
     } else {
       requireName(project, 'project');
       requireName(topic, 'topic');
       msg.project = project;
       msg.topic = topic;
-      const t = this.store.topic(project, topic);
+      const r = this.resolveAddress({ ...addr, project, topic }, fromBrain);
+      const t = r.rec;
       refuseClosed(t, 'téma je uzavretá');
       // `<persona>/main` without `@` means the persona's main thread when the persona has one and no such topic exists.
-      if (!t && topic === PERSONA_MAIN_TOPIC && isValidName(project) && this.store.topic(personaProject(project), PERSONA_MAIN_TOPIC)) {
-        return this.toPersonaMain(msg, project, {}, opId);
+      if (!t && topic === PERSONA_MAIN_TOPIC && isValidName(project) && this.store.topics().some((x) => x.project === personaProject(project) && x.topic === PERSONA_MAIN_TOPIC)) {
+        return this.toPersonaMain(msg, project, {}, opId, fromBrain);
       }
       if (!t || (t.visibility === 'private' && sender !== t.persona)) {
         // Unregistered topic, or a private topic addressed by someone else than its owner: the same answer as for an
-        // unknown topic (no oracle), held + notice, never create the topic (P-045).
+        // unknown topic (no oracle), held + notice, never create the topic (P-045). Model 3: to_brain is the brain asked
+        // (else the sender's), no machine; `address` keeps what the sender gave, so a later delivery resolves the same way.
         if (t) msg.private_owner = t.persona;
+        msg.to_brain = t ? t.brain ?? null : (r.brain ?? fromBrain);
+        msg.to_machine = null;
+        msg.to_brain_name = t ? t.brain_name || null : (msg.to_brain === fromBrain ? brainNameOf(ctx.brain_name) : null);
+        msg.address = addr;
         transition(msg, 'held', 'send', 'thread', { at: created_at });
         const notice = this.createNotice({
           kind: 'unregistered-topic',
@@ -515,17 +739,19 @@ export class Service {
           message: msg,
         });
         msg.notice_id = notice.id;
-        const result = { id: msg.id, status: msg.status, level, notice_id: notice.id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, project_known: this.projectKnown(project) };
+        const result = { id: msg.id, status: msg.status, level, notice_id: notice.id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, project_known: this.projectKnown(project, fromBrain) };
         this.recordOp(msg, opId, 'send', result);
         this.store.saveMessage(msg);
         this.log(`held ${msg.id} for ${t ? 'private' : 'unregistered'} ${project}/${topic}`);
         return result;
       }
+      setRecipient(msg, t);
+      resolved = r.resolved;
     }
     transition(msg, 'pending', 'send', 'thread', { at: created_at });
     this.store.saveMessage(msg);
     this.afterDelivery(msg);
-    const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null };
+    const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, ...(resolved ? { resolved } : {}) };
     this.recordOp(msg, opId, 'send', result);
     this.store.saveMessage(msg);
     return result;
@@ -555,11 +781,24 @@ export class Service {
   }
 
   /**
-   * The project has at least one open registered topic (D-0024: the sender of a held message learns that someone serves
-   * the project). It depends on the project only, never on the addressed topic (no oracle, P-045).
+   * The project has at least one open registered topic in the sender's brain (D-0024: the sender of a held message learns
+   * that someone serves the project; model 3: only its own brain counts). It depends on the project only, never on the
+   * addressed topic (no oracle, P-045).
    */
-  projectKnown(project) {
-    return this.store.topics().some((t) => t && t.project === project && t.state !== 'closed');
+  projectKnown(project, fromBrain = null) {
+    return this.store.topics().some((t) => t && t.project === project && t.state !== 'closed' && (t.brain ?? null) === (fromBrain ?? null));
+  }
+
+  /**
+   * Topic of a persona address (persona + project + topic): an open record the persona owns (the given brain only, when
+   * named), the sender's brain first, else the only brain that has one; else null (the message goes to the persona's main).
+   */
+  personaTopic(persona, project, topic, addr = {}, fromBrain = null) {
+    const list = this.store.topics().filter((t) => t.project === project && t.topic === topic && t.state !== 'closed' && t.persona === persona
+      && (!addr.brain || t.brain === addr.brain || t.brain_name === addr.brain) && (!addr.machine || t.machine === addr.machine)).sort(byUpdatedDesc);
+    const own = fromBrain != null ? list.find((t) => t.brain === fromBrain) : null;
+    if (own) return own;
+    return new Set(list.map((t) => t.brain ?? null)).size === 1 ? list[0] : null;
   }
 
   /**
@@ -588,17 +827,23 @@ export class Service {
    * exist yet: it picks the mail up after (re)birth. A persona that never registered gets one open operator notice
    * (typo guard), the message keeps waiting. A held message delivered here by the operator moves `held → pending`.
    */
-  toPersonaMain(msg, persona, ref = {}, opId = null) {
+  toPersonaMain(msg, persona, ref = {}, opId = null, fromBrain = null) {
+    // Model 3: the persona's main is its name and its brain (own brain first, else the only one; more → 409 ambiguous).
+    // Without a main the message has no brain and no machine; the first registration of main takes it.
+    const main = this.resolveAddress({ project: personaProject(persona), topic: PERSONA_MAIN_TOPIC }, fromBrain).rec;
+    const live = main && main.state !== 'closed' ? main : null;
     msg.project = personaProject(persona);
     msg.topic = PERSONA_MAIN_TOPIC;
     msg.persona = persona;
     msg.ref_project = ref.project || null;
     msg.ref_topic = ref.topic || null;
+    delete msg.address;
+    setRecipient(msg, live);
     if (msg.status === 'held') transition(msg, 'pending', 'decide', 'operator');
     else transition(msg, 'pending', 'send', 'thread', { at: msg.created_at });
     this.store.saveMessage(msg);
     let warning = null;
-    if (!this.store.topic(msg.project, msg.topic)) {
+    if (!live) {
       warning = `persona ${persona} has no main thread yet; the message waits`;
       const open = this.store.notices((n) => n.state === 'open' && n.kind === 'unregistered-persona' && n.persona === persona);
       if (!open.length) {
@@ -619,6 +864,7 @@ export class Service {
   supersede(msg) {
     const same = (m) => m.id !== msg.id && m.status === 'pending' && !m.reply_to && m.sender === msg.sender
       && m.supersede_key === msg.supersede_key && m.project === msg.project && m.topic === msg.topic && (m.persona || null) === (msg.persona || null)
+      && (m.to_brain ?? null) === (msg.to_brain ?? null) && (m.to_machine ?? null) === (msg.to_machine ?? null)
       && (m.to_thread || null) === (msg.to_thread || null);
     for (const old of this.store.messages(same)) {
       const notice = old.notice_id && !msg.notice_id ? this.store.notice(old.notice_id) : null;
@@ -637,7 +883,7 @@ export class Service {
   /** Wake events and operator notices once a new message is pending in a mailbox. */
   afterDelivery(msg) {
     if (msg.supersede_key) this.supersede(msg);
-    const t = msg.to_thread ? null : this.store.topic(msg.project, msg.topic);
+    const t = msg.to_thread ? null : this.resolveKey(recipientTopicKey(msg));
     // Events never carry the body (P-043); `text_hash` lets the wake module detect repeats. A message addressed to a
     // thread (maintainer) rings that thread on its machine.
     this.emitEvent({
@@ -656,7 +902,7 @@ export class Service {
 
   /** Event of a delivered reply for the original's sender. */
   replyEvent(reply, original) {
-    const t = reply.project && reply.topic ? this.store.topic(reply.project, reply.topic) : null;
+    const t = reply.project && reply.topic ? this.resolveKey(recipientTopicKey(reply)) : null;
     return this.emitEvent({
       type: 'reply', ...eventBase(reply), reply_to: original.id, reply_state: reply.reply_state, original_level: original.level,
       holder: original.thread_id || (t ? t.holder : null), holder_mode: original.thread_id ? null : (t ? t.holder_mode || null : null),
@@ -665,8 +911,14 @@ export class Service {
   }
 
   // --- mailboxes -------------------------------------------------------------------
-  /** The mailbox a request names: thread, project+topic or persona (its main thread). null when none. */
-  mailbox({ project = null, topic = null, thread = null, persona = null } = {}) {
+  /**
+   * The mailbox a request names: thread, project+topic or persona (its main thread). null when none. Model 3: a topic
+   * mailbox is the full key; `brain` and `machine` of the query, else the request's (X-Comms-Brain, X-Comms-Machine); a
+   * request without a machine means the brain's open record (I11).
+   */
+  mailbox(q = {}, ctx = {}) {
+    let { project = null, topic = null } = q;
+    const { thread = null, persona = null } = q;
     if (present(persona)) {
       requireName(persona, 'persona');
       project = personaProject(persona);
@@ -675,18 +927,30 @@ export class Service {
     if (present(thread)) requireThread(thread);
     const byTopic = present(project) && present(topic);
     if (!byTopic && !present(thread)) return null;
-    return { project: byTopic ? project : null, topic: byTopic ? topic : null, thread: present(thread) ? thread : null };
+    let brain = null;
+    let machine = null;
+    if (byTopic) {
+      // An empty `brain=` / `machine=` parameter means exactly none (wake asks the event's key, also a key without them).
+      brain = q.brain === '' ? null : requestBrain(q.brain, ctx);
+      if (q.machine === '') machine = null;
+      else {
+        machine = normalizeMachine(present(q.machine) ? q.machine : ctx.machine);
+        if (!machine) { const open = this.openTopic(brain, project, topic); machine = open ? open.machine : UNKNOWN_MACHINE; }
+      }
+    }
+    return { brain, machine, project: byTopic ? project : null, topic: byTopic ? topic : null, thread: present(thread) ? thread : null };
   }
 
-  requireMailbox(q) {
-    const mb = this.mailbox(q);
+  requireMailbox(q, ctx = {}) {
+    const mb = this.mailbox(q, ctx);
     if (!mb) throw new HttpError(400, 'zadaj schránku: project a topic, persona alebo thread');
     return mb;
   }
 
+  /** Model 3: a topic mailbox matches on the whole key (brain, machine, project, topic), never on project/topic alone. */
   inMailbox(m, mb) {
     if (!mb) return false;
-    return (mb.thread && m.to_thread === mb.thread) || (mb.project && mb.topic && m.project === mb.project && m.topic === mb.topic) || false;
+    return (mb.thread && m.to_thread === mb.thread) || (mb.project && mb.topic && m.project === mb.project && m.topic === mb.topic && sameTopicKey(recipientTopicKey(m), mb)) || false;
   }
 
   /** Persona that owns the mailbox of a message (a reply: the original's sender; else the topic's persona). */
@@ -696,7 +960,7 @@ export class Service {
       return o ? o.sender : null;
     }
     if (m.persona) return m.persona;
-    const t = m.project && m.topic ? this.store.topic(m.project, m.topic) : null;
+    const t = m.project && m.topic ? this.resolveKey(recipientTopicKey(m)) : null;
     return t ? t.persona || null : null;
   }
 
@@ -715,8 +979,8 @@ export class Service {
 
   // --- receive -------------------------------------------------------------------
   /** Pending messages of a mailbox (I2: inbox = status pending), optionally only the given ids. No state change. */
-  pending(q, ids = null) {
-    const mb = this.requireMailbox(q);
+  pending(q, ids = null, ctx = {}) {
+    const mb = this.requireMailbox(q, ctx);
     const list = this.store.messages((m) => m.status === 'pending' && this.inMailbox(m, mb));
     const want = Array.isArray(ids) && ids.length ? new Set(ids.map(String)) : null;
     const out = want ? list.filter((m) => want.has(m.id)) : list;
@@ -728,8 +992,8 @@ export class Service {
    * Read the bodies of pending messages: the PICKUP (`pending → picked`, `picked_at`, `picked_by_thread`); a reply and a
    * steer need no answer and end `done (read)`. `ids` limits the read to those messages.
    */
-  receive(q) {
-    const list = this.pending(q, q.ids);
+  receive(q, ctx = {}) {
+    const list = this.pending(q, q.ids, ctx);
     return list.map((m) => publicMessage(this.pickUp(m, q.thread || null)));
   }
 
@@ -746,10 +1010,10 @@ export class Service {
    * One message by id in any status (1d): its sender or its mailbox reads the body again (a lost HTTP answer loses
    * nothing; thread B of the topic reads what thread A picked up). The mailbox picks a pending message up.
    */
-  receiveOne(id, q, sender) {
+  receiveOne(id, q, sender, ctx = {}) {
     const m = this.store.message(String(id || ''));
     if (!m) throw new HttpError(404, `správa ${id} neexistuje`);
-    const mb = this.mailbox(q);
+    const mb = this.mailbox(q, ctx);
     const forMailbox = this.actsForMailbox(m, mb, sender);
     if (!forMailbox && m.sender !== sender) throw new HttpError(403, `správa ${id} nie je vaša ani vo vašej schránke`);
     if (forMailbox && m.status === 'pending') this.pickUp(m, (mb && mb.thread) || null);
@@ -757,8 +1021,8 @@ export class Service {
   }
 
   /** Count without reading (no pickup): the inbox of a mailbox. */
-  count(q) {
-    const list = this.pending(q);
+  count(q, ctx = {}) {
+    const list = this.pending(q, null, ctx);
     return {
       total: list.length, blocker: list.filter((m) => m.level === 'blocker').length, ids: list.map((m) => m.id),
       items: list.map((m) => ({
@@ -776,11 +1040,12 @@ export class Service {
    * project+topic or persona); the message must be in it (403). Order of writes (I5): the reply, the cancelled reply, then
    * the original. A closed source topic of the sender does not stop it (I9): `answer_delivered: false`.
    */
-  resolve(sender, body = {}) {
+  resolve(sender, body = {}, ctx = {}) {
     const { id = null, state = null, text = null, ack = false, cancels = null, thread_id = null, thread_machine = null, wait_for = null } = body;
     const opId = this.checkOpId(body.client_op_id);
     if (!present(id)) throw new HttpError(400, 'zadaj id správy');
-    const mb = this.requireMailbox(body);
+    // An explicit null brain or machine (a queued resolve of a client without one) does not take the flushing client's.
+    const mb = this.requireMailbox(body, { ...ctx, ...(body.brain === null ? { brain: null } : {}), ...(body.machine === null ? { machine: null } : {}) });
     const m = this.store.message(String(id));
     if (!m) throw new HttpError(404, `správa ${id} neexistuje`);
     if (!this.actsForMailbox(m, mb, sender)) throw new HttpError(403, `správa ${id} nie je vo vašej schránke: vybaviť ju smie iba jej príjemca`);
@@ -857,11 +1122,20 @@ export class Service {
     return result;
   }
 
-  /** The reply record (to the original's sender); undeliverable at once when the sender's topic is closed or there is no way back. */
+  /**
+   * The reply record (to the original's sender); undeliverable at once when the sender's topic is closed or there is no way
+   * back. Model 3: the sender's topic is resolveKey() of its key (along moved_to); a sender without a brain (before model 3)
+   * gets the reply only through its old record (moved_to, else brain null), never into a guessed brain (`no-return-path`).
+   */
   makeReply(sender, original, { state, text, thread_id, thread_machine, wait_for, cancels, mb, at }) {
+    const hasTopic = !!(original.from_project && original.from_topic);
+    const back = hasTopic ? this.resolveKey(senderTopicKey(original)) : null;
     const reply = {
       id: newId(), project: original.from_project || null, topic: original.from_topic || null, persona: null, ref_project: null, ref_topic: null,
-      to_thread: original.thread_id || null, level: original.level, text, sender,
+      to_thread: original.thread_id || null,
+      to_brain: back ? back.brain ?? null : original.from_brain ?? null, to_machine: back ? back.machine : original.from_machine ?? null, to_brain_name: back ? back.brain_name || null : null,
+      from_brain: original.to_brain ?? null, from_machine: original.to_machine ?? null,
+      level: original.level, text, sender,
       thread_id: thread_id || mb.thread || null, thread_machine: normalizeMachine(thread_machine),
       from_project: original.project || null, from_topic: original.topic || null, reply_to: original.id, reply_state: state,
       wait_for: present(wait_for) ? String(wait_for) : null, cancels: cancels || null, supersede_key: null,
@@ -869,11 +1143,9 @@ export class Service {
     };
     transition(reply, 'pending', 'resolve', 'thread', { at });
     let why = null;
-    if (!reply.to_thread && !(reply.project && reply.topic)) why = 'no-return-path';
-    else if (reply.project && reply.topic) {
-      const t = this.store.topic(reply.project, reply.topic);
-      if (t && t.state === 'closed') why = 'sender-closed';
-    }
+    if (!reply.to_thread && !hasTopic) why = 'no-return-path';
+    else if (!reply.to_thread && !back && original.from_brain == null) why = 'no-return-path';
+    else if (back && back.state === 'closed') why = 'sender-closed';
     if (why) {
       Object.assign(reply, { undelivered_at: at, undelivered_holder: null, undelivered_reason: why });
       transition(reply, 'undelivered', 'resolve', 'thread', { at });
@@ -904,7 +1176,7 @@ export class Service {
   }
 
   /** State of one message (metadata, status, history); the body only for its sender and its mailbox (1d). */
-  messageState(id, q = {}, sender = null) {
+  messageState(id, q = {}, sender = null, ctx = {}) {
     const m = this.store.message(String(id || ''));
     if (!m) throw new HttpError(404, `správa ${id} neexistuje`);
     const out = {
@@ -913,13 +1185,14 @@ export class Service {
       answer_state: m.answer_state || null, answer_at: m.answer_at || null, answer_id: m.answer_id || null, answer_origin: m.answer_origin || null,
       answer_delivered: m.answer_delivered ?? null, answer_undelivered_reason: m.answer_undelivered_reason || null,
       cancels: m.cancels || null, cancelled_by: m.cancelled_by || null, project: m.project || null, topic: m.topic || null, to: addressOf(m),
+      to_brain: m.to_brain ?? null, to_machine: m.to_machine ?? null, to_brain_name: m.to_brain_name || null, from_brain: m.from_brain ?? null, from_machine: m.from_machine ?? null,
       to_thread: m.to_thread || null, sender: m.sender, thread_id: m.thread_id || null, from_project: m.from_project || null, from_topic: m.from_topic || null,
       created_at: m.created_at, expires_at: m.expires_at || null, expired_at: m.expired_at || null, ttl_s: m.ttl_s || null,
       code_answer: m.code_answer || null, code_answer_at: m.code_answer_at || null, picked_at: m.picked_at || null, picked_by_thread: m.picked_by_thread || null,
       wait_due_at: m.wait_due_at || null, wait_n: m.wait_n ?? null, wait_reason: m.wait_reason || null, wait_rang_at: m.wait_rang_at || null,
       undelivered_at: m.undelivered_at || null, undelivered_holder: m.undelivered_holder || null, undelivered_reason: m.undelivered_reason || null,
     };
-    if (this.mayRead(m, this.mailbox(q), sender)) out.text = m.text;
+    if (this.mayRead(m, this.mailbox(q, ctx), sender)) out.text = m.text;
     return out;
   }
 
@@ -929,30 +1202,47 @@ export class Service {
    * holds, I8), `awaiting` (its own non-final messages), `recent` rows after `since` (rows up to `since` are deleted and
    * the cursor stored), `topics`, `server`.
    */
-  obligations(q = {}) {
+  obligations(q = {}, ctx = {}) {
     const thread = present(q.thread) ? q.thread : null;
     if (thread) requireThread(thread);
-    const boxes = new Set();
+    // Model 3: a mailbox is the full key; `topics` items and `persona` mean the brain and machine of the query (else the
+    // request's; without a machine the brain's open record, I11). The recent rows of a topic are keyed without the machine.
+    const brain = requestBrain(q.brain, ctx);
+    const machineOf = (p, t) => normalizeMachine(present(q.machine) ? q.machine : ctx.machine) || (this.openTopic(brain, p, t) || {}).machine || UNKNOWN_MACHINE;
+    const boxes = new Map();
+    const addBox = (k) => boxes.set(keyText(k), k);
     const project = present(q.project) ? q.project : null;
     if (project) requireName(project, 'project');
     for (const raw of String(q.topics || '').split(',').map((s) => s.trim()).filter(Boolean)) {
       const [p, t] = raw.includes('/') ? raw.split('/') : [project, raw];
       if (!isValidName(p) || !isValidName(t)) throw new HttpError(400, `neplatná téma „${raw}“ v topics (project/topic alebo topic s project)`);
-      boxes.add(`${p}/${t}`);
+      addBox({ brain, machine: machineOf(p, t), project: p, topic: t });
     }
-    if (present(q.persona)) { requireName(q.persona, 'persona'); boxes.add(`${personaProject(q.persona)}/${PERSONA_MAIN_TOPIC}`); }
-    const topicRecs = this.store.topics().filter(Boolean);
-    if (thread) for (const t of topicRecs) if (t.holder === thread && t.state !== 'closed') boxes.add(`${t.project}/${t.topic}`);
+    if (present(q.persona)) {
+      requireName(q.persona, 'persona');
+      const p = personaProject(q.persona);
+      addBox({ brain, machine: machineOf(p, PERSONA_MAIN_TOPIC), project: p, topic: PERSONA_MAIN_TOPIC });
+    }
+    const topicRecs = this.store.topics();
+    if (thread) for (const t of topicRecs) if (t.holder === thread && t.state !== 'closed') addBox(topicKey(t));
     if (!thread && !boxes.size) throw new HttpError(400, 'zadaj thread alebo topics');
-    const inBox = (m) => (thread && m.to_thread === thread) || (m.project && m.topic && boxes.has(`${m.project}/${m.topic}`));
-    const fromMe = (m) => !m.reply_to && ((thread && m.thread_id === thread) || (m.from_project && m.from_topic && boxes.has(`${m.from_project}/${m.from_topic}`)));
+    const inBox = (m) => (thread && m.to_thread === thread) || (m.project && m.topic && boxes.has(keyText(recipientTopicKey(m))));
+    // A sender's topic may have moved since it sent (I11): its key resolves along moved_to (once per key).
+    const senderBox = new Map();
+    const fromBox = (m) => {
+      const k = keyText(senderTopicKey(m));
+      if (boxes.has(k)) return true;
+      if (!senderBox.has(k)) { const rec = this.resolveKey(senderTopicKey(m)); senderBox.set(k, !!rec && boxes.has(keyText(topicKey(rec)))); }
+      return senderBox.get(k);
+    };
+    const fromMe = (m) => !m.reply_to && ((thread && m.thread_id === thread) || (m.from_project && m.from_topic && fromBox(m)));
     const byTime = (a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id);
     const all = this.store.messages();
     const inbox = all.filter((m) => m.status === 'pending' && inBox(m)).sort(byTime);
     const owed = all.filter((m) => (m.status === 'picked' || m.status === 'waiting') && !m.reply_to && m.level !== 'steer' && inBox(m)).sort(byTime);
     const awaiting = all.filter((m) => !isFinal(m.status) && fromMe(m)).sort(byTime);
 
-    const keys = [...(thread ? [thread] : []), ...[...boxes].map((b) => `topic:${b}`)];
+    const keys = [...new Set([...(thread ? [thread] : []), ...[...boxes.values()].map((b) => recentTopicKey(b.brain, b.project, b.topic))])];
     const sinceGiven = q.since != null && q.since !== '';
     const since = sinceGiven ? Number(q.since) : null;
     if (sinceGiven && !Number.isFinite(since)) throw new HttpError(400, 'since musí byť číslo (cursor)');
@@ -979,10 +1269,12 @@ export class Service {
       awaiting: awaiting.map((m) => ({ id: m.id, to: addressOf(m), level: m.level, status: m.status, answer_state: m.answer_state || null, code_answer: m.code_answer || null, wait_due_at: m.wait_due_at || null, wait_n: m.wait_n ?? null, wait_reason: m.wait_reason || null })),
       recent,
       cursor,
-      topics: [...boxes].map((b) => {
-        const [p, t] = b.split('/');
-        const rec = topicRecs.find((x) => x.project === p && x.topic === t);
-        return { project: p, topic: t, registered: !!rec, state: rec ? rec.state || 'open' : null, holder: rec ? rec.holder || null : null, holder_mode: rec ? rec.holder_mode || null : null, closed_at: rec ? rec.closed_at || null : null };
+      topics: [...boxes.values()].map((b) => {
+        const rec = topicRecs.find((x) => sameTopicKey(x, b));
+        return {
+          brain: b.brain, brain_name: rec ? rec.brain_name || null : null, machine: b.machine, project: b.project, topic: b.topic, registered: !!rec, state: rec ? rec.state || 'open' : null,
+          holder: rec ? rec.holder || null : null, holder_mode: rec ? rec.holder_mode || null : null, closed_at: rec ? rec.closed_at || null : null, moved_to: rec && rec.moved_to ? rec.moved_to : null,
+        };
       }),
       server: this.serverInfo(),
     };
@@ -1071,7 +1363,7 @@ export class Service {
   senderHolder(m) {
     if (m.thread_id) return { holder: m.thread_id, holder_machine: m.thread_machine || null, holder_mode: null };
     if (m.from_project && m.from_topic) {
-      const t = this.store.topic(m.from_project, m.from_topic);
+      const t = this.resolveKey(senderTopicKey(m));
       if (t && t.holder) return { holder: t.holder, holder_machine: t.holder_machine || null, holder_mode: t.holder_mode || null };
     }
     return null;
@@ -1115,7 +1407,7 @@ export class Service {
   /** Thread that receives a message: the thread it is addressed to, else the holder of its topic. */
   recipientThread(m) {
     if (m.to_thread) return m.to_thread;
-    const t = m.project && m.topic ? this.store.topic(m.project, m.topic) : null;
+    const t = m.project && m.topic ? this.resolveKey(recipientTopicKey(m)) : null;
     return t && t.holder ? t.holder : null;
   }
 
@@ -1129,7 +1421,7 @@ export class Service {
     const out = [];
     for (const m of this.store.messages((x) => x.status === 'pending')) {
       if (now - Date.parse(m.created_at) < olderMs) continue;
-      const t = m.to_thread ? null : (m.project && m.topic ? this.store.topic(m.project, m.topic) : null);
+      const t = m.to_thread ? null : (m.project && m.topic ? this.resolveKey(recipientTopicKey(m)) : null);
       const orig = m.reply_to && m.to_thread ? this.store.message(m.reply_to) : null;
       out.push({
         type: m.reply_to ? 'reply' : m.level, ...eventBase(m), created_at: m.created_at,
@@ -1193,7 +1485,7 @@ export class Service {
     if (!m) throw new HttpError(404, `správa ${message_id} neexistuje`);
     if (m.status !== 'pending' && m.status !== 'held') return { bounced: false, status: m.status, reason: `status ${m.status}` };
     if (holder && !m.to_thread && m.project && m.topic) {
-      const t = this.store.topic(m.project, m.topic);
+      const t = this.resolveKey(recipientTopicKey(m));
       if (t && t.holder && t.holder !== String(holder)) return { bounced: false, status: m.status, reason: `holder ${t.holder}` };
     }
     this.undeliver(m, 'bounce', { holder, reason: reason || 'cannot receive messages' });
@@ -1214,11 +1506,43 @@ export class Service {
 
   // --- repair (I5) -------------------------------------------------------------------------
   /**
+   * At start: a move stopped between its writes (I11) is finished first: a new record whose source (`moved_from`) is not
+   * yet closed with `moved_to` to it gets the rest of the move; every non-final message whose key points to a record with
+   * `moved_to` goes to the record its key resolves to. Returns the ids moved.
+   */
+  repairMoves() {
+    const out = [];
+    for (const listed of this.store.topics()) {
+      const rec = this.store.topic(listed); // fresh: an earlier repair in this loop may have closed it
+      if (!rec || rec.state === 'closed' || !rec.moved_from) continue;
+      const old = this.store.topic(rec.moved_from);
+      if (!old || old.state === 'closed') continue;
+      // Only toward the newer record: a return move B→A stopped midway leaves B open with its own moved_from A (older
+      // than the new A); finishing "A→B" too would close both records with moved_to pointing at each other.
+      if (!(String(old.updated_at || '') < String(rec.updated_at || ''))) continue;
+      out.push(...this.moveTopicMail(old, rec));
+      this.log(`repair: move ${whereLabel(old)} → ${whereLabel(rec)} finished`);
+    }
+    const target = new Map();
+    for (const m of this.store.messages((x) => !isFinal(x.status) && x.project && x.topic && x.to_machine)) {
+      const k = recipientTopicKey(m);
+      const ks = keyText(k);
+      if (!target.has(ks)) { const r = this.store.topic(k); target.set(ks, r && r.moved_to ? this.resolveKey(k) : null); }
+      const to = target.get(ks);
+      if (!to || sameTopicKey(to, k) || to.state === 'closed') continue;
+      this.moveMessage(m, to);
+      out.push(m.id);
+    }
+    return out;
+  }
+
+  /**
    * At start: a reply is written before its original (I5). An original whose latest reply is not its recorded answer
    * is finished from that reply: answer fields, the transition, its notices, the cancelled reply, the reply event.
-   * Returns the ids repaired.
+   * A move stopped midway is finished before (repairMoves). Returns the ids repaired.
    */
   repair() {
+    const out = this.repairMoves();
     const all = this.store.messages();
     const byId = new Map(all.map((m) => [m.id, m]));
     const replies = new Map();
@@ -1227,7 +1551,6 @@ export class Service {
       if (!replies.has(r.reply_to)) replies.set(r.reply_to, []);
       replies.get(r.reply_to).push(r);
     }
-    const out = [];
     for (const [oid, list] of replies) {
       const o = byId.get(oid);
       if (!o || o.reply_to) continue;
@@ -1271,7 +1594,7 @@ export class Service {
    * of an older turn leaves the current record as it is (`stale: true`). `next` (closed only): the next step left in the
    * handover of the held topic; wake rings the thread to continue it (continuation, P-026).
    */
-  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null, waiting_operator = undefined, discussion = undefined } = {}) {
+  turn({ thread, state = null, machine = null, project = null, topic = null, holder_mode = null, reason = null, attempt = false, opened_at = null, next = null, resume_at = null, waiting_operator = undefined, discussion = undefined, brain = null } = {}, ctx = {}) {
     requireThread(thread);
     const prev = this.store.turn(thread);
     const now = nowIso();
@@ -1304,6 +1627,8 @@ export class Service {
     if (state === 'open') {
       rec = {
         thread, machine: normalizeMachine(machine), project: project || null, topic: topic || null, holder_mode: holder_mode || null,
+        // Model 3: the brain is a label of the turn record, not its identity (the record is the thread).
+        brain: requestBrain(brain, ctx),
         state: 'open', opened_at: now, closed_at: null, close_reason: null, keepalive: { count: 0, last_at: null },
         // The run (one T3 turn of the provider): a prompt steered into the running turn opens without a Stop in between
         // and keeps the run; wake keeps a ring queued behind the run until the next run starts (wake-stale-ring).
@@ -1345,6 +1670,7 @@ export class Service {
     const n = {
       id: newId(), kind, title, state: 'open', ...extra,
       message_id: message.id, project: message.project, topic: message.topic,
+      brain: message.to_brain ?? null, machine: message.to_machine ?? null, where: message.project && message.topic ? whereLabel({ brain: message.to_brain, brain_name: message.to_brain_name, machine: message.to_machine }) : null,
       level: message.level, sender: message.sender, thread_id: message.thread_id,
       options: NOTICE_OPTIONS[kind].map(({ id, label, needsTarget }) => ({ id, label, needs_target: !!needsTarget })),
       created_at: nowIso(), decided_at: null, decision: null, target: null,
@@ -1389,7 +1715,7 @@ export class Service {
   }
 
   /** Operator decision, executed directly by the service; no model involved (P-046). */
-  decide({ notice_id, decision, target = null }) {
+  decide({ notice_id, decision, target = null }, ctx = {}) {
     const n = this.store.notice(notice_id || '');
     if (!n) throw new HttpError(404, `oznam ${notice_id} neexistuje`);
     if (n.state !== 'open') throw new HttpError(409, 'oznam je už rozhodnutý');
@@ -1415,24 +1741,40 @@ export class Service {
         msg.notice_id = null;
         delete msg.private_owner;
         decided();
-        this.toPersonaMain(msg, owner, ref);
+        this.toPersonaMain(msg, owner, ref, null, msg.from_brain ?? null);
         return { notice_id: n.id, decision, delivered_to: { project: personaProject(owner), topic: PERSONA_MAIN_TOPIC } };
       }
-      let dest = { project: msg.project, topic: msg.topic };
-      if (decision === 'redirect') dest = parseTarget(target);
-      const t = this.store.topic(dest.project, dest.topic);
-      if (!t) throw new HttpError(409, `téma ${dest.project}/${dest.topic} nie je zaregistrovaná; pošta tému nezakladá`);
+      // Model 3: `deliver` resolves the sender's address again (resolveAddress, its own brain first); `redirect` resolves the
+      // target `[<brain>[@<machine>]:]<project>/<topic>` from the operator's brain (X-Comms-Brain, usually none).
+      let addr = { ...(msg.address || {}), project: msg.project, topic: msg.topic };
+      let fromBrain = msg.from_brain ?? null;
+      if (decision === 'redirect') { addr = parseTarget(target); fromBrain = requestBrain(null, ctx); }
+      const dest = { project: addr.project, topic: addr.topic };
+      const t = this.resolveAddress(addr, fromBrain).rec;
+      if (!t) throw new HttpError(409, `téma ${dest.project}/${dest.topic}${addr.brain ? ` brainu ${addr.brain}` : ''} nie je zaregistrovaná; pošta tému nezakladá`);
       if (decision === 'redirect') {
-        msg.redirected_from = { project: msg.project, topic: msg.topic };
+        msg.redirected_from = { project: msg.project, topic: msg.topic, brain: msg.to_brain ?? null };
         delete msg.private_owner;
         msg.project = dest.project;
         msg.topic = dest.topic;
       }
+      delete msg.address;
+      setRecipient(msg, t);
       msg.notice_id = null;
       decided();
       this.apply(msg, 'pending', 'decide', 'operator');
       this.afterDelivery(msg);
-      result = { delivered_to: dest };
+      result = { delivered_to: dest, resolved: whereLabel(t) };
+    } else if (n.kind === 'legacy-topic' && decision === 'move') {
+      // The operator moves the mail of the record from before model 3 into the brain's new record.
+      const old = this.store.topic(n.legacy_key);
+      const neu = this.resolveKey(n.new_key);
+      if (!old || old.state === 'closed') throw new HttpError(409, 'staršia téma už nie je otvorená');
+      if (!neu || neu.state === 'closed') throw new HttpError(409, 'nová téma už nie je otvorená');
+      neu.moved_from = topicKey(old);
+      this.store.saveTopic(neu);
+      result = { moved: this.moveTopicMail(old, neu), resolved: whereLabel(neu) };
+      decided();
     } else if (n.kind === 'blocker' || n.kind === 'unregistered-persona' || n.kind === 'unpicked') {
       decided();
       if (decision === 'discard' && msg && msg.status === 'pending') this.apply(msg, 'discarded', 'decide', 'operator');
@@ -1474,12 +1816,72 @@ export function formatDuration(sec) {
   return `${sec}s`;
 }
 
+/** Model 3: events carry the recipient's and the sender's brain and machine; wake counts with these, never with its own. */
 function eventBase(m) {
   return {
-    message_id: m.id, level: m.level, project: m.project, topic: m.topic,
-    sender: m.sender, thread_id: m.thread_id, from_project: m.from_project, from_topic: m.from_topic,
+    message_id: m.id, level: m.level, project: m.project, topic: m.topic, brain: m.to_brain ?? null, machine: m.to_machine ?? null,
+    sender: m.sender, thread_id: m.thread_id, from_project: m.from_project, from_topic: m.from_topic, from_brain: m.from_brain ?? null, from_machine: m.from_machine ?? null,
     text_hash: textHash(m.text),
   };
+}
+
+/** Key of a message's recipient topic (to_brain, to_machine, project, topic). */
+function recipientTopicKey(m) {
+  return { brain: m.to_brain ?? null, machine: m.to_machine ?? null, project: m.project, topic: m.topic };
+}
+
+/** Key of a message's source topic (from_brain, from_machine, from_project, from_topic). */
+function senderTopicKey(m) {
+  return { brain: m.from_brain ?? null, machine: m.from_machine ?? null, project: m.from_project, topic: m.from_topic };
+}
+
+/** Key of the recent rows of a topic: `topic:<brain>/<project>/<topic>` (no machine; brain empty before model 3). */
+function recentTopicKey(brain, project, topic) {
+  return `topic:${brain ?? ''}/${project}/${topic}`;
+}
+
+function keyText(k) {
+  return JSON.stringify([k.brain ?? null, k.machine ?? null, k.project, k.topic]);
+}
+
+/** `<brain_name>@<machine>` of a record (brain id without a name; `-` before model 3). */
+function whereLabel(rec) {
+  return `${rec.brain_name || rec.brain || '-'}@${rec.machine || '?'}`;
+}
+
+/** The message's recipient is this topic record (key and readable brain name); null clears it. */
+function setRecipient(msg, rec) {
+  msg.to_brain = rec ? rec.brain ?? null : null;
+  msg.to_machine = rec ? rec.machine ?? null : null;
+  msg.to_brain_name = rec ? rec.brain_name || null : null;
+}
+
+function byUpdatedDesc(a, b) {
+  return String(b.updated_at || '').localeCompare(String(a.updated_at || ''));
+}
+
+/** 409 for an address that names a topic of more than one brain (nothing is written). */
+function ambiguousError(project, topic, recs) {
+  const list = recs.map((t) => `${t.brain_name || t.brain || '-'} (${t.brain ?? '-'})@${t.machine || '?'}`);
+  return new HttpError(409, `adresa ${project}/${topic} je nejednoznačná: téma je otvorená vo viacerých brainoch (${list.join(', ')}); zadaj brain: <brain>[@<stroj>]:${project}/${topic}`, { ambiguous: list, project, topic });
+}
+
+/** Brain of a request: the body or query value, else X-Comms-Brain; null when none (a sender without a brain). */
+function requestBrain(v, ctx = {}) {
+  if (present(v)) return requireBrainValue(v);
+  return present(ctx.brain) ? requireBrainValue(ctx.brain) : null;
+}
+
+function requireBrainValue(v) {
+  if (!isValidName(String(v))) throw new HttpError(400, 'neplatný brain: povolené sú písmená, číslice, bodka, pomlčka a podčiarkovník');
+  return String(v);
+}
+
+/** Readable brain name (directory name of the brain): a label, not an identity. */
+function brainNameOf(v) {
+  if (!present(v)) return null;
+  const s = String(v).replace(/[\x00-\x1f]/g, '').trim().slice(0, 128);
+  return s || null;
 }
 
 function clearWaitFields(m) {
@@ -1526,15 +1928,23 @@ function requireName(v, field) {
   if (!isValidName(v)) throw new HttpError(400, `neplatné pole ${field}: povolené sú písmená, číslice, bodka, pomlčka a podčiarkovník`);
 }
 
-function parseTarget(target) {
-  const [project, topic] = String(target || '').split('/');
-  if (!isValidName(project) || !isValidName(topic)) throw new HttpError(400, 'cieľ (target) musí byť v tvare project/topic');
-  return { project, topic };
+/** Target of a redirect: `[<brain>[@<machine>]:]<project>/<topic>` (brain = id or brain_name). */
+export function parseTarget(target) {
+  const raw = String(target || '');
+  const colon = raw.lastIndexOf(':');
+  const head = colon >= 0 ? raw.slice(0, colon) : null;
+  const [project, topic, extra] = raw.slice(colon + 1).split('/');
+  const [brain, machine] = head != null ? head.split('@') : [null, null];
+  if (!isValidName(project) || !isValidName(topic) || extra !== undefined || (head != null && !isValidName(brain)) || (machine != null && !normalizeMachine(machine))) {
+    throw new HttpError(400, 'cieľ (target) musí byť v tvare [<brain>[@<stroj>]:]<project>/<topic>');
+  }
+  return { brain: brain || null, machine: machine ? normalizeMachine(machine) : null, project, topic };
 }
 
 export function publicMessage(m) {
   return {
     id: m.id, project: m.project, topic: m.topic, persona: m.persona || null, ref_project: m.ref_project || null, ref_topic: m.ref_topic || null,
+    to_brain: m.to_brain ?? null, to_machine: m.to_machine ?? null, from_brain: m.from_brain ?? null, from_machine: m.from_machine ?? null,
     to_thread: m.to_thread, level: m.level, text: m.text, status: m.status, resolution: m.resolution || null,
     picked_at: m.picked_at || null, picked_by_thread: m.picked_by_thread || null,
     sender: m.sender, thread_id: m.thread_id, from_project: m.from_project, from_topic: m.from_topic,

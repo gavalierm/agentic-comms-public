@@ -1,5 +1,6 @@
-// keep: core (5a, client of mail model 2): the outbox replayed twice is one answer; a service of another model gets
-// nothing written or queued and a flush keeps the outbox; 3c order of a flush; the obligations backup (3b).
+// keep: core (5a, client of mail model 3): the outbox replayed twice is one answer; a service of another model gets
+// nothing written or queued and a flush keeps the outbox; 3c order of a flush (a model 2 item without brain → rejected/);
+// the obligations backup (3b).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,7 +25,7 @@ async function setup(t) {
 }
 
 /** A fake service: /health answers `health`, every other request `status` with `body`. */
-async function fakeService(t, health, status = 426, body = { error: 'mail model 2 (comms 0.5.0) and workflow 1.8.0 go together', model: 3 }) {
+async function fakeService(t, health, status = 426, body = { error: 'mail model 4: update mail and workflow together', model: 4 }) {
   const seen = [];
   const srv = http.createServer((req, res) => {
     seen.push(`${req.method} ${req.url}`);
@@ -75,17 +76,17 @@ test('another model: nothing is written or queued, the client fails loudly, a fl
   assert.equal(jsonFiles(old.client.cfg.outbox).length, 1, 'only the item queued before; nothing moved to rejected/');
   assert.ok(!fs.existsSync(path.join(old.client.cfg.outbox, 'rejected')));
   assert.deepEqual(old.seen.filter((s) => !s.startsWith('GET /health')), [], 'nothing but /health was asked');
-  assert.equal(modelMismatchText(null), 'comms model ? ≠ 2: update mail and workflow together');
+  assert.equal(modelMismatchText(null), 'comms model ? ≠ 3: update mail and workflow together');
 
   // A service that refuses the model with 426: an error, not an outage (no outbox item).
-  const strict = await fakeService(t, { ok: true, instance_id: null, model: 2 });
+  const strict = await fakeService(t, { ok: true, instance_id: null, model: 3 });
   await assert.rejects(strict.client.send({ ...BOX, level: 'assist', text: 'x' }), (e) => e.code === 'MODEL_MISMATCH' && e.status === 426);
   assert.equal(jsonFiles(strict.client.cfg.outbox).length, 0);
 
   // CLI: exit code 3 and the line on stderr.
   const cli = await runCli(['send', '--url', old.url, '--key', 'k', '--data-dir', old.dir, '--client-dir', old.dir, '--outbox', path.join(old.dir, 'cli-outbox'), ...['--project', 'p', '--topic', 't'], '--level', 'assist', '--text', 'x']);
   assert.equal(cli.code, 3, cli.err);
-  assert.match(cli.err, /comms model \? ≠ 2: update mail and workflow together/);
+  assert.match(cli.err, /comms model \? ≠ 3: update mail and workflow together/);
   assert.equal(jsonFiles(path.join(old.dir, 'cli-outbox')).length, 0);
 });
 
@@ -98,12 +99,15 @@ test('flush (3c): 409 with a final status drops the item with `already <resoluti
   recipient.queue('/resolve', { ...BOX, id: a.id, state: 'hotovo', thread: 'thr-b', client_op_id: 'op-late' });
   // A resolve for a mailbox the message is not in: 403.
   recipient.queue('/resolve', { project: 'p', topic: 'other', id: b.id, state: 'hotovo', client_op_id: 'op-other' });
+  // An item queued by a model 2 client (no sender brain): it cannot name its topic, so it goes to rejected/ with its address.
+  fs.writeFileSync(path.join(outbox, '29991231T000000000Z-0000aaaa.json'), JSON.stringify({ path: '/send', body: { ...BOX, level: 'assist', text: 'old', client_op_id: 'op-m2' } }));
   const r = await recipient.flushOutbox();
   assert.deepEqual(r.dropped.map((x) => [x.id, x.resolution]), [[a.id, 'reply']]);
   assert.ok(r.lines.includes(`already reply ${a.id}`));
-  assert.deepEqual(r.rejected.map((x) => x.status), [403]);
+  assert.deepEqual(r.rejected.map((x) => x.status), [403, null]);
+  assert.ok(r.lines.includes('rejected /send p/t (model 2 item without brain)'), r.lines.join('\n'));
   assert.equal(jsonFiles(outbox).length, 0);
-  assert.equal(jsonFiles(path.join(outbox, 'rejected')).filter((f) => !f.endsWith('.error.json')).length, 1);
+  assert.equal(jsonFiles(path.join(outbox, 'rejected')).filter((f) => !f.endsWith('.error.json')).length, 2);
   assert.equal(readMsg(inst, b.id).status, 'picked', 'the refused resolve changed nothing');
 });
 

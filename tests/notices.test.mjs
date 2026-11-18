@@ -142,10 +142,10 @@ test('TCP listener requires the bearer key and the model header; HTML page avail
   assert.ok(port > 0);
   assert.equal(a.store.serverInfo().tcp.port, port);
   const url = `http://127.0.0.1:${port}`;
-  const model = { 'X-Comms-Model': '2' };
+  const model = { 'X-Comms-Model': '3' };
 
   const health = await (await fetch(`${url}/health`)).json();
-  assert.deepEqual([health.instance_id, health.model], [a.instanceId, 2]);
+  assert.deepEqual([health.instance_id, health.model], [a.instanceId, 3]);
   const anon = await fetch(`${url}/notices`, { headers: model });
   assert.equal(anon.status, 401);
   const noModel = await fetch(`${url}/notices`, { headers: { Authorization: `Bearer ${a.key}` } });
@@ -170,9 +170,9 @@ test('TCP listener requires the bearer key and model 2; HTML page available over
 
   const health = await fetch(`${url}/health`);
   assert.equal((await health.json()).instance_id, a.instanceId);
-  const anon = await fetch(`${url}/notices`, { headers: { 'X-Comms-Model': '2' } });
+  const anon = await fetch(`${url}/notices`, { headers: { 'X-Comms-Model': '3' } });
   assert.equal(anon.status, 401);
-  const authed = await fetch(`${url}/notices`, { headers: { 'X-Comms-Model': '2', Authorization: `Bearer ${a.key}` } });
+  const authed = await fetch(`${url}/notices`, { headers: { 'X-Comms-Model': '3', Authorization: `Bearer ${a.key}` } });
   assert.equal(authed.status, 200);
   const page = await fetch(`${url}/?key=${encodeURIComponent(a.key)}`);
   assert.equal(page.status, 200);

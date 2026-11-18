@@ -16,7 +16,7 @@ const BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
 
 function cli(args, env = {}) {
   const r = spawnSync(process.execPath, [BIN, ...args], {
-    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, COMMS_SELF_RESTART: '0', ...env },
+    encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, COMMS_SELF_RESTART: '0', COMMS_BRAIN: 'brain-test', ...env },
   });
   return { code: r.status, out: r.stdout, err: r.stderr, json: tryJson(r.stdout) };
 }
@@ -268,7 +268,7 @@ test('count keeps ids for an outage', async (t) => {
 
 test('client: a 2xx answer that is not JSON is an error (BAD_RESPONSE); the outbox item is kept', async (t) => {
   const srv = http.createServer((req, res) => {
-    if (req.url === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, instance_id: null, model: 2 })); }
+    if (req.url === '/health') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ ok: true, instance_id: null, model: 3 })); }
     res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>proxy page</html>');
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));

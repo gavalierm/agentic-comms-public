@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { readJson, writeJson, listJsonFiles, newSecret, nowIso, isValidThread, HttpError } from '../common/util.mjs';
 import { DATA_SCHEMA } from './lifecycle.mjs';
 
@@ -109,31 +109,33 @@ export class Store {
   }
 
   // --- topics ----------------------------------------------------------------
-  topicFile(project, topic) {
-    return path.join(this.dirs.topics, `${project}__${topic}.json`);
+  /**
+   * File of a topic key (model 3): `topics/<sha1 of brain, machine, project, topic; 16 hex>.json`. The names joined with
+   * `__` are not unique, so the identity is the content: a record with other fields is another topic.
+   */
+  topicFile(key) {
+    return path.join(this.dirs.topics, `${topicHash(key)}.json`);
   }
 
-  /** The stored topic, or null. `${project}__${topic}` is not unique (`a`/`x__y` and `a__x`/`y`): another topic's record is no answer. */
-  topic(project, topic) {
-    const rec = readJson(this.topicFile(project, topic), null);
-    if (!rec) return null;
-    // Records without the names (old data) are read as they are; a record with other names is another topic.
-    const same = (stored, asked) => stored == null || stored === asked;
-    return same(rec.project, project) && same(rec.topic, topic) ? rec : null;
+  /** The stored topic of a full key `{brain, machine, project, topic}` (brain null = a record from before model 3), or null. */
+  topic(key) {
+    if (!key || !key.project || !key.topic || !key.machine) return null;
+    const rec = readJson(this.topicFile(key), null);
+    return rec && sameTopicKey(rec, key) ? rec : null;
   }
 
-  /** Refuses (409) to overwrite the file of a different project/topic. */
+  /** Refuses (409) to overwrite the file of another key (all four fields are compared). */
   saveTopic(rec) {
-    const file = this.topicFile(rec.project, rec.topic);
+    const file = this.topicFile(rec);
     const other = readJson(file, null);
-    if (other && (other.project !== rec.project || other.topic !== rec.topic) && (other.project != null || other.topic != null)) {
-      throw new HttpError(409, `téma ${rec.project}/${rec.topic} koliduje so súborom témy ${other.project}/${other.topic}; registrácia zamietnutá`);
+    if (other && !sameTopicKey(other, rec)) {
+      throw new HttpError(409, `téma ${topicKeyText(rec)} koliduje so súborom témy ${topicKeyText(other)}; registrácia zamietnutá`);
     }
     writeJson(file, rec);
   }
 
   topics() {
-    return listJsonFiles(this.dirs.topics).map((f) => readJson(path.join(this.dirs.topics, f)));
+    return listJsonFiles(this.dirs.topics).map((f) => readJson(path.join(this.dirs.topics, f), null)).filter(Boolean);
   }
 
   // --- messages ----------------------------------------------------------------
@@ -211,7 +213,7 @@ export class Store {
   }
 
   // --- per-thread records (recent rows and their cursor, section 2) ------------------------
-  /** `key` is a thread id or `topic:<project>/<topic>` (a sender without a thread); the name is URI-encoded. */
+  /** `key` is a thread id or `topic:<brain>/<project>/<topic>` (a sender without a thread; brain empty before model 3); the name is URI-encoded. */
   threadFile(key) {
     return path.join(this.dirs.threads, `${encodeURIComponent(key)}.json`);
   }
@@ -222,6 +224,10 @@ export class Store {
 
   saveThreadRecord(rec) {
     writeJson(this.threadFile(rec.key), rec);
+  }
+
+  removeThreadRecord(key) {
+    try { fs.unlinkSync(this.threadFile(key)); } catch { /* gone */ }
   }
 
   // --- wake events ----------------------------------------------------------------
@@ -244,6 +250,24 @@ export class Store {
     }
     return out;
   }
+}
+
+/** The key of a topic record or address: brain (null before model 3), machine, project, topic. */
+export function topicKey(rec) {
+  return { brain: rec.brain ?? null, machine: rec.machine ?? null, project: rec.project, topic: rec.topic };
+}
+
+export function sameTopicKey(a, b) {
+  return (a.brain ?? null) === (b.brain ?? null) && (a.machine ?? null) === (b.machine ?? null) && a.project === b.project && a.topic === b.topic;
+}
+
+export function topicKeyText(k) {
+  return `${k.brain ?? '-'}@${k.machine ?? '?'}:${k.project}/${k.topic}`;
+}
+
+/** 16 hex chars of sha1 over the JSON of the four fields (unambiguous, unlike names joined with a separator). */
+export function topicHash(key) {
+  return createHash('sha1').update(JSON.stringify([key.brain ?? null, key.machine ?? null, key.project, key.topic]), 'utf8').digest('hex').slice(0, 16);
 }
 
 function safeUser() {

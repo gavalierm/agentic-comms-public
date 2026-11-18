@@ -14,7 +14,7 @@ const WAKE_BIN = fileURLToPath(new URL('../bin/wake.mjs', import.meta.url));
 const COMMS_BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
 const tryJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
 const node = (bin, args, env = {}) => {
-  const r = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, COMMS_SELF_RESTART: '0', ...env } });
+  const r = spawnSync(process.execPath, [bin, ...args], { encoding: 'utf8', env: { PATH: process.env.PATH, HOME: process.env.HOME, COMMS_SELF_RESTART: '0', COMMS_BRAIN: 'brain-test', ...env } });
   return { code: r.status, out: r.stdout, err: r.stderr, json: tryJson(r.stdout) };
 };
 
@@ -182,5 +182,5 @@ test('obligations carries the wake status like count: no field before wake ever 
   fs.writeFileSync(lockFile(stateDir), JSON.stringify({ pid: process.pid, started_at: now, heartbeat_at: now }));
   const o2 = ob();
   assert.deepEqual(o2.json.wake, { running: true, pid: process.pid, heartbeat_at: now });
-  assert.equal(o2.json.server.model, 2, 'the rest of the answer is the service\'s');
+  assert.equal(o2.json.server.model, 3, 'the rest of the answer is the service\'s');
 });

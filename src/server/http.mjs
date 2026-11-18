@@ -1,8 +1,10 @@
 // HTTP routing and authentication. Every route except /health requires a key
 // (Authorization: Bearer, ?key=, or cookie comms_key). The sender is always
 // derived from the key, never from the request body (P-041, P-047).
-// Every API request carries X-Comms-Model: 2 (mail model 2, D-0089); another or no value is 426 (I10).
-import { HttpError } from '../common/util.mjs';
+// Every API request carries X-Comms-Model: 3 (mail model 3); another or no value is 426 (I10).
+// Model 3: X-Comms-Brain, X-Comms-Brain-Name and X-Comms-Machine name the caller's brain and machine (the request context);
+// a mailbox query's `brain` and `machine` parameters override them.
+import { HttpError, normalizeMachine } from '../common/util.mjs';
 import { renderPage, renderError } from './page.mjs';
 import { MAIL_MODEL, MODEL_MISMATCH_TEXT } from './lifecycle.mjs';
 
@@ -32,6 +34,7 @@ export function createHandler(service, store) {
       }
 
       service.noteClient(sender, req.headers);
+      const ctx = ctxOf(req);
       const route = `${req.method} ${url.pathname}`;
       switch (route) {
         case 'GET /': {
@@ -44,22 +47,22 @@ export function createHandler(service, store) {
           return sendHtml(res, 200, renderPage({ instance: service.instance, notices, pending, key: url.searchParams.get('key'), showAll }));
         }
         case 'POST /send':
-          return sendJson(res, 200, service.send(sender, body));
+          return sendJson(res, 200, service.send(sender, body, ctx));
         case 'GET /receive': {
           const id = url.searchParams.get('id');
-          if (id) return sendJson(res, 200, { messages: [service.receiveOne(id, queryOf(url), sender)] });
-          return sendJson(res, 200, { messages: service.receive(queryOf(url)) });
+          if (id) return sendJson(res, 200, { messages: [service.receiveOne(id, queryOf(url), sender, ctx)] });
+          return sendJson(res, 200, { messages: service.receive(queryOf(url), ctx) });
         }
         case 'GET /count':
-          return sendJson(res, 200, service.count(queryOf(url)));
+          return sendJson(res, 200, service.count(queryOf(url), ctx));
         case 'POST /resolve':
-          return sendJson(res, 200, service.resolve(sender, body));
+          return sendJson(res, 200, service.resolve(sender, body, ctx));
         case 'POST /withdraw':
           return sendJson(res, 200, service.withdraw(sender, body));
         case 'GET /obligations': {
           const p = url.searchParams;
           if (p.get('due') === '1') return sendJson(res, 200, service.due(sender));
-          return sendJson(res, 200, service.obligations({ thread: p.get('thread'), topics: p.get('topics'), project: p.get('project'), persona: p.get('persona'), since: p.get('since') }));
+          return sendJson(res, 200, service.obligations({ thread: p.get('thread'), topics: p.get('topics'), project: p.get('project'), persona: p.get('persona'), brain: p.get('brain'), machine: p.get('machine'), since: p.get('since') }, ctx));
         }
         case 'GET /unpicked':
           return sendJson(res, 200, { events: service.unpicked({ olderMs: Number.parseInt(url.searchParams.get('older_ms') || '0', 10) || 0 }) });
@@ -72,7 +75,7 @@ export function createHandler(service, store) {
         case 'POST /decide': {
           const isForm = body.__form === true;
           try {
-            const out = service.decide(body);
+            const out = service.decide(body, ctx);
             if (isForm) return redirect(res, body.key ? `/?key=${encodeURIComponent(body.key)}` : '/');
             return sendJson(res, 200, out);
           } catch (e) {
@@ -81,13 +84,13 @@ export function createHandler(service, store) {
           }
         }
         case 'POST /register-topic':
-          return sendJson(res, 200, service.registerTopic(body, sender));
+          return sendJson(res, 200, service.registerTopic(body, sender, ctx));
         case 'GET /message':
-          return sendJson(res, 200, service.messageState(url.searchParams.get('id'), queryOf(url), sender));
+          return sendJson(res, 200, service.messageState(url.searchParams.get('id'), queryOf(url), sender, ctx));
         case 'POST /bounce':
           return sendJson(res, 200, service.bounce(body));
         case 'POST /turn':
-          return sendJson(res, 200, service.turn(body));
+          return sendJson(res, 200, service.turn(body, ctx));
         case 'GET /turns':
           return sendJson(res, 200, { turns: service.turns({ open: url.searchParams.get('open') === '1' }) });
         case 'GET /clients':
@@ -116,7 +119,13 @@ export function createHandler(service, store) {
 function queryOf(url) {
   const p = url.searchParams;
   const ids = p.get('ids') ? p.get('ids').split(',').filter(Boolean) : null;
-  return { project: p.get('project') || null, topic: p.get('topic') || null, thread: p.get('thread') || null, persona: p.get('persona') || null, ids };
+  return { project: p.get('project') || null, topic: p.get('topic') || null, thread: p.get('thread') || null, persona: p.get('persona') || null, brain: p.has('brain') ? p.get('brain') : null, machine: p.has('machine') ? p.get('machine') : null, ids };
+}
+
+/** Request context (model 3): the caller's brain, its readable name and machine from the headers; absent → null. */
+function ctxOf(req) {
+  const h = (k) => { const v = req.headers[k]; return v == null || String(v).trim() === '' ? null : String(v).trim(); };
+  return { brain: h('x-comms-brain'), brain_name: h('x-comms-brain-name'), machine: normalizeMachine(h('x-comms-machine')) };
 }
 
 function findKey(req, url) {

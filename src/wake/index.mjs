@@ -159,15 +159,18 @@ export function dueText(item) {
   return `${NO_REPLY_TEMPLATE} ${item.id}`;
 }
 
-/** Address of one side of an exchange: topic, else thread, else sender. */
-export function endpoint(project, topic, thread, sender) {
-  if (project && topic) return `${project}/${topic}`;
+/**
+ * Address of one side of an exchange: topic `<brain>/<project>/<topic>` (model 3; no machine, so a moved topic keeps its
+ * limit window; `-` for a topic from before model 3), else thread, else sender.
+ */
+export function endpoint(brain, project, topic, thread, sender) {
+  if (project && topic) return `${brain || '-'}/${project}/${topic}`;
   if (thread) return `thread:${thread}`;
   return `sender:${sender || '?'}`;
 }
 
-export function sourceOf(ev) { return endpoint(ev.from_project, ev.from_topic, ev.thread_id, ev.sender); }
-export function targetOf(ev) { return endpoint(ev.project, ev.topic, ev.holder, null); }
+export function sourceOf(ev) { return endpoint(ev.from_brain, ev.from_project, ev.from_topic, ev.thread_id, ev.sender); }
+export function targetOf(ev) { return endpoint(ev.brain, ev.project, ev.topic, ev.holder, null); }
 
 /** Unordered pair of topics (both directions share the hourly limit). */
 export function pairKey(ev) {
@@ -290,7 +293,9 @@ export class Waker {
     // ring; the bell turn would find no new mail and the workflow hook would block its prompt (wake-picked-check 2026-11-14).
     {
       const q = { thread: String(ev.holder) };
-      if (ev.project && ev.topic) { q.project = ev.project; q.topic = ev.topic; }
+      // Model 3: the mailbox is the event's brain and machine, never this wake's (its client sends no brain).
+      // Empty when the event has none: exactly that key, not the header of this wake.
+      if (ev.project && ev.topic) { q.project = ev.project; q.topic = ev.topic; q.brain = ev.brain || ''; q.machine = ev.machine || ''; }
       try {
         const c = await this.client.pendingMail(q);
         if (!c.total) {
@@ -587,6 +592,11 @@ export class Waker {
           // Only a message still in the inbox (pending) is rung; picked, answered, withdrawn or undelivered is not.
           if (st.status !== 'pending') {
             this.log(`held ${ev.message_id}: ${st.status}${st.resolution ? `/${st.resolution}` : ''}; nezvoní sa`);
+            continue;
+          }
+          // Model 3: the topic moved to another machine (I11); the move's event rings the new holder there.
+          if (st.to_machine && ev.machine && st.to_machine !== ev.machine) {
+            this.log(`held ${ev.message_id}: téma sa presunula na stroj ${st.to_machine}; nezvoní sa`);
             continue;
           }
         } catch (e) {
@@ -1266,7 +1276,10 @@ export function ensureKey(cfg) {
 
 export function createWaker(cfg, { log = () => {}, now } = {}) {
   ensureKey(cfg);
-  const client = new Client(cfg.comms);
+  // Model 3: wake has no brain of its own; a count asks the event's brain and machine (an event of a topic from before
+  // model 3 has none, and no header may fill it in).
+  const comms = { ...cfg.comms, brain: null, brainName: null };
+  const client = new Client(comms);
   const adapter = createAdapter(cfg);
   const keepaliveSince = cfg.keepaliveSinceCommand ? () => readSince(cfg.keepaliveSinceCommand) : null;
   return new Waker({
@@ -1274,7 +1287,7 @@ export function createWaker(cfg, { log = () => {}, now } = {}) {
     limitPerHour: cfg.limitPerHour, stopOnRepeat: cfg.stopOnRepeat, maxEventAgeMs: cfg.maxEventAgeMs, waitMs: cfg.waitMs, reconnectMs: cfg.reconnectMs,
     remindAfterMs: cfg.remindAfterMs, remindMax: cfg.remindMax,
     machine: cfg.machine,
-    keepaliveSince, keepaliveClient: keepaliveSince ? new Client(cfg.comms) : null, keepaliveIntervalMs: cfg.keepaliveIntervalMs,
+    keepaliveSince, keepaliveClient: keepaliveSince ? new Client(comms) : null, keepaliveIntervalMs: cfg.keepaliveIntervalMs,
     jobs: cfg.jobs || [],
   });
 }

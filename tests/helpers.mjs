@@ -7,6 +7,7 @@ import { Store } from '../src/server/store.mjs';
 import { startServer } from '../src/server/index.mjs';
 import { Client, resolveConfig } from '../src/client/index.mjs';
 import { socketPath } from '../src/common/paths.mjs';
+import { normalizeMachine } from '../src/common/util.mjs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -15,6 +16,10 @@ const COMMS_BIN = fileURLToPath(new URL('../bin/comms.mjs', import.meta.url));
 // COMMS_TEST_TMP moves the temporary instances elsewhere (e.g. a scratch directory).
 const TMP = process.env.COMMS_TEST_TMP || (fs.existsSync('/tmp') ? '/tmp' : os.tmpdir());
 const CLEAN_ENV = { HOME: os.homedir(), PATH: process.env.PATH };
+/** Brain of the tests' clients and raw requests (model 3: a topic is brain + machine + project + topic). */
+export const TEST_BRAIN = 'brain-test';
+/** Machine the tests' clients and CLI runs name by default (the host name, as the client resolves it). */
+export const LOCAL_MACHINE = normalizeMachine(os.hostname());
 
 export function tmpDir(prefix = 'comms-test-') {
   return fs.mkdtempSync(path.join(TMP, prefix));
@@ -35,7 +40,7 @@ export async function startInstance(inst, extra = {}) {
 }
 
 export function makeClient(inst, overrides = {}) {
-  const cfg = resolveConfig({ dataDir: inst.dir, key: inst.key, noStart: true, ...overrides }, CLEAN_ENV);
+  const cfg = resolveConfig({ dataDir: inst.dir, key: inst.key, noStart: true, brain: TEST_BRAIN, ...overrides }, CLEAN_ENV);
   return new Client(cfg);
 }
 
@@ -64,13 +69,14 @@ export function rawRequest(sock, method, pathname, { body, headers = {} } = {}) 
 function tryJson(s) { try { return JSON.parse(s); } catch { return null; } }
 
 /**
- * Mail model 2 API over the socket, raw HTTP without the client (server tests).
- * `call(method, path, body?)` → { status, json }; every request carries X-Comms-Model: 2 and the key.
+ * Mail model 3 API over the socket, raw HTTP without the client (server tests).
+ * `call(method, path, body?)` → { status, json }; every request carries X-Comms-Model: 3, the key and X-Comms-Brain
+ * (TEST_BRAIN; a header '' sends none); `extra` headers go with every request (another brain or machine).
  * Helpers return the JSON and throw on a status other than `expect` (default 2xx).
  */
-export function api(inst, key = inst.key) {
+export function api(inst, key = inst.key, extra = {}) {
   const call = (method, pathname, body, headers = {}) => rawRequest(inst.socket, method, pathname, {
-    body, headers: { Authorization: `Bearer ${key}`, 'X-Comms-Model': '2', ...headers },
+    body, headers: { Authorization: `Bearer ${key}`, 'X-Comms-Model': '3', 'X-Comms-Brain': TEST_BRAIN, ...extra, ...headers },
   });
   const ok = async (p, expect) => {
     const r = await p;
@@ -130,7 +136,7 @@ export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export function runCli(args, { env = {}, timeout = 15000 } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [COMMS_BIN, ...args], {
-      env: { PATH: process.env.PATH, HOME: process.env.HOME, COMMS_SELF_RESTART: '0', ...env }, stdio: ['ignore', 'pipe', 'pipe'],
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, COMMS_SELF_RESTART: '0', COMMS_BRAIN: TEST_BRAIN, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
     let err = '';

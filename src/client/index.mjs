@@ -1,7 +1,9 @@
-// Client core of mail model 2: http.request over socketPath (or an http:// / https:// URL), instance_id and model check, start-on-demand,
+// Client core of mail model 3: http.request over socketPath (or an http:// / https:// URL), instance_id and model check, start-on-demand,
 // outbox for outages (writes with client_op_id), obligations with an offline backup, message count.
-// Model (4a, I10): every request carries X-Comms-Model: 2; a service of another model (/health, 426) fails loudly and
+// Model (4a, I10): every request carries X-Comms-Model: 3; a service of another model (/health, 426) fails loudly and
 // nothing is written or queued. The outbox is only for an unavailable service (P-041).
+// Model 3: a topic is brain + machine + project + topic; every request names this client's brain (X-Comms-Brain,
+// X-Comms-Brain-Name; COMMS_BRAIN, COMMS_BRAIN_NAME) and machine (X-Comms-Machine; COMMS_MACHINE).
 import http from 'node:http';
 import https from 'node:https';
 import fs from 'node:fs';
@@ -16,10 +18,12 @@ export const DEFAULT_TIMEOUT = 2000;
 export const COUNT_TTL = 60_000;
 /** Turn records (`turn`) give up quickly; only a `closed` record is queued on outage. */
 export const TURN_TIMEOUT = 1000;
-/** Mail model this client speaks (D-0087, D-0089); the service must report the same in /health. */
-export const MAIL_MODEL = 2;
+/** Mail model this client speaks (model 3: topic = brain + machine + project + topic); the service must report the same in /health. */
+export const MAIL_MODEL = 3;
 /** Writes that go into the outbox on outage; each carries a client_op_id (the service replays a repeated one). */
 export const OUTBOX_OPS = ['/send', '/resolve', '/withdraw'];
+/** Query parameters sent also when empty (model 3: an explicit mailbox key without brain or machine). */
+const KEEP_EMPTY = ['brain', 'machine'];
 const BIN = fileURLToPath(new URL('../../bin/comms.mjs', import.meta.url));
 /** Version of this mail client (package.json); sent with every request so the service records which client a machine runs. */
 export const CLIENT_VERSION = readJson(fileURLToPath(new URL('../../package.json', import.meta.url)), {}).version || null;
@@ -58,6 +62,10 @@ export function resolveConfig(opts = {}, env = process.env) {
     threadId: opts.thread || env.COMMS_THREAD_ID || cfg.thread_id || env.T3CODE_THREAD_ID || null,
     // Machine of this client's threads: wake modules ring only holders on their own machine.
     machine: normalizeMachine(opts.machine || env.COMMS_MACHINE || cfg.machine || os.hostname()),
+    // Brain of this client's topics (model 3): its id (policy.json brain_id of the workflow) and readable name; none for a
+    // thread without a brain (the maintainer).
+    brain: opts.brain || env.COMMS_BRAIN || cfg.brain || null,
+    brainName: opts.brainName || env.COMMS_BRAIN_NAME || cfg.brain_name || null,
     // Version of the workflow that calls this client (the workflow sets COMMS_WORKFLOW_VERSION); recorded by the service.
     workflowVersion: opts.workflowVersion || env.COMMS_WORKFLOW_VERSION || cfg.workflow_version || null,
     outbox: opts.outbox || env.COMMS_OUTBOX || cfg.outbox || path.join(cdir, 'outbox'),
@@ -84,7 +92,8 @@ export class Client {
    * 4xx/5xx, BAD_RESPONSE on a 2xx whose body is not JSON. Every call has its own timeout (default cfg.timeout).
    */
   request(method, pathname, { body, query, auth = true, timeout = this.cfg.timeout } = {}) {
-    const q = query ? '?' + new URLSearchParams(Object.entries(query).filter(([, v]) => v != null && v !== '')).toString() : '';
+    // An empty `brain` / `machine` is kept: it asks for a mailbox key without them (wake, an event of such a key).
+    const q = query ? '?' + new URLSearchParams(Object.entries(query).filter(([k, v]) => v != null && (v !== '' || KEEP_EMPTY.includes(k)))).toString() : '';
     let target;
     let transport = http;
     if (this.cfg.url) {
@@ -286,8 +295,24 @@ export class Client {
   queue(pathname, body) {
     // The name sorts by time (newId starts with it), so a flush keeps the order of the writes.
     const file = path.join(this.cfg.outbox, `${newId()}.json`);
-    writeJson(file, { path: pathname, body, queued_at: nowIso() });
+    writeJson(file, { path: pathname, body: OUTBOX_OPS.includes(pathname) ? this.withBrain(pathname, body) : body, queued_at: nowIso() });
     return file;
+  }
+
+  /**
+   * Model 3: a queued write carries the sender's brain and machine of the moment it was queued (a flush after a change of
+   * the configuration still sends them); a resolve also its mailbox's brain and machine. The target brain of a send is its `brain`.
+   */
+  withBrain(pathname, body) {
+    return {
+      ...body,
+      from_brain: body.from_brain !== undefined ? body.from_brain : this.cfg.brain || null,
+      from_machine: body.from_machine !== undefined ? body.from_machine : this.cfg.machine || null,
+      ...(pathname === '/resolve' ? {
+        brain: body.brain !== undefined ? body.brain : this.cfg.brain || null,
+        machine: body.machine !== undefined ? body.machine : this.cfg.machine || null,
+      } : {}),
+    };
   }
 
   /** Queued items in order: [{ file, item }] (an unreadable file is removed). */
@@ -315,6 +340,17 @@ export class Client {
     for (let i = 0; i < items.length; i++) {
       const { file: f, item } = items[i];
       const full = path.join(this.cfg.outbox, f);
+      // An item of model 2 (queued without the sender's brain) cannot name its topic: it goes to rejected/ with its address.
+      if (OUTBOX_OPS.includes(item.path) && !(item.body && 'from_brain' in item.body)) {
+        const dir = path.join(this.cfg.outbox, 'rejected');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.renameSync(full, path.join(dir, f));
+        const error = 'model 2 item without brain';
+        writeJson(path.join(dir, `${f}.error.json`), { error, status: null, details: null, at: nowIso() });
+        out.rejected.push({ file: f, path: item.path, status: null, error });
+        out.lines.push(`rejected ${item.path} ${itemAddress(item.body)} (${error})`.replace(/\s+/g, ' '));
+        continue;
+      }
       try {
         const res = await this.request('POST', item.path, { body: item.body });
         fs.unlinkSync(full);
@@ -356,7 +392,7 @@ export class Client {
    * Another model throws (nothing is read).
    */
   async obligations(q = {}, now = Date.now()) {
-    const key = ['thread', 'topics', 'project', 'persona'].map((k) => q[k] || '').join('|');
+    const key = [...['thread', 'topics', 'project', 'persona'].map((k) => q[k] || ''), q.brain || this.cfg.brain || '', q.machine || this.cfg.machine || ''].join('|');
     const cache = readJson(this.obligationsCacheFile(), {});
     try {
       await this.ensureRunning();
@@ -395,7 +431,7 @@ export class Client {
    * outage: no new attempt before 60 s; `first_report` marks the first failure of a window.
    */
   async count(q, now = Date.now()) {
-    const key = `${q.project || ''}/${q.topic || ''}/${q.thread || ''}/${q.persona || ''}`;
+    const key = `${q.brain || this.cfg.brain || ''}/${q.machine || this.cfg.machine || ''}/${q.project || ''}/${q.topic || ''}/${q.thread || ''}/${q.persona || ''}`;
     const cache = readJson(this.cacheFile(), {});
     const entry = cache[key] || {};
     if (entry.failed_at && now - entry.failed_at < COUNT_TTL) {
@@ -415,7 +451,7 @@ export class Client {
   }
 }
 
-/** Final statuses of model 2 (1a): a 409 with one of them means the queued operation already happened another way. */
+/** Final statuses (1a): a 409 with one of them means the queued operation already happened another way. */
 export const FINAL_STATUSES = ['done', 'discarded', 'superseded', 'undelivered'];
 
 /** Headers naming the client version, workflow version and machine. */
@@ -440,7 +476,18 @@ export function versionHeaders(cfg) {
   if (CLIENT_VERSION) h['X-Comms-Client'] = clean(CLIENT_VERSION);
   if (cfg.workflowVersion) h['X-Workflow-Version'] = clean(cfg.workflowVersion);
   if (cfg.machine) h['X-Comms-Machine'] = clean(cfg.machine);
+  if (cfg.brain) h['X-Comms-Brain'] = clean(cfg.brain);
+  if (cfg.brainName) h['X-Comms-Brain-Name'] = clean(cfg.brainName);
   return h;
+}
+
+/** Address of a queued item for the output line: its topic, persona, thread or message id. */
+function itemAddress(b = {}) {
+  if (b.project && b.topic) return `${b.brain ? `${b.brain}:` : ''}${b.project}/${b.topic}`;
+  if (b.persona) return `@${b.persona}`;
+  if (b.to_thread) return `thread/${b.to_thread}`;
+  if (b.maintainer) return 'maintainer';
+  return b.id || '';
 }
 
 function sleep(ms) {

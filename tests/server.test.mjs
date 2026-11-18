@@ -341,7 +341,7 @@ test('turns: POST /turn open|closed|attempt, GET /turns?open=1; turn-interrupted
   await c.turn({ thread: 'thr-2', state: 'closed' });
   const open = await turns(true);
   assert.deepEqual(open.map((x) => x.thread), ['thr-1']);
-  assert.deepEqual(Object.keys(open[0]).sort(), ['close_reason', 'closed_at', 'holder_mode', 'keepalive', 'machine', 'opened_at', 'project', 'run_at', 'state', 'thread', 'topic']);
+  assert.deepEqual(Object.keys(open[0]).sort(), ['brain', 'close_reason', 'closed_at', 'holder_mode', 'keepalive', 'machine', 'opened_at', 'project', 'run_at', 'state', 'thread', 'topic']);
   assert.equal((await turns(false)).length, 2);
 
   const at = await c.turn({ thread: 'thr-1', attempt: true });
@@ -416,17 +416,18 @@ test('register-topic: fields not passed keep their stored values', async (t) => 
   assert.deepEqual([t2.topic.holder, t2.topic.holder_mode, t2.topic.holder_machine, t2.topic.subject], ['thr-2', null, null, 'Old']);
 });
 
-test('register-topic: "a"/"x__y" and "a__x"/"y" (same file name) do not share a record; the foreign topic is refused, not overwritten', async (t) => {
+test('register-topic: "a"/"x__y" and "a__x"/"y" do not share a record (model 3: the file is the sha1 of the whole key)', async (t) => {
   const { a, c } = await serviceUp(t);
+  const k = (project, topic) => ({ brain: 'brain-test', machine: 'unknown', project, topic });
   await c.register({ project: 'a', topic: 'x__y', subject: 'One' });
-  assert.equal(a.store.topicFile('a', 'x__y'), a.store.topicFile('a__x', 'y'), 'the premise: both names map to one file');
-  assert.equal(a.store.topic('a__x', 'y'), null);
-  assert.equal((await c.call('POST', '/register-topic', { project: 'a__x', topic: 'y', subject: 'Two' })).status, 409);
-  assert.equal(a.store.topic('a', 'x__y').subject, 'One');
+  assert.notEqual(a.store.topicFile(k('a', 'x__y')), a.store.topicFile(k('a__x', 'y')));
+  assert.equal(a.store.topic(k('a__x', 'y')), null);
   // A message to the unregistered name is held, not delivered into the other topic.
   const sent = await c.send({ project: 'a__x', topic: 'y', level: 'assist', text: 'x' });
   assert.equal(sent.status, 'held');
   assert.equal((await c.receive({ project: 'a', topic: 'x__y' })).length, 0);
+  await c.register({ project: 'a__x', topic: 'y', subject: 'Two' });
+  assert.deepEqual([a.store.topic(k('a', 'x__y')).subject, a.store.topic(k('a__x', 'y')).subject], ['One', 'Two']);
 });
 
 test('send: reply_to, reply_state and cancels are 400 (a reply goes through resolve); resolve of an unknown id is 404 naming it', async (t) => {
@@ -608,13 +609,13 @@ test('decide redirect refuses an expired held message like deliver; a private de
 
 // --- client and CLI ------------------------------------------------------------------------------------
 
-test('health returns instance_id and model 2; client rejects a different instance', async (t) => {
+test('health returns instance_id and model 3; client rejects a different instance', async (t) => {
   const { a, sa } = await serviceUp(t);
 
   const h = await makeClient(a).ensureRunning();
   assert.equal(h.ok, true);
   assert.equal(h.instance_id, a.instanceId);
-  assert.equal(h.model, 2);
+  assert.equal(h.model, 3);
 
   const wrong = makeClient(a, { instanceId: 'deadbeef00000000' });
   await assert.rejects(wrong.ensureRunning(), (e) => e.code === 'INSTANCE_MISMATCH');

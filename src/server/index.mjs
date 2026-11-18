@@ -49,10 +49,10 @@ export async function startServer({ dataDir, tcp = null, log = () => {}, managed
     try { fs.unlinkSync(sock); } catch { /* no stale socket */ }
   }
 
-  // 0.4.x data (no meta.json) is migrated in one step before any request is served (design 4b); a failed verification
-  // throws MigrationError and the service does not start (the data stays in the backup).
+  // 0.4.x data (no meta.json, design 4b) and schema 2 (model 2, topics without brain) are migrated before any request is
+  // served, each step with its own backup; a failed verification throws MigrationError and the service does not start.
   const migration = migrateData(store, { log });
-  if (migration.migrated) log(`migrated to schema 2, backup ${migration.backup}`);
+  if (migration.migrated) log(`migrated (${migration.steps.join(', ')}) to schema 3, backup ${migration.backup}`);
 
   const service = new Service(store, { log });
   // I5: a reply written without its original (stop between the two writes) is finished before the first request.

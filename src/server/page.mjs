@@ -10,21 +10,21 @@ export function renderPage({ instance, notices, pending, key, showAll }) {
 
   const noticeRows = notices.length ? notices.map((n) => `
     <li class="notice ${esc(n.kind)} ${esc(n.state)}">
-      <div class="head"><strong>${esc(n.title)}</strong> <span class="meta">${esc(n.kind)} · ${esc(n.level)} · od ${esc(n.sender)}${n.thread_id ? ` (vlákno ${esc(n.thread_id)})` : ''} · čaká ${esc(waitingText(n.waiting_since))}</span></div>
+      <div class="head"><strong>${esc(n.title)}</strong> <span class="meta">${esc(n.kind)} · ${esc(n.level)}${n.where ? ` · ${esc(n.where)}` : ''} · od ${esc(n.sender)}${n.thread_id ? ` (vlákno ${esc(n.thread_id)})` : ''} · čaká ${esc(waitingText(n.waiting_since))}</span></div>
       ${n.detail ? `<div class="meta">${esc(n.detail)}</div>` : ''}
       <pre class="text">${esc(n.text)}</pre>
       ${n.state === 'open' ? `
       <form method="post" action="/decide" class="actions">
         ${keyField}
         <input type="hidden" name="notice_id" value="${esc(n.id)}">
-        ${n.options.some((o) => o.needs_target) ? '<label>Cieľ (project/topic): <input name="target" placeholder="projekt/tema"></label>' : ''}
+        ${n.options.some((o) => o.needs_target) ? '<label>Cieľ ([brain[@stroj]:]project/topic): <input name="target" placeholder="projekt/tema"></label>' : ''}
         ${n.options.map((o) => `<button type="submit" name="decision" value="${esc(o.id)}">${esc(o.label)}</button>`).join('\n        ')}
       </form>` : `<div class="meta">Rozhodnuté: ${esc(n.decision)}${n.target ? ` → ${esc(n.target)}` : ''} (${esc(n.decided_at)})</div>`}
       <div class="meta">oznam ${esc(n.id)} · správa ${esc(n.message_id)}</div>
     </li>`).join('') : '<li class="empty">Žiadne otvorené oznamy.</li>';
 
   const pendingRows = pending.length ? pending.map((m) => `
-    <tr><td>${esc(m.project)}/${esc(m.topic)}${m.to_thread ? `<br><small>vlákno ${esc(m.to_thread)}</small>` : ''}</td><td>${esc(m.level)}</td><td>${esc(m.sender)}</td><td>${esc(waitingText(m.created_at))}</td><td><pre>${esc(m.text)}</pre></td></tr>`).join('')
+    <tr><td>${esc(m.project)}/${esc(m.topic)}${m.project && m.topic ? `<br><small>${esc(m.to_brain_name || m.to_brain || '-')}@${esc(m.to_machine || '?')}</small>` : ''}${m.to_thread ? `<br><small>vlákno ${esc(m.to_thread)}</small>` : ''}</td><td>${esc(m.level)}</td><td>${esc(m.sender)}</td><td>${esc(waitingText(m.created_at))}</td><td><pre>${esc(m.text)}</pre></td></tr>`).join('')
     : '<tr><td colspan="5" class="empty">Žiadne čakajúce správy.</td></tr>';
 
   return `<!doctype html>

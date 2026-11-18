@@ -1,12 +1,12 @@
-// Life cycle of a message (mail model 2, D-0087): one field `status`, written only by transition().
+// Life cycle of a message (mail model 3; status model D-0087): one field `status`, written only by transition().
 // Also the one-step migration of 0.4.x records (`state`/`outcome`/`acked_at`/`bounced_at`) to `status`.
 import { HttpError, nowIso, FINAL_REPLY_STATE } from '../common/util.mjs';
 
-/** Mail model spoken by this server; every request carries it in X-Comms-Model (else 426). */
-export const MAIL_MODEL = 2;
-export const MODEL_MISMATCH_TEXT = 'mail model 2 (comms 0.5.0) and workflow 1.8.0 go together';
-/** Schema of the data folder (meta.json); a folder without meta.json is 0.4.x data and is migrated at start. */
-export const DATA_SCHEMA = 2;
+/** Mail model spoken by this server; every request carries it in X-Comms-Model (else 426). Model 3: a topic is brain + machine + project + topic. */
+export const MAIL_MODEL = 3;
+export const MODEL_MISMATCH_TEXT = 'mail model 3 (topic = brain + machine + project + topic): update mail and workflow together';
+/** Schema of the data folder (meta.json); a folder without meta.json is 0.4.x data, schema 2 has topics without brain; both are migrated at start. */
+export const DATA_SCHEMA = 3;
 
 export const STATUSES = ['held', 'pending', 'picked', 'waiting', 'done', 'discarded', 'superseded', 'undelivered'];
 export const FINAL_STATUSES = ['done', 'discarded', 'superseded', 'undelivered'];

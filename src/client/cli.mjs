@@ -27,8 +27,13 @@ Služba:
   stop                                            zastaví bežiacu službu inštancie
   health                                          stav služby a instance_id
 
-Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model pošty 2, iný model: kód 3, nič sa nezapíše):
-  send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]] | --maintainer | --to-thread <id>
+Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model pošty 3, iný model: kód 3, nič sa nezapíše):
+  Model 3: téma je brain + stroj + projekt + téma. Brain a stroj klienta: --brain <id> --brain-name <meno> --machine <stroj>
+  (inak COMMS_BRAIN, COMMS_BRAIN_NAME, COMMS_MACHINE alebo "brain", "brain_name", "machine" v --config); posielajú sa ako
+  X-Comms-Brain, X-Comms-Brain-Name, X-Comms-Machine a sú schránkou príkazov receive, count, obligations (bez brainu iba vlákno).
+  Adresa témy: [<brain>[@<stroj>]:]<projekt>/<téma> (brain = ID alebo jednoznačné meno brainu); bez brainu vlastný brain,
+  inak jediná otvorená téma iného brainu (potvrdenie nesie resolved: <meno>@<stroj>), viac → 409 s ambiguous.
+  send --to <adresa> | --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]] | --maintainer | --to-thread <id>
        --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--supersede-key <kľúč>]
                                                   nová správa (odpoveď ide cez resolve); potvrdenie { id, status, wait_due_at }
                                                   adresa: projekt+téma, alebo persona (+projekt, +téma); persona bez
@@ -72,9 +77,12 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model poš
                                                   príznak otvoreného ťahu: vlákno čaká na dialóg operátora (P-061); pošta správu preň po lehote
                                                   neoznačí „no reply“, ale odosielateľovi zapíše odpoveď „otázka“ (pôvod code); koniec ťahu príznak zruší
   notices [--all]
-  decide --notice <id> --decision <id> [--target <project/topic>]
+  decide --notice <id> --decision <id> [--target <[brain[@stroj]:]project/topic>]   potvrdenie nesie resolved: <meno>@<stroj>
   register-topic --project <p> --topic <t> --subject <text> [--persona <meno>] [--visibility public|private]
                  [--holder <thread>] [--holder-mode operator|auto] [--holder-machine <stroj>] [--takeover]
+                 vyžaduje brain; najviac jedna otvorená téma (brain, projekt, téma) naprieč strojmi: registrácia na inom
+                 stroji ju presunie (ten istý --holder bez --takeover, iný držiteľ iba s --takeover, inak 409);
+                 potvrdenie nesie moved (ids) a moved_from (<meno>@<stroj>)
   register-topic --persona <meno> --main [--holder <thread>] [--holder-machine <stroj>] [--takeover]   hlavné vlákno persony
   register-topic --project <p> --topic <t> --release [--holder <thread>]   uvoľní držiteľa (bez --holder alebo vlastného);
                  cudzí držiteľ sa mení iba s --takeover; zmena držiteľa bez --takeover je odmietnutá (409)
@@ -88,13 +96,13 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model poš
                                                   (comms_version a workflow_version null: starý klient bez verzie alebo workflow ju neposlal)
 
 Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.json> | --url <http(s)://host[:port]>
-                --key <kľúč> | --thread <id> | --machine <stroj> | --outbox <cesta> | --timeout <ms> | --no-start
+                --key <kľúč> | --thread <id> | --brain <id> | --brain-name <meno> | --machine <stroj> | --outbox <cesta> | --timeout <ms> | --no-start
 `;
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
   'sender', 'tcp', 'project', 'topic', 'level', 'text', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'to-thread', 'id', 'notice', 'decision', 'target',
   'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator', 'discussion',
-  'topics', 'due-at', 'base-s']);
+  'topics', 'due-at', 'base-s', 'brain', 'brain-name', 'to']);
 const BOOL_FLAGS = new Set(['maintainer', 'no-start', 'all', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close', 'due']);
 
 export function parseArgs(argv) {
@@ -252,9 +260,11 @@ async function run(cmd, args, cfg, io) {
       if (args.level === 'info') throw new CommsError('REJECTED', LEVEL_REMOVED_TEXT, { status: 400 });
       need('level');
       if (!LEVELS.includes(args.level)) throw new CommsError('REJECTED', `neznáma úroveň „${args.level}“; platné úrovne: ${LEVELS.join('|')}`, { status: 400 });
-      if (args.maintainer && (args.project || args.topic || args.persona)) throw new CommsError('USAGE', '--maintainer sa nekombinuje s --project, --topic ani --persona');
-      if (args.toThread && (args.maintainer || args.project || args.topic || args.persona)) throw new CommsError('USAGE', '--to-thread sa nekombinuje s --maintainer, --project, --topic ani --persona');
-      if (!args.persona && !args.maintainer && !args.toThread) need('project', 'topic');
+      if (args.maintainer && (args.project || args.topic || args.persona || args.to)) throw new CommsError('USAGE', '--maintainer sa nekombinuje s --to, --project, --topic ani --persona');
+      if (args.toThread && (args.maintainer || args.project || args.topic || args.persona || args.to)) throw new CommsError('USAGE', '--to-thread sa nekombinuje s --to, --maintainer, --project, --topic ani --persona');
+      if (args.to && (args.project || args.topic || args.persona)) throw new CommsError('USAGE', '--to sa nekombinuje s --project, --topic ani --persona');
+      const to = args.to ? parseAddress(args.to) : null;
+      if (!args.persona && !args.maintainer && !args.toThread && !to) need('project', 'topic');
       for (const f of ['state', 'cancels', 'waitFor']) {
         if (args[f] != null) throw new CommsError('USAGE', `--${f === 'waitFor' ? 'wait-for' : f} patrí vybaveniu správy (comms resolve), nie send`);
       }
@@ -268,7 +278,8 @@ async function run(cmd, args, cfg, io) {
       let text = args.text;
       if (text === '-') text = await readAll(io.stdin);
       return client.send({
-        project: args.project || null, topic: args.topic || null, persona: args.persona || null, ...(args.maintainer ? { maintainer: true } : {}), ...(args.toThread ? { to_thread: args.toThread } : {}), level: args.level, text,
+        project: to ? to.project : args.project || null, topic: to ? to.topic : args.topic || null, persona: args.persona || null,
+        ...(to && to.brain ? { brain: to.brain } : {}), ...(to && to.machine ? { machine: to.machine } : {}), ...(args.maintainer ? { maintainer: true } : {}), ...(args.toThread ? { to_thread: args.toThread } : {}), level: args.level, text,
         from_project: args.fromProject || null, from_topic: args.fromTopic || null,
         ...(args.ttl != null ? { ttl: args.ttl } : {}),
         ...(args.supersedeKey != null ? { supersede_key: args.supersedeKey } : {}),
@@ -306,7 +317,7 @@ async function run(cmd, args, cfg, io) {
       return client.withdraw({ id: args.id[0] });
     case 'obligations': {
       if (args.due) return client.due();
-      const q = { thread: args.thread || cfg.threadId || null, topics: args.topics || null, project: args.project || null, persona: args.persona || null, since: args.since ?? null };
+      const q = { thread: args.thread || cfg.threadId || null, topics: args.topics || null, project: args.project || null, persona: args.persona || null, since: args.since ?? null, ...brainOf(cfg) };
       if (!q.thread && !q.topics && !q.persona) throw new CommsError('USAGE', 'obligations: zadaj --thread (alebo COMMS_THREAD_ID), --topics alebo --persona');
       // obligations replaces count for the status line (design part 2), so it carries the wake status of this machine
       // like count (comms-public#4), also with the offline backup: null (no field) when wake never ran here.
@@ -342,7 +353,7 @@ async function run(cmd, args, cfg, io) {
       if (!args.thread && !args.persona) need('project', 'topic');
       await client.ensureRunning();
       try { await client.flushOutbox(); } catch (e) { if (e.code === 'MODEL_MISMATCH' || e.code === 'INSTANCE_MISMATCH') throw e; /* outbox stays, reported by flush */ }
-      const q = { project: args.project, topic: args.topic, thread: args.thread, persona: args.persona };
+      const q = { project: args.project, topic: args.topic, thread: args.thread, persona: args.persona, ...brainOf(cfg) };
       // One `--id`: that message in any status (receive?id, 1d); more: only those of the pending ones.
       if (args.id.length === 1) return client.receive({ ...q, id: args.id[0] });
       return client.receive({ ...q, ids: args.id.length ? args.id.join(',') : null });
@@ -350,7 +361,7 @@ async function run(cmd, args, cfg, io) {
     case 'count':
       if (!args.thread && !args.persona) need('project', 'topic');
     {
-      const r = await client.count({ project: args.project, topic: args.topic, thread: args.thread, persona: args.persona });
+      const r = await client.count({ project: args.project, topic: args.topic, thread: args.thread, persona: args.persona, ...brainOf(cfg) });
       // comms-public#4: whether this machine's wake runs, for the session status line (null: wake never ran here).
       // The state dir as `wake run` resolves it: workflow passes its own --client-dir (outbox), wake does not.
       const wake = wakeStatus(wakeStateDir(args));
@@ -387,7 +398,26 @@ async function run(cmd, args, cfg, io) {
 /** Mailbox of resolve/settle/ack/message: project+topic, persona, else the thread (--thread or the client's thread). */
 function mailboxOf(args, cfg) {
   const thread = args.thread || cfg.threadId || null;
-  return { project: args.project || null, topic: args.topic || null, persona: args.persona || null, thread };
+  return { project: args.project || null, topic: args.topic || null, persona: args.persona || null, thread, ...brainOf(cfg) };
+}
+
+/** Brain and machine of a topic mailbox (model 3): this client's (--brain/--machine, COMMS_BRAIN/COMMS_MACHINE, config). */
+function brainOf(cfg) {
+  return { ...(cfg.brain ? { brain: cfg.brain } : {}), ...(cfg.machine ? { machine: cfg.machine } : {}) };
+}
+
+/** Topic address `[<brain>[@<machine>]:]<project>/<topic>` (model 3; brain = id or brain_name). */
+export function parseAddress(s) {
+  const raw = String(s || '');
+  const colon = raw.lastIndexOf(':');
+  const head = colon >= 0 ? raw.slice(0, colon) : null;
+  const parts = raw.slice(colon + 1).split('/');
+  const [brain, machine, extra] = head != null ? head.split('@') : [null, null];
+  const ok = (v) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(v || '');
+  if (parts.length !== 2 || !ok(parts[0]) || !ok(parts[1]) || (head != null && !ok(brain)) || (machine != null && !machine) || extra !== undefined) {
+    throw new CommsError('USAGE', `adresa „${raw}“ musí byť [<brain>[@<stroj>]:]<projekt>/<téma>`);
+  }
+  return { brain: brain || null, machine: machine || null, project: parts[0], topic: parts[1] };
 }
 
 function requireInstance(store, cfg) {

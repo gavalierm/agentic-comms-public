@@ -2,18 +2,19 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeInstance, startInstance, makeClient, cleanup, runCli, api, addKey } from './helpers.mjs';
+import { makeInstance, startInstance, makeClient, cleanup, runCli, api, addKey, LOCAL_MACHINE } from './helpers.mjs';
 
 // Reply protocol (incident 2026-11-11: three replies to one message, the last a new request): a reply carries a
 // state (hotovo | otázka | čakám), a message has one final reply, a reply is never answered by a reply.
-// Mail model 2: the recipient answers with POST /resolve (design mail-service-design v3, 1b and 1d).
+// The recipient answers with POST /resolve (design mail-service-design v3, 1b and 1d). Model 3: the topics are
+// registered on this machine, where the CLI runs (X-Comms-Machine), so its mailbox queries name the same key.
 
 async function pair(t, name) {
   const a = makeInstance(name);
   const sa = await startInstance(a);
   t.after(async () => { await sa.stop(); cleanup(a.dir); });
-  const alice = api(a);
-  const bob = api(a, addKey(a, 'bob'));
+  const alice = api(a, a.key, { 'X-Comms-Machine': LOCAL_MACHINE });
+  const bob = api(a, addKey(a, 'bob'), { 'X-Comms-Machine': LOCAL_MACHINE });
   await alice.register({ project: 'p', topic: 't', subject: 'S', holder: 'thr-bob' });
   const box = { project: 'p', topic: 't', thread: 'thr-bob' };
   const ask = (text = 'decide', extra = {}) => alice.send({ project: 'p', topic: 't', level: 'assist', text, thread_id: 'thr-alice', ...extra });

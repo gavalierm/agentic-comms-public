@@ -570,6 +570,8 @@ test('one queued ring per open turn of a busy holder; a new turn may be rung aga
   await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o1.turn.opened_at });
   await sleep(5);
   const o2 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  // The queued ring's turn reads both messages: the held second one then rings no more.
+  await client.receive({ project: 'p', topic: 't' });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'three', thread_id: 'thr-s3' });
   assert.equal(await waker.pollOnce(500), 1);
   assert.equal(adapter.calls.length, 2);
@@ -581,6 +583,30 @@ test('one queued ring per open turn of a busy holder; a new turn may be rung aga
   assert.equal(await waker.pollOnce(500), 1);
   assert.equal(adapter.calls.length, 3);
   assert.deepEqual(waker.state.queued, {});
+});
+
+// doma-pc 2026-11-18 (ttl: 2027-05-18): the ring queued behind the run was spent by that run (steered into it); the next
+// message was skipped as "queued" and dropped, read only at the operator's next prompt. It is held and rings once the
+// queued mark is gone, only while it still waits.
+test('a message skipped behind a queued ring is held: it rings once the mark is gone and it still waits, never twice', async (t) => {
+  const { client, waker, adapter, clock } = await setup(t);
+  const o1 = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  const m1 = await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'one', thread_id: 'thr-s' });
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'two', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 2);
+  assert.equal(adapter.calls.length, 1);
+  assert.equal(Object.values(waker.state.held)[0]?.held_reason, 'queued', 'held, not dropped');
+  // The run reads "one" and ends; no new run comes (the queued ring was steered into it).
+  await client.receive({ project: 'p', topic: 't', id: m1.id });
+  await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o1.turn.opened_at });
+  await waker.pollOnce(50);
+  assert.equal(adapter.calls.length, 1, 'within queuedStartMs the queued ring may still start');
+  clock.t = Date.now() + waker.opts.queuedStartMs + 1000;
+  await waker.pollOnce(50);
+  assert.equal(adapter.calls.length, 2, 'the held message rings');
+  assert.deepEqual(waker.state.held, {});
+  await waker.pollOnce(50);
+  assert.equal(adapter.calls.length, 2, 'once');
 });
 
 // wake-stale-ring 2026-11-13: a ring queued behind a long run; the operator's prompts steered into that run opened new turn
@@ -622,9 +648,11 @@ test('idle holder: the same bell again before its turn opens is skipped; after t
   await client.send({ project: 'p', topic: 't', level: 'assist', text: 'two', thread_id: 'thr-s2', from_project: 'q', from_topic: 'u' });
   assert.equal(await waker.pollOnce(500), 2);
   assert.equal(adapter.calls.length, 1, 'the turn of the first ring sees both messages');
+  assert.equal(Object.values(waker.state.held)[0]?.held_reason, 'queued', 'held, not dropped (doma-pc 2026-11-18)');
   // The rung turn opened and closed: a later message rings again.
   await sleep(5);
   const o = await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1' });
+  await client.receive({ project: 'p', topic: 't' });
   await client.turn({ thread: 'thr-1', state: 'closed', opened_at: o.turn.opened_at });
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'three', thread_id: 'thr-s3' });
   assert.equal(await waker.pollOnce(500), 1);

@@ -337,7 +337,9 @@ export class Waker {
         this.log(`queued ${holder}: vlákno ${runChanged ? 'beží iný beh' : 'nebeží'}; zaradený zvonček už nečaká, zvoní sa`);
         this.state.unqueue(holder);
       } else {
-        this.state.save();
+        // Held, never dropped: a ring steered into the running run was spent by it (doma-pc 2026-11-18); releaseHeld rings
+        // the message once the mark is gone, only while it still waits.
+        this.hold(ev, now, 'queued');
         return skip('queued');
       }
     }
@@ -354,22 +356,25 @@ export class Waker {
     const idle = this.state.idle[holder];
     if (!th.busy && turnsKnown && idle && bellKey(idle.text) === bellKey(ringText(ev)) && now - idle.at < this.opts.idleDedupeMs
       && !(record && record.opened_at && Date.parse(record.opened_at) >= idle.at)) {
+      this.hold(ev, now, 'queued');
       return skip('queued');
     }
 
     const dir = directionKey(ev);
     const pair = pairKey(ev);
     const prev = this.state.last[dir];
-    // A released event was counted when it came (its hold is not a second copy of the text).
-    const repeats = ev.released ? (prev?.count || 1) : prev && prev.hash === ev.text_hash ? prev.count + 1 : 1;
+    // An event held above the limit was counted when it came (`counted`; its hold is not a second copy of the text), a
+    // reminder is no new copy either; one held before this point (running, queued) is counted now (review 2026-11-18).
+    const counted = !!(ev.counted || ev.reminder);
+    const repeats = counted ? (prev?.count || 1) : prev && prev.hash === ev.text_hash ? prev.count + 1 : 1;
     // Repeat detection only for events with a body hash (blocker/reply).
-    if (ev.text_hash && !ev.released) this.state.last[dir] = { hash: ev.text_hash, count: repeats, at: now };
+    if (ev.text_hash && !counted) this.state.last[dir] = { hash: ev.text_hash, count: repeats, at: now };
     this.state.prune(now);
     const recent = this.state.rings[pair] || [];
 
     let limit = null;
     const lim = pairLimit(ev, this.opts.limitPerHour);
-    if (ev.text_hash && !ev.released && repeats >= this.opts.stopOnRepeat) limit = { reason: 'repeat', detail: `rovnaká správa ${repeats}× za sebou (${dir})` };
+    if (ev.text_hash && !counted && repeats >= this.opts.stopOnRepeat) limit = { reason: 'repeat', detail: `rovnaká správa ${repeats}× za sebou (${dir})` };
     else if (recent.length >= lim) limit = { reason: 'hour', limit: lim, detail: `${recent.length} zobudení za poslednú hodinu (${pair}), limit ${lim}` };
 
     if (limit) {
@@ -381,7 +386,7 @@ export class Waker {
         // The window has room once recent.length - lim + 1 rings left it: the last of them is index recent.length - lim
         // (2026-11-18: the oldest ring + 1 h said 07:52 for 8 rings over a limit of 6; three had to leave, 07:57).
         limit.free_at = new Date([...recent].sort((a, b) => a - b)[recent.length - lim] + HOUR).toISOString();
-        this.hold(ev, now, 'limit');
+        this.hold({ ...ev, counted: true }, now, 'limit');
       }
       this.state.save();
       this.log(`limit ${ev.seq} (${limit.reason}): ${limit.detail}; správa ${ev.message_id} ${limit.free_at ? `zazvoní, keď sa okno uvoľní (${limit.free_at})` : 'čaká na ďalší ťah'}`);
@@ -491,7 +496,7 @@ export class Waker {
   }
 
   /**
-   * Keep an event until its holder's discussion ends, (`reason` running) until T3 no longer runs the thread, or (`reason` limit) until its pair of topics has room under the hourly limit (newest HELD_MAX).
+   * Keep an event until its holder's discussion ends, (`reason` running) until T3 no longer runs the thread, (`reason` queued) until no queued or fresh idle ring of the holder waits, or (`reason` limit) until its pair of topics has room under the hourly limit (newest HELD_MAX).
    */
   hold(ev, now = this.now(), reason = 'discussion') {
     const key = ev.message_id || `seq:${ev.seq}`;
@@ -531,6 +536,23 @@ export class Waker {
           this.log(`held ${ev.message_id || key}: neskorší zvonček témy ho pokryl; nezvoní sa`);
           continue;
         }
+      } else if (ev.held_reason === 'queued') {
+        // Held behind a queued ring or a fresh idle ring of the same bell: released once neither waits any more (handle
+        // decides again; the message rings only while pending).
+        const h = String(ev.holder);
+        const rec = turns.find((x) => x.thread === h) || null;
+        this.state.pruneQueued(turns, this.now(), this.opts.queuedStartMs);
+        if (this.state.queued[h]) {
+          // As handle: an open record T3 does not run (interrupted, Stop lost) or another T3 run means the queued ring
+          // started or was lost; else the mark still waits.
+          if (!t3Seen.has(h)) t3Seen.set(h, await this.t3State(h));
+          const t3 = t3Seen.get(h);
+          const runChanged = t3.known && t3.running && !!t3.run && !!this.state.queuedRun[h] && t3.run !== this.state.queuedRun[h];
+          if (!(rec && rec.state === 'open' && t3.known && (!t3.running || runChanged))) continue;
+          this.state.unqueue(h);
+        }
+        const idle = this.state.idle[h];
+        if (idle && bellKey(idle.text) === bellKey(ringText(ev)) && this.now() - idle.at < this.opts.idleDedupeMs && !(rec && rec.opened_at && Date.parse(rec.opened_at) >= idle.at)) continue;
       } else if (ev.held_reason === 'running') {
         // Held while T3 ran the thread: rung once T3 no longer runs it (or after turnBusyMaxMs, behind the run); archived or
         // gone bounces. Unknown T3 state: released when no fresh open turn record says it runs (a lost bell is worse).
@@ -571,7 +593,7 @@ export class Waker {
           this.log(`message ${ev.message_id}: ${e.message}; zvoní sa bez kontroly`);
         }
       }
-      this.log(`release ${ev.message_id || key} → ${ev.holder}: ${ev.held_reason === 'running' ? 'ťah vlákna skončil' : ev.held_reason === 'limit' ? 'okno limitu sa uvoľnilo' : 'diskusia s operátorom skončila'}`);
+      this.log(`release ${ev.message_id || key} → ${ev.holder}: ${ev.held_reason === 'running' ? 'ťah vlákna skončil' : ev.held_reason === 'limit' ? 'okno limitu sa uvoľnilo' : ev.held_reason === 'queued' ? 'zaradený zvonček už nečaká' : 'diskusia s operátorom skončila'}`);
       released += 1;
       const { held_at: _a, held_reason: _r, ...orig } = ev;
       await this.handle({ ...orig, created_at: new Date(this.now()).toISOString(), released: true });
@@ -1036,8 +1058,8 @@ export class Waker {
     let outage = false;
     while (!signal || !signal.aborted) {
       try {
-        // A ring held for a running thread comes within runningCheckMs of the run's end (no event marks that end).
-        const running = Object.values(this.state.held).some((e) => e && e.held_reason === 'running');
+        // A ring held for a running thread or behind a queued ring comes within runningCheckMs of the run's end (no event marks that end).
+        const running = Object.values(this.state.held).some((e) => e && (e.held_reason === 'running' || e.held_reason === 'queued'));
         await this.pollOnce(running ? Math.min(this.opts.waitMs, this.opts.runningCheckMs) : this.opts.waitMs);
         if (outage) { this.log('comms available again'); outage = false; }
         backoff = this.opts.reconnectMs;

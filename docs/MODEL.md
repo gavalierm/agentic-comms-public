@@ -98,7 +98,7 @@ Každá požiadavka okrem `GET /health` a stránky operátora (`GET /`, formulá
 | Operácia | Vstup | Potvrdenie | Chyby |
 |---|---|---|---|
 | `GET /health` | – | `{ok, instance_id, instance, pid, time, version, model: 2}` | – |
-| `POST /send` | adresa (`project`+`topic` alebo `persona` [+`project` [+`topic`]]), `level`, `text`, `ttl`, `supersede_key`, `thread_id`, `from_project`/`from_topic`, `client_op_id` | `{id, status, level, notice_id, expires_at, wait_due_at, project_known?, warning?}` | 400 (`reply_to`, `reply_state`, `cancels` patria `resolve`; `info`), 410 uzavretá téma |
+| `POST /send` | adresa (`project`+`topic`, `persona` [+`project` [+`topic`]], `maintainer: true` alebo `to_thread`), `level`, `text`, `ttl`, `supersede_key`, `thread_id`, `from_project`/`from_topic`, `client_op_id` | `{id, status, level, notice_id, expires_at, wait_due_at, project_known?, warning?}` | 400 (`reply_to`, `reply_state`, `cancels` patria `resolve`; `info`), 410 uzavretá téma |
 | `GET /receive` | schránka (`project`+`topic`, `persona`, `thread`), `ids?` | iba `pending`; čítanie = prevzatie (`picked`, odpoveď a `steer` `done/read`) | 400 |
 | `GET /receive?id=` | `id`, schránka | správa v akomkoľvek stave; schránka čakajúcu prevezme | 403 nie odosielateľ ani schránka, 404 |
 | `POST /resolve` | `id`, `state` `hotovo`/`otázka`/`čakám`, `text?`, `ack?`, `cancels?`, `wait_for?`, schránka, `client_op_id` | `{id, status, resolution, answer_state, answer_id, answer_delivered, reason?}` | 400 (odpoveď na odpoveď, vlastná správa, priebežná bez textu), 403 mimo schránky, 404, 409 so stavom |
@@ -111,6 +111,8 @@ Každá požiadavka okrem `GET /health` a stránky operátora (`GET /`, formulá
 | `POST /register-topic` (`close: true`) | téma, `holder` | `{closed, undelivered: [ids], recipient_closed: [ids]}` | 404, 409 |
 | `POST /bounce` | `message_id`, `holder`, `reason` | `{bounced, status, reason?}` | 404 |
 | ostatné | `count`, `notices`, `decide`, `turn`, `turns`, `clients`, `notice`, `events` | nad `status` | |
+
+**Adresa vlákna (`to_thread`, operátor 2026-11-18):** novú správu vláknu podľa ID (nie odpoveď) smie poslať iba vlákno správcu: `thread_id` odosielateľa = `instance.json` `maintainer.thread` a, keď ho inštancia uvádza, `thread_machine` = `maintainer.machine`, inak 403. Cieľové vlákno musí server poznať: stroj vezme zo záznamu ťahu vlákna (`turns`), inak z jeho najnovšej odoslanej správy (`thread_machine`); bez stroja 404 (budenie by nevedelo, kde zazvoniť, a cudzí stroj by správu vrátil ako `undelivered`). Správa ide do schránky vlákna (`to_thread`, `to_thread_machine`) ako správa správcovi; odpoveď (`resolve`) ide späť vláknu správcu. Kombinácia s `project`, `topic`, `persona` či `maintainer` je 400. `thread_id` je deklarácia klienta (rovnaká dôvera ako kľúč; kľúče vydáva operátor). CLI: `send --to-thread <id>`, workflow `comms.mjs send --to thread/<id>`.
 
 Zrušené bez náhrady (D-0089): `POST /ack`, `POST /settle`, `send` s `reply_to`, polia `state`, `acked_at`, `outcome`, `bounced_at`, udalosti `expired` a `undelivered`.
 
@@ -216,6 +218,7 @@ Wake pri T3 `status` `archived` alebo trvalej chybe (`PERMANENT_RING_FAILURE`: a
 - Nie jednorazové udalosti budenia (`expired`, `undelivered`, preskočenie udalostí starších ako 60 min), lebo zvonček pri vypnutom alebo spadnutom wake sa stratil; čakanie je pole správy potvrdené `wait-rang`.
 - Nie vrstva kompatibility (odvodené `state`/`outcome`, aliasy `ack`/`settle`, vetvy podľa verzie, režim legacy), lebo drží dva modely naraz a zdvojuje testy; nesúlad zlyhá nahlas (426, kód 3).
 - Nie busy zo zastaraného záznamu ťahu, lebo záznam prerušeného či archivovaného vlákna ostal otvorený a `steer` sa zaradil za beh, ktorý nikdy neprišiel (steer nedošiel).
+- Nie správa vláknu iného stroja iba ako odpoveď, lebo správca nemal ako začať test ani pokyn vláknu, ktoré nedrží tému (operátor 2026-11-18: „nové správy mu máš vedieť poslať“); adresa vlákna `to_thread` patrí iba vláknu správcu.
 - Nie zvonček zaradený za beh vlákna, ktoré T3 práve vykonáva (výnimky: neznámy stav T3, strop 60 min), lebo prišiel až po tom, čo vlákno poštu v tom behu prevzalo, a operátor videl prázdny zvonček ako „UserPromptSubmit operation blocked by hook“ (operátor 2026-11-18).
 - Nie kódová odpoveď (`otázka`/`busy`) ako vybavenie mimo schránky, lebo neprevzatú správu by už nikto neprevzal (stratená správa); `code_answer` je pole nad `pending`.
 - Nie odpoveď a ack ako dve operácie klienta, lebo výpadok medzi nimi nechal správu nevybavenú; `resolve` je jedna operácia s `client_op_id`.

@@ -421,7 +421,7 @@ export class Service {
   }
 
   deliver(sender, body, opId) {
-    const { project = null, topic = null, persona = null, maintainer = false, level, text, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null, supersede_key = null } = body;
+    const { project = null, topic = null, persona = null, maintainer = false, to_thread = null, level, text, thread_id = null, thread_machine = null, from_project = null, from_topic = null, ttl = null, supersede_key = null } = body;
     if (level === 'info') throw new HttpError(400, LEVEL_REMOVED_TEXT);
     if (level == null || level === '') throw new HttpError(400, `úroveň (level) je povinná: ${LEVELS.join('|')}`);
     if (!LEVELS.includes(level)) throw new HttpError(400, `neznáma úroveň „${level}“; platné úrovne: ${LEVELS.join('|')}`);
@@ -440,6 +440,27 @@ export class Service {
     // A blocker and an assist wait for an answer from the start (1b); a steer only for its pickup.
     if (level !== 'steer') this.setWait(msg, WAIT_BASE_S[level], 'no-reply', Date.parse(created_at));
 
+    if (present(to_thread)) {
+      // Thread address (operator 2026-11-18): a new message to a thread by its id, only from the maintainer's thread; the
+      // machine comes from what the server knows of that thread, so wake rings it where it runs (else it would bounce).
+      if (maintainer === true || project != null || topic != null || persona != null) throw new HttpError(400, 'adresa vlákna (to_thread) sa nekombinuje s maintainer, project, topic ani persona');
+      requireThread(to_thread);
+      const mt = this.maintainerThread();
+      // The thread and, when the instance names it, the machine of the maintainer (both declared, as every thread mailbox).
+      if (!mt || !thread_id || thread_id !== mt.thread || (mt.machine && normalizeMachine(thread_machine) !== normalizeMachine(mt.machine))) throw new HttpError(403, 'správu vláknu podľa ID (to_thread) posiela iba vlákno správcu (instance.json maintainer.thread a maintainer.machine)');
+      const machine = this.threadMachine(to_thread);
+      if (!machine) throw new HttpError(404, `vlákno ${to_thread} tento server nepozná (nemá záznam ťahu ani od neho správu): nie je kde zazvoniť; vlákno musí najprv otvoriť ťah alebo poslať správu cez tento server`);
+      msg.to_thread = to_thread;
+      msg.to_thread_machine = machine;
+      transition(msg, 'pending', 'send', 'thread', { at: created_at });
+      this.store.saveMessage(msg);
+      this.afterDelivery(msg);
+      const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, to_thread: msg.to_thread };
+      this.recordOp(msg, opId, 'send', result);
+      this.store.saveMessage(msg);
+      this.log(`thread ${msg.id} → vlákno ${msg.to_thread} (${machine})`);
+      return result;
+    }
     if (maintainer === true) {
       // Maintainer address (operator 2026-11-16): the T3 thread of the workflow maintainer, set as maintainer.thread in
       // instance.json (read at every send, no restart). No thread set: refused, the sender files an issue instead. A
@@ -514,6 +535,15 @@ export class Service {
    * The workflow maintainer's T3 thread from instance.json `maintainer` ({ thread, machine }), read fresh at every call
    * so a new thread takes effect without a restart; null when none is set.
    */
+  /** Machine of a thread this server knows: its turn record, else its newest message as a sender; null when unknown. */
+  threadMachine(thread) {
+    const t = this.store.turn(thread);
+    if (t && t.machine) return normalizeMachine(t.machine);
+    let best = null;
+    for (const m of this.store.messages((x) => x.thread_id === thread && x.thread_machine)) if (!best || String(m.created_at) > String(best.created_at)) best = m;
+    return best ? normalizeMachine(best.thread_machine) : null;
+  }
+
   maintainerThread() {
     let inst = null;
     try { inst = this.store.instance(); } catch { inst = this.instance; }
@@ -618,7 +648,7 @@ export class Service {
     });
     // A keyed blocker (repeated by a script) raises its notice only when nobody picked it up: checkExpired.
     if (msg.level === 'blocker' && !msg.supersede_key && !msg.notice_id) {
-      const notice = this.createNotice({ kind: 'blocker', title: `Blocker pre tému ${msg.project}/${msg.topic}`, message: msg });
+      const notice = this.createNotice({ kind: 'blocker', title: msg.to_thread ? `Blocker pre vlákno ${msg.to_thread}` : `Blocker pre tému ${msg.project}/${msg.topic}`, message: msg });
       msg.notice_id = notice.id;
       this.store.saveMessage(msg);
     }

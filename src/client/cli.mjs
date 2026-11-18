@@ -28,7 +28,7 @@ Služba:
   health                                          stav služby a instance_id
 
 Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model pošty 2, iný model: kód 3, nič sa nezapíše):
-  send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]] | --maintainer
+  send --project <p> --topic <t> | --persona <meno> [--project <p> [--topic <t>]] | --maintainer | --to-thread <id>
        --level blocker|steer|assist --text <text|-> [--from-project <p> --from-topic <t>] [--ttl <dĺžka>] [--supersede-key <kľúč>]
                                                   nová správa (odpoveď ide cez resolve); potvrdenie { id, status, wait_due_at }
                                                   adresa: projekt+téma, alebo persona (+projekt, +téma); persona bez
@@ -253,7 +253,8 @@ async function run(cmd, args, cfg, io) {
       need('level');
       if (!LEVELS.includes(args.level)) throw new CommsError('REJECTED', `neznáma úroveň „${args.level}“; platné úrovne: ${LEVELS.join('|')}`, { status: 400 });
       if (args.maintainer && (args.project || args.topic || args.persona)) throw new CommsError('USAGE', '--maintainer sa nekombinuje s --project, --topic ani --persona');
-      if (!args.persona && !args.maintainer) need('project', 'topic');
+      if (args.toThread && (args.maintainer || args.project || args.topic || args.persona)) throw new CommsError('USAGE', '--to-thread sa nekombinuje s --maintainer, --project, --topic ani --persona');
+      if (!args.persona && !args.maintainer && !args.toThread) need('project', 'topic');
       for (const f of ['state', 'cancels', 'waitFor']) {
         if (args[f] != null) throw new CommsError('USAGE', `--${f === 'waitFor' ? 'wait-for' : f} patrí vybaveniu správy (comms resolve), nie send`);
       }
@@ -267,7 +268,7 @@ async function run(cmd, args, cfg, io) {
       let text = args.text;
       if (text === '-') text = await readAll(io.stdin);
       return client.send({
-        project: args.project || null, topic: args.topic || null, persona: args.persona || null, ...(args.maintainer ? { maintainer: true } : {}), level: args.level, text,
+        project: args.project || null, topic: args.topic || null, persona: args.persona || null, ...(args.maintainer ? { maintainer: true } : {}), ...(args.toThread ? { to_thread: args.toThread } : {}), level: args.level, text,
         from_project: args.fromProject || null, from_topic: args.fromTopic || null,
         ...(args.ttl != null ? { ttl: args.ttl } : {}),
         ...(args.supersedeKey != null ? { supersede_key: args.supersedeKey } : {}),

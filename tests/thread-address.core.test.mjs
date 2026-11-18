@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { makeInstance, startInstance, api, cleanup } from './helpers.mjs';
+import { makeInstance, startInstance, api, cleanup, runCli } from './helpers.mjs';
 
 const MT = 'thread-maintainer';
 const R = 'thread-remote';
@@ -32,6 +32,10 @@ test('to_thread: only the maintainer thread sends it; rung on the thread\'s mach
     const r = await a.send({ to_thread: R, level: 'assist', text: 'ping from the maintainer', thread_id: MT, thread_machine: 'myserver' });
     assert.equal(r.status, 'pending');
     assert.equal(r.to_thread, R);
+    // The CLI takes --to-thread (2026-11-18: the option was missing from the client's list, refused as unknown).
+    const cli = await runCli(['send', '--data-dir', inst.dir, '--key', inst.key, '--no-start', '--thread', MT, '--machine', 'myserver', '--to-thread', R, '--level', 'assist', '--text', 'cli ping']);
+    assert.equal(cli.code, 0, cli.err || cli.out);
+    assert.equal(cli.json.to_thread, R);
     const ev = (await a.events(0)).find((e) => e.message_id === r.id);
     assert.equal(ev.holder, R);
     assert.equal(ev.holder_machine, 'doma-pc');

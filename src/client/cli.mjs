@@ -92,7 +92,7 @@ Spoločné voľby: --instance <meno> | --data-dir <cesta> | --config <súbor.jso
 `;
 
 const FLAGS_WITH_VALUE = new Set(['instance', 'data-dir', 'config', 'url', 'key', 'thread', 'outbox', 'timeout', 'client-dir', 'instance-id',
-  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'id', 'notice', 'decision', 'target',
+  'sender', 'tcp', 'project', 'topic', 'level', 'text', 'wait-for', 'cancels', 'supersede-key', 'from-project', 'from-topic', 'to-thread', 'id', 'notice', 'decision', 'target',
   'subject', 'holder', 'holder-mode', 'since', 'wait', 'persona', 'visibility', 'holder-machine', 'machine', 'ttl', 'state', 'opened-at', 'next', 'resume-at', 'waiting-operator', 'discussion',
   'topics', 'due-at', 'base-s']);
 const BOOL_FLAGS = new Set(['maintainer', 'no-start', 'all', 'help', 'json', 'wake', 'main', 'no-self-restart', 'takeover', 'release', 'close', 'due']);

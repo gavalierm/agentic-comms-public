@@ -194,6 +194,8 @@ test('I3 undelivered only from pending/held: bounce of a picked or done message 
     const held = await s.a.send({ project: P, topic: 'nobody', level: 'assist', text: 'h', thread_id: SENDER_THREAD });
     assert.equal(held.status, 'held');
     assert.equal((await s.a.notices()).filter((n) => n.message_id === held.id).length, 1);
+    const hs = await s.a.message(held.id);
+    assert.deepEqual([hs.held_reason, hs.notice_id], ['unregistered-topic', held.notice_id], 'held names its reason (flow-public#107)');
     assert.equal((await s.a.bounce({ message_id: held.id })).bounced, true);
     assert.equal(readMsg(s.inst, held.id).status, 'undelivered');
     const n = (await s.a.notices(true)).find((x) => x.message_id === held.id);

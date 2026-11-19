@@ -1192,6 +1192,13 @@ export class Service {
       wait_due_at: m.wait_due_at || null, wait_n: m.wait_n ?? null, wait_reason: m.wait_reason || null, wait_rang_at: m.wait_rang_at || null,
       undelivered_at: m.undelivered_at || null, undelivered_holder: m.undelivered_holder || null, undelivered_reason: m.undelivered_reason || null,
     };
+    // `held` without its reason was read as "the recipient is working" (flow-public#107): the only cause of `held` is an
+    // address no thread receives; the kind of its operator notice says which.
+    if (m.status === 'held') {
+      out.notice_id = m.notice_id || null;
+      out.held_reason = (m.notice_id && this.store.notice(m.notice_id)?.kind) || 'unregistered-topic';
+      out.held_note = 'no thread receives this address (no such topic, or a private one): the message waits for the operator to route it (notice), nobody works on it';
+    }
     if (this.mayRead(m, this.mailbox(q, ctx), sender)) out.text = m.text;
     return out;
   }

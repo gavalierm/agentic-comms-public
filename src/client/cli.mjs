@@ -64,7 +64,7 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model poš
   wait-adopt --id <id> --due-at <iso> [--base-s <sekundy>]
                                                   služba prevezme lokálne čakanie (budík) klienta na odpoveď: iba odosielateľ, iba nekonečná správa
   count --project <p> --topic <t> | --persona <meno> | --thread <id>  počet a ids čakajúcich správ (vždy živo; po výpadku nový pokus najskôr po 60 s)
-  message --id <id> [schránka]                    stav správy (status, resolution, history, wait_*); telo iba odosielateľovi a schránke
+  message --id <id> [schránka]                    stav správy (status, resolution, history, wait_*; pri held dôvod held_reason); telo iba odosielateľovi a schránke
   turn --state open|closed [--thread <id>] [--machine <stroj>] [--project <p> --topic <t>] [--holder-mode operator|auto]
        [--opened-at <iso>] [--next <krok>] [--discussion open|closed]
                                                   záznam ťahu vlákna pre keepalive; closed s --opened-at zatvorí iba ten ťah;

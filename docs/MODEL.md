@@ -106,7 +106,7 @@ Každá požiadavka okrem `GET /health` a stránky operátora (`GET /`, formulá
 | `GET /receive?id=` | `id`, schránka | správa v akomkoľvek stave; schránka čakajúcu prevezme | 403 nie odosielateľ ani schránka, 404 |
 | `POST /resolve` | `id`, `state` `hotovo`/`otázka`/`čakám`, `text?`, `ack?`, `cancels?`, `wait_for?`, schránka, `client_op_id` | `{id, status, resolution, answer_state, answer_id, answer_delivered, reason?}` | 400 (odpoveď na odpoveď, vlastná správa, priebežná bez textu), 403 mimo schránky, 404, 409 so stavom |
 | `POST /withdraw` | `id`, `client_op_id` | `{id, status: done, resolution: withdrawn}` | 403 nie odosielateľ, 409 konečná |
-| `GET /message?id=` | `id`, schránka | metadáta, `status`, `history`, `wait_*`; `text` iba odosielateľovi a schránke | 404 |
+| `GET /message?id=` | `id`, schránka | metadáta, `status`, `history`, `wait_*`; pri `held` dôvod (`held_reason` = druh oznamu operátora, `held_note`, `notice_id`); `text` iba odosielateľovi a schránke | 404 |
 | `GET /obligations` | `thread`, `topics`, `project`, `persona`, `since` | `{inbox, owed, awaiting, recent, cursor, topics, server}` | 400 bez `thread`, `topics` aj `persona` |
 | `GET /obligations?due=1` | – | `{due: [{id, level, status, wait_due_at, wait_n, wait_reason, holder, holder_machine, …}], server}` | – |
 | `POST /wait-rang` | `id`, `rang_at?` (bez neho hodiny servera) | `{id, status, wait_due_at, wait_n, wait_reason}` | 403, 404, 409 konečná bez čakania |

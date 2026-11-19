@@ -5,6 +5,7 @@
 // The heartbeat also tells `wake status` whether the wake is running.
 import fs from 'node:fs';
 import path from 'node:path';
+import { readLock, lockLive, createExclusive } from '../common/lock.mjs';
 
 export const LOCK_HEARTBEAT_MS = 30_000;
 export const LOCK_STALE_MS = 3 * LOCK_HEARTBEAT_MS;
@@ -12,29 +13,11 @@ const LOCK_POLL_MS = 10_000;
 
 export const lockFile = (stateDir) => path.join(stateDir, 'wake.lock');
 
-export function readWakeLock(stateDir) {
-  try { return JSON.parse(fs.readFileSync(lockFile(stateDir), 'utf8')); } catch { return null; }
-}
+export const readWakeLock = (stateDir) => readLock(lockFile(stateDir));
 
-function alive(pid) {
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
-}
-
-/** The lock is held by another live process with a fresh heartbeat. */
+/** The lock is held by another live process with a fresh heartbeat (the own pid does not hold it: one `wake run` per process). */
 export function lockHeld(lock, { now = Date.now(), pid = process.pid } = {}) {
-  if (!lock || !Number.isInteger(lock.pid) || lock.pid === pid) return false;
-  const beat = Date.parse(lock.heartbeat_at || '');
-  return alive(lock.pid) && !Number.isNaN(beat) && now - beat < LOCK_STALE_MS;
-}
-
-function tryCreate(file, rec) {
-  try {
-    fs.writeFileSync(file, JSON.stringify(rec), { flag: 'wx' });
-    return true;
-  } catch (e) {
-    if (e.code === 'EEXIST') return false;
-    throw e;
-  }
+  return !!lock && lock.pid !== pid && lockLive(lock, LOCK_STALE_MS, now);
 }
 
 /**
@@ -49,7 +32,7 @@ export async function acquireWakeLock(stateDir, { log = () => {}, signal = null,
   let told = false;
   for (;;) {
     if (signal?.aborted) return null;
-    if (tryCreate(file, rec())) break;
+    if (createExclusive(file, rec())) break;
     const lock = readWakeLock(stateDir);
     if (!lockHeld(lock)) {
       // Stale (dead pid, no heartbeat, unreadable) or our own: replace it.

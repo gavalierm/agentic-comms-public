@@ -1,15 +1,20 @@
 // keep: core (5a, client of mail model 3): the outbox replayed twice is one answer; a service of another model gets
 // nothing written or queued and a flush keeps the outbox; 3c order of a flush (a model 2 item without brain → rejected/);
-// the obligations backup (3b).
+// the obligations backup (3b); one flush of an outbox at a time (flush lock: two flushes at once, a stale lock, a lock
+// still held when the wait ends).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import { spawnSync } from 'node:child_process';
 import { makeInstance, startInstance, makeClient, cleanup, tmpDir, runCli } from './helpers.mjs';
 import { Client, resolveConfig, modelMismatchText } from '../src/client/index.mjs';
 
 const BOX = { project: 'p', topic: 't' };
+// Literals, not imports: the lock file name is a contract between the clients of one machine (sessions may run two versions).
+const FLUSH_LOCK = 'flush.lock';
+const FLUSH_BUSY_TEXT = 'outbox flush in progress';
 const jsonFiles = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f.endsWith('.json')) : []);
 const readMsg = (inst, id) => JSON.parse(fs.readFileSync(path.join(inst.dir, 'messages', `${id}.json`), 'utf8'));
 
@@ -22,6 +27,17 @@ async function setup(t) {
   const recipient = makeClient(inst, { thread: 'thr-b', outbox });
   await recipient.registerTopic({ ...BOX, subject: 'S', holder: 'thr-b' });
   return { inst, s, outbox, sender, recipient };
+}
+
+/** What reaches the service, in order: the text of each send and the state of each turn record. */
+function recordWrites(s) {
+  const seen = [];
+  const { service } = s.srv;
+  for (const [name, label] of [['send', (_sender, body) => body.text], ['turn', (body) => `turn ${body.state}`]]) {
+    const orig = service[name].bind(service);
+    service[name] = (...a) => { seen.push(label(...a)); return orig(...a); };
+  }
+  return seen;
 }
 
 /** A fake service: /health answers `health`, every other request `status` with `body`. */
@@ -142,4 +158,83 @@ test('obligations backup (3b): offline answer is the last live one, marked, with
   assert.deepEqual(after.owed, [], 'a resolved, b withdrawn');
   assert.equal(jsonFiles(outbox).length, 0);
   assert.deepEqual([readMsg(inst, a.id).resolution, readMsg(inst, b.id).resolution], ['reply', 'withdrawn']);
+});
+
+test('one flush of an outbox at a time: two flushes and a send at once in one process, then two processes: every item reaches the service once, in order, no call fails', async (t) => {
+  const { inst, s, outbox, sender, recipient } = await setup(t);
+  const seen = recordWrites(s);
+  // Four sends and a turn record (it has no client_op_id: the service cannot replay it).
+  const fill = (tag) => {
+    for (const n of [1, 2, 3, 4]) sender.queue('/send', { ...BOX, level: 'assist', text: `${tag}${n}`, thread_id: 'thr-a', client_op_id: `op-${tag}${n}` });
+    sender.queue('/turn', { thread: 'thr-a', state: 'closed', opened_at: 'old-turn' });
+  };
+  fill('a');
+  const [f1, f2, live] = await Promise.all([
+    sender.flushOutbox(),
+    recipient.flushOutbox(),
+    makeClient(inst, { thread: 'thr-a', outbox }).send({ ...BOX, level: 'assist', text: 'live' }),
+  ]);
+  assert.deepEqual(seen, ['a1', 'a2', 'a3', 'a4', 'turn closed', 'live'], 'once each, in order, the new write last');
+  assert.deepEqual([f1.sent.length + f2.sent.length, [...f1.sent, ...f2.sent].some((x) => x.replayed)], [5, false]);
+  assert.equal(live.status, 'pending');
+  assert.deepEqual(fs.readdirSync(outbox), [], 'no item and no lock left');
+
+  // Two processes (two sessions of one brain, each runs a hook).
+  fill('b');
+  seen.length = 0;
+  const flush = ['flush', '--data-dir', inst.dir, '--key', inst.key, '--no-start', '--outbox', outbox];
+  const runs = await Promise.all([runCli(flush), runCli(flush)]);
+  assert.deepEqual(runs.map((r) => r.code), [0, 0], runs.map((r) => r.err).join('\n'));
+  assert.deepEqual(seen, ['b1', 'b2', 'b3', 'b4', 'turn closed']);
+  assert.equal(runs[0].json.sent.length + runs[1].json.sent.length, 5);
+  assert.deepEqual(fs.readdirSync(outbox), []);
+});
+
+test('flush lock: a lock of a dead process or with an old heartbeat is taken over', async (t) => {
+  const { outbox, sender } = await setup(t);
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  const locks = [
+    { pid: dead, token: 'other', heartbeat_at: new Date().toISOString(), stale_ms: 60_000 },
+    { pid: process.pid, token: 'other', heartbeat_at: new Date(Date.now() - 61_000).toISOString(), stale_ms: 60_000 },
+  ];
+  for (const [i, lock] of locks.entries()) {
+    sender.queue('/send', { ...BOX, level: 'assist', text: `m${i}`, thread_id: 'thr-a', client_op_id: `op-stale-${i}` });
+    fs.writeFileSync(path.join(outbox, FLUSH_LOCK), JSON.stringify(lock));
+    const r = await sender.flushOutbox();
+    assert.deepEqual([r.sent.length, r.busy], [1, undefined], `lock ${i}`);
+    assert.deepEqual(fs.readdirSync(outbox), [], 'the stale lock is gone, the new one released');
+  }
+});
+
+test('flush lock still held when the wait ends: a send and a closed turn are queued behind the outbox, an open turn and obligations go on, nothing overtakes', async (t) => {
+  const { inst, s, outbox, sender } = await setup(t);
+  const seen = recordWrites(s);
+  sender.queue('/send', { ...BOX, level: 'assist', text: 'first', thread_id: 'thr-a', client_op_id: 'op-first' });
+  // A live flush of another caller: this process, another token, a fresh heartbeat.
+  const lockFile = path.join(outbox, FLUSH_LOCK);
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, token: 'other', heartbeat_at: new Date().toISOString(), stale_ms: 60_000 }));
+  const c = () => makeClient(inst, { thread: 'thr-a', outbox, timeout: 250 });
+  const [w, closed, open, ob, fl] = await Promise.all([
+    c().send({ ...BOX, level: 'assist', text: 'second' }),
+    c().turn({ thread: 'thr-a', state: 'closed', opened_at: 'old-turn' }),
+    c().turn({ thread: 'thr-a', state: 'open' }),
+    c().obligations({ thread: 'thr-a' }),
+    c().flushOutbox(),
+  ]);
+  assert.deepEqual([w.queued, w.message, typeof w.client_op_id, fs.existsSync(w.outbox_file)], [true, FLUSH_BUSY_TEXT, 'string', true]);
+  assert.deepEqual([closed.ok, closed.unavailable, closed.queued, closed.error], [false, true, true, FLUSH_BUSY_TEXT]);
+  assert.equal(open.turn.state, 'open', 'open is never queued');
+  assert.equal(ob.offline, false);
+  assert.deepEqual([fl.busy, fl.remaining, fl.sent.length], [true, 1, 0]);
+  assert.deepEqual(seen, ['turn open'], 'no queued write reached the service');
+  assert.equal(JSON.parse(fs.readFileSync(lockFile, 'utf8')).token, 'other', 'the live lock is not touched');
+  const queued = jsonFiles(outbox).sort().map((f) => JSON.parse(fs.readFileSync(path.join(outbox, f), 'utf8')));
+  assert.deepEqual([queued.length, queued[0].body.text], [3, 'first']);
+
+  // The other flush ends: the next flush sends all three, the oldest first.
+  fs.rmSync(lockFile);
+  const r = await sender.flushOutbox();
+  assert.deepEqual([r.sent.length, r.busy], [3, undefined]);
+  assert.deepEqual([seen[1], seen.slice(2).sort()], ['first', ['second', 'turn closed']]);
+  assert.deepEqual(fs.readdirSync(outbox), []);
 });

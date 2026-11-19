@@ -28,6 +28,7 @@ export function notifyOperator(instance, { notice, message, log = () => {} }) {
   try {
     const child = spawn(command, {
       shell: true,
+      windowsHide: true, // the detached server has no console on Windows: without it cmd.exe opens a window that takes the focus
       stdio: ['pipe', 'ignore', 'pipe'],
       env: {
         ...process.env,

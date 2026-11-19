@@ -1,6 +1,6 @@
 # src/
 
-- `common/`: cesty podľa OS (`paths.mjs`: dátový priečinok, socket / named pipe), pomôcky (`util.mjs`: atomický zápis JSON, ID, úrovne), samoreštart (`selfrestart.mjs`: revízia `.git/HEAD`, sledovanie súborov, vypnutie).
+- `common/`: cesty podľa OS (`paths.mjs`: dátový priečinok, socket / named pipe), pomôcky (`util.mjs`: atomický zápis JSON, ID, úrovne), samoreštart (`selfrestart.mjs`: revízia `.git/HEAD`, sledovanie súborov, vypnutie), zámky (`lock.mjs`: výlučné vytvorenie, živý držiteľ podľa `pid` a `heartbeat_at`, zámok s tokenom; používa ho zámok budenia `wake/lock.mjs` a zámok flushu outboxu v `client/index.mjs`).
 - `server/`: `store.mjs` (súbory inštancie: správy, témy, oznamy, udalosti, kľúče), `service.mjs` (logika `send`/`receive`/`decide`/udalosti, lehoty TTL, ťahy; `decide` pozdržanú správu po lehote nedoručí ani nepresmeruje, `refuseExpiredHeld`), `http.mjs` (routing, kľúč → odosielateľ), `page.mjs` (HTML stránka oznamov), `index.mjs` (štart na sockete, voliteľne TCP).
 - `client/`: `index.mjs` (`http.request` so `socketPath`, overenie `instance_id`, spustenie na požiadanie, outbox, cache počtu), `cli.mjs` (príkazy a voľby).
 - `notify/`: externý príkaz `notify.command` pri `blocker`.

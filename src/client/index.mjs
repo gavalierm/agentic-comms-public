@@ -1,7 +1,8 @@
 // Client core of mail model 3: http.request over socketPath (or an http:// / https:// URL), instance_id and model check, start-on-demand,
 // outbox for outages (writes with client_op_id), obligations with an offline backup, message count.
 // Model (4a, I10): every request carries X-Comms-Model: 3; a service of another model (/health, 426) fails loudly and
-// nothing is written or queued. The outbox is only for an unavailable service (P-041).
+// nothing is written or queued. The outbox is only for an unavailable service (P-041). One flush of an outbox runs at a
+// time (flush lock in the outbox directory): a second flush would send every item again and lose the order.
 // Model 3: a topic is brain + machine + project + topic; every request names this client's brain (X-Comms-Brain,
 // X-Comms-Brain-Name; COMMS_BRAIN, COMMS_BRAIN_NAME) and machine (X-Comms-Machine; COMMS_MACHINE).
 import http from 'node:http';
@@ -12,7 +13,8 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dataDir as resolveDataDir, instanceName, socketPath, clientDir } from '../common/paths.mjs';
-import { readJson, writeJson, listJsonFiles, nowIso, newId, normalizeMachine } from '../common/util.mjs';
+import { readJson, writeJson, listJsonFiles, nowIso, newId, normalizeMachine, sleep } from '../common/util.mjs';
+import { acquireTokenLock } from '../common/lock.mjs';
 
 export const DEFAULT_TIMEOUT = 2000;
 export const COUNT_TTL = 60_000;
@@ -22,6 +24,15 @@ export const TURN_TIMEOUT = 1000;
 export const MAIL_MODEL = 3;
 /** Writes that go into the outbox on outage; each carries a client_op_id (the service replays a repeated one). */
 export const OUTBOX_OPS = ['/send', '/resolve', '/withdraw'];
+/** Flush lock of an outbox: a file in the outbox directory that is not an item (`listJsonFiles` reads only *.json). */
+export const FLUSH_LOCK = 'flush.lock';
+/**
+ * A flush without a heartbeat for this long is replaced. The heartbeat is refreshed before each item and one request is
+ * bounded by the timeout, so three timeouts (at least 10 s) never end a flush that still sends.
+ */
+export const flushStaleMs = (timeout) => Math.max(10_000, 3 * timeout);
+/** The line of a write queued because another flush of the outbox still ran when the wait ended. */
+export const FLUSH_BUSY_TEXT = 'outbox flush in progress';
 /** Query parameters sent also when empty (model 3: an explicit mailbox key without brain or machine). */
 const KEEP_EMPTY = ['brain', 'machine'];
 const BIN = fileURLToPath(new URL('../../bin/comms.mjs', import.meta.url));
@@ -193,19 +204,20 @@ export class Client {
 
   /**
    * A write of the outbox kind (send, resolve, withdraw) with a client_op_id: the outbox goes first (order), then this
-   * write. Only an unavailable service queues it (`{ queued: true, client_op_id, outbox_file }`); another model, a
+   * write. An unavailable service queues it (`{ queued: true, client_op_id, outbox_file }`), and so does a flush of
+   * another caller that still runs when the wait ends (the write must not overtake the queued ones); another model, a
    * rejection or an instance mismatch throw and nothing is queued.
    */
   async write(pathname, body) {
     const item = { ...body, client_op_id: body.client_op_id || newId() };
+    const queued = (message) => ({ queued: true, client_op_id: item.client_op_id, outbox_file: this.queue(pathname, item), message });
     try {
       await this.ensureRunning();
-      if (listJsonFiles(this.cfg.outbox).length) await this.flushOutbox();
+      if (listJsonFiles(this.cfg.outbox).length && (await this.flushOutbox()).busy) return queued(FLUSH_BUSY_TEXT);
       return await this.request('POST', pathname, { body: item });
     } catch (e) {
       if (e.code !== 'UNAVAILABLE') throw e;
-      const file = this.queue(pathname, item);
-      return { queued: true, client_op_id: item.client_op_id, outbox_file: file, message: 'comms unavailable' };
+      return queued('comms unavailable');
     }
   }
 
@@ -269,21 +281,23 @@ export class Client {
    * Record a turn (open/closed); never thrown on outage. On outage a `closed` record is
    * queued in the outbox (sent with the next flush; the service ignores it when `opened_at`
    * no longer matches) → `{ ok:false, unavailable:true, queued:true }`; `open` is not queued
-   * → `{ ok:false, unavailable:true }`.
+   * → `{ ok:false, unavailable:true }`. A flush of another caller that still runs when the wait ends: a `closed` is
+   * queued the same way (behind the queued records), an `open` is sent without its own flush.
    */
   async turn(body) {
+    const closed = body && body.state === 'closed';
+    const queued = (error) => ({ ok: false, unavailable: true, queued: true, outbox_file: this.queue('/turn', body), error });
     try {
       // A `closed` queued during an outage goes first: else the service keeps an old turn open and wake skips the
       // thread as already rung (fable audit M6). Turn records run every prompt, so the outbox drains here too.
-      if (listJsonFiles(this.cfg.outbox).length) { await this.ensureRunning(); await this.flushOutbox(); }
+      if (listJsonFiles(this.cfg.outbox).length) {
+        await this.ensureRunning();
+        if ((await this.flushOutbox()).busy && closed) return queued(FLUSH_BUSY_TEXT);
+      }
       return await this.call('POST', '/turn', { body });
     } catch (e) {
       if (e.code !== 'UNAVAILABLE') throw e;
-      if (body && body.state === 'closed') {
-        const file = this.queue('/turn', body);
-        return { ok: false, unavailable: true, queued: true, outbox_file: file, error: e.message };
-      }
-      return { ok: false, unavailable: true, error: e.message };
+      return closed ? queued(e.message) : { ok: false, unavailable: true, error: e.message };
     }
   }
   events(since, wait) {
@@ -327,55 +341,77 @@ export class Client {
     return out;
   }
 
+  /** Move a refused item to rejected/ with its error file; false when the item is gone (another flush finished it). */
+  moveRejected(f, error, status = null, details = null) {
+    const dir = path.join(this.cfg.outbox, 'rejected');
+    fs.mkdirSync(dir, { recursive: true });
+    try { fs.renameSync(path.join(this.cfg.outbox, f), path.join(dir, f)); } catch (e) { if (e.code === 'ENOENT') return false; throw e; }
+    writeJson(path.join(dir, `${f}.error.json`), { error, status, details, at: nowIso() });
+    return true;
+  }
+
   /**
    * Send the queued items in order (3c). The model is checked first (ensureRunning): another model leaves every item
    * where it is. Per item: 2xx → done; 409 with a final status → dropped with the line `already <resolution>`; another
    * 4xx → `rejected/` with a line; outage, 426 or 5xx → stop, the rest stays. Returns
    * `{ sent, dropped, rejected, remaining, lines }`; an outage or another model throws after recording what was sent.
+   * One flush of an outbox at a time (flush lock, across processes and inside one): a second flush waits at most
+   * cfg.timeout, then reads the outbox again. Still locked then: nothing is sent, the answer has `busy: true` and
+   * `remaining` (the caller must not overtake the queued items).
    */
   async flushOutbox() {
     await this.ensureRunning();
-    const items = this.outboxItems();
     const out = { sent: [], dropped: [], rejected: [], remaining: 0, lines: [] };
-    for (let i = 0; i < items.length; i++) {
-      const { file: f, item } = items[i];
-      const full = path.join(this.cfg.outbox, f);
-      // An item of model 2 (queued without the sender's brain) cannot name its topic: it goes to rejected/ with its address.
-      if (OUTBOX_OPS.includes(item.path) && !(item.body && 'from_brain' in item.body)) {
-        const dir = path.join(this.cfg.outbox, 'rejected');
-        fs.mkdirSync(dir, { recursive: true });
-        fs.renameSync(full, path.join(dir, f));
-        const error = 'model 2 item without brain';
-        writeJson(path.join(dir, `${f}.error.json`), { error, status: null, details: null, at: nowIso() });
-        out.rejected.push({ file: f, path: item.path, status: null, error });
-        out.lines.push(`rejected ${item.path} ${itemAddress(item.body)} (${error})`.replace(/\s+/g, ' '));
-        continue;
-      }
-      try {
-        const res = await this.request('POST', item.path, { body: item.body });
-        fs.unlinkSync(full);
-        out.sent.push({ file: f, path: item.path, id: res.id ?? null, ...(res.replayed ? { replayed: true } : {}) });
-      } catch (e) {
-        const st = e.data || {};
-        if (e.code === 'REJECTED' && e.status === 409 && FINAL_STATUSES.includes(st.status)) {
-          fs.unlinkSync(full);
-          const line = `already ${st.resolution || st.status} ${st.id || item.body.id || ''}`.trim();
-          out.dropped.push({ file: f, path: item.path, id: st.id || item.body.id || null, status: st.status, resolution: st.resolution || null });
-          out.lines.push(line);
+    // Nothing queued (most calls): no lock.
+    const waiting = listJsonFiles(this.cfg.outbox).length;
+    if (!waiting) return out;
+    const lock = await acquireTokenLock(path.join(this.cfg.outbox, FLUSH_LOCK), { waitMs: this.cfg.timeout, staleMs: flushStaleMs(this.cfg.timeout) });
+    if (!lock) return { ...out, remaining: waiting, busy: true };
+    try { return await this.flushLocked(lock, out); } finally { lock.release(); }
+  }
+
+  /** The flush itself, under the flush lock. */
+  async flushLocked(lock, out) {
+    // The outbox is read under the lock, and again after each pass: an item queued while this flush ran (a caller whose
+    // wait ended) goes with it, not with a later call. Every pass removes its items or throws, so the loop ends.
+    for (let items = this.outboxItems(); items.length; items = this.outboxItems()) {
+      for (let i = 0; i < items.length; i++) {
+        const { file: f, item } = items[i];
+        const full = path.join(this.cfg.outbox, f);
+        // Heartbeat before each item. A lock that is no longer ours (replaced as stale) stops this flush: the new holder sends the rest.
+        if (!lock.beat()) return Object.assign(out, { remaining: items.length - i, busy: true });
+        // An item of model 2 (queued without the sender's brain) cannot name its topic: it goes to rejected/ with its address.
+        if (OUTBOX_OPS.includes(item.path) && !(item.body && 'from_brain' in item.body)) {
+          const error = 'model 2 item without brain';
+          if (!this.moveRejected(f, error)) continue;
+          out.rejected.push({ file: f, path: item.path, status: null, error });
+          out.lines.push(`rejected ${item.path} ${itemAddress(item.body)} (${error})`.replace(/\s+/g, ' '));
           continue;
         }
-        if (e.code === 'REJECTED' && e.status >= 400 && e.status < 500) {
-          const dir = path.join(this.cfg.outbox, 'rejected');
-          fs.mkdirSync(dir, { recursive: true });
-          fs.renameSync(full, path.join(dir, f));
-          writeJson(path.join(dir, `${f}.error.json`), { error: e.message, status: e.status, details: e.data || null, at: nowIso() });
-          out.rejected.push({ file: f, path: item.path, status: e.status, error: e.message });
-          out.lines.push(`rejected ${item.path} ${item.body.id || ''} (${e.status}): ${e.message}`.replace(/\s+/g, ' '));
-          continue;
+        try {
+          const res = await this.request('POST', item.path, { body: item.body });
+          // Tolerant removes (force): a file that is already gone was finished by another flush.
+          fs.rmSync(full, { force: true });
+          out.sent.push({ file: f, path: item.path, id: res.id ?? null, ...(res.replayed ? { replayed: true } : {}) });
+        } catch (e) {
+          const st = e.data || {};
+          if (e.code === 'REJECTED' && e.status === 409 && FINAL_STATUSES.includes(st.status)) {
+            fs.rmSync(full, { force: true });
+            const line = `already ${st.resolution || st.status} ${st.id || item.body.id || ''}`.trim();
+            out.dropped.push({ file: f, path: item.path, id: st.id || item.body.id || null, status: st.status, resolution: st.resolution || null });
+            out.lines.push(line);
+            continue;
+          }
+          if (e.code === 'REJECTED' && e.status >= 400 && e.status < 500) {
+            if (!this.moveRejected(f, e.message, e.status, e.data || null)) continue;
+            out.rejected.push({ file: f, path: item.path, status: e.status, error: e.message });
+            out.lines.push(`rejected ${item.path} ${item.body.id || ''} (${e.status}): ${e.message}`.replace(/\s+/g, ' '));
+            continue;
+          }
+          out.remaining = items.length - i;
+          e.flush = out;
+          throw e;
         }
-        out.remaining = items.length - i;
-        e.flush = out;
-        throw e;
       }
     }
     return out;
@@ -385,8 +421,9 @@ export class Client {
   obligationsCacheFile() { return path.join(this.cfg.clientDir, 'obligations-cache.json'); }
 
   /**
-   * What the thread owes and awaits (`GET /obligations`). Live: the outbox is flushed first (3c point 2), the answer then
-   * replaces the backup for this query (point 3). Unavailable: the last answer of the same query with `offline: true`,
+   * What the thread owes and awaits (`GET /obligations`). Live: the outbox is flushed first (3c point 2; a flush of
+   * another caller that still runs when the wait ends is not repeated: this is a read), the answer then replaces the
+   * backup for this query (point 3). Unavailable: the last answer of the same query with `offline: true`,
    * `age_s`, no `recent` rows (they were shown), minus the ids with a queued operation (an owed message with a queued
    * resolve, an awaited one with a queued withdraw). No backup yet → `{ offline: true, unavailable: true, cached: false }`.
    * Another model throws (nothing is read).
@@ -488,8 +525,4 @@ function itemAddress(b = {}) {
   if (b.to_thread) return `thread/${b.to_thread}`;
   if (b.maintainer) return 'maintainer';
   return b.id || '';
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }

@@ -4,7 +4,7 @@ Tento dokument je **záväzný opis** modelu pošty 2 (D-0087, D-0089, D-0090). 
 
 Pravidlo D-0090: koncept pošty sa pri ďalších zmenách nesmie rozbiť. **Každá zmena pošty tento dokument najprv prečíta a zmení ako prvý** (časť 6). Keď sa kód a tento dokument rozchádzajú, je to chyba, ktorá sa opraví v kóde alebo vedome tu, nikdy sa neprehliadne.
 
-Skratky: LC = `src/server/lifecycle.mjs`, SV = `src/server/service.mjs`, HT = `src/server/http.mjs`, MG = `src/server/migrate.mjs`, CL = `src/client/index.mjs`, CLI = `src/client/cli.mjs`, WK = `src/wake/index.mjs`, UT = `src/common/util.mjs`.
+Skratky: LC = `src/server/lifecycle.mjs`, SV = `src/server/service.mjs`, HT = `src/server/http.mjs`, MG = `src/server/migrate.mjs`, CL = `src/client/index.mjs`, CLI = `src/client/cli.mjs`, WK = `src/wake/index.mjs`, UT = `src/common/util.mjs`, LK = `src/common/lock.mjs`.
 
 ## 1. Princíp
 
@@ -86,6 +86,7 @@ Testy jadra sú označené `// keep: core` a nesmú sa zmazať bez náhrady (ča
 | migrácia 2→3 (schema 3) | lifecycle.core: `schema 3: migration of a schema-2 sample keys topics and messages by brain and machine, verifies, a second start changes nothing; a stop in the middle leaves schema 2` |
 | migrácia 4b | lifecycle.core: `4b: migration of a 0.4 sample (bounced_at, replies without answer_state, busy, steer) → expected status; second start changes nothing`; `4b: verification catches a planted error: the service does not start and names the ids` |
 | outbox po obnove (3c) | client.core: ``flush (3c): 409 with a final status drops the item with `already <resolution>`; another refusal goes to rejected/`` |
+| jeden flush outboxu naraz (zámok `flush.lock`) | client.core: `one flush of an outbox at a time: two flushes and a send at once in one process, then two processes: every item reaches the service once, in order, no call fails`; `flush lock: a lock of a dead process or with an old heartbeat is taken over`; `flush lock still held when the wait ends: a send and a closed turn are queued behind the outbox, an open turn and obligations go on, nothing overtakes` |
 | záloha `obligations` (3b) | client.core: `obligations backup (3b): offline answer is the last live one, marked, without recent, minus ids with a queued operation` |
 | busy iba pre bežiace vlákno | wake: `a stale open turn record gives no busy: T3 not running → rung, nothing queued, a due wait rings; while T3 runs the thread its mail is held and rung after the run`; `a workflow thread T3 runs gets no ring behind the run (closed record too); picked in the run: none after it; past turnBusyMaxMs: rung behind the run`; `without the thread state an open record counts only within its deadline: past it the service writes no busy, a due wait rings, wake queues nothing` |
 
@@ -138,6 +139,16 @@ Zrušené bez náhrady (D-0089): `POST /ack`, `POST /settle`, `send` s `reply_to
 Kódy CLI: 0 ok, 1 odmietnuté alebo použitie, 2 `comms unavailable`, 3 iná inštancia alebo iný model.
 
 Outbox (CL `write`, `flushOutbox`): zápis ide do outboxu **iba** pri `UNAVAILABLE`; 426, 4xx a iná inštancia zlyhajú hneď. `flush` najprv overí model (iný → nič sa nepohne), potom v poradí: 2xx → hotovo; 409 s konečným `status` → zahodí s riadkom `already <resolution> <id>`; iné 4xx → `rejected/` + `.error.json`; výpadok, 426, 5xx → stop, zvyšok ostáva.
+
+Jeden flush naraz (CL `flushOutbox`, LK `acquireTokenLock`): outbox posiela najviac jeden flush naraz, medzi procesmi aj v jednom procese (dve relácie jedného brainu, dve volania klienta v procese hooku). Dva súbežné flushe by každú položku poslali dvakrát (`turn` nemá `client_op_id`) a stratili poradie.
+
+- Zámok je súbor `flush.lock` v priečinku outboxu (nie `*.json`, takže nie je položka). Vzniká výlučným vytvorením (`wx`) a drží `{pid, token, heartbeat_at, stale_ms}`. Vlastníkom je `token` jedného získania, nie `pid`: dva klienty jedného procesu sa vylučujú tiež.
+- Držiteľ obnoví `heartbeat_at` pred každou položkou a zámok zmaže na konci (`finally`). Keď zámok už nenesie jeho `token`, flush zastaví (`busy: true`); zvyšok pošle nový držiteľ.
+- Zámok mŕtveho `pid` alebo s `heartbeat_at` starším ako `stale_ms` držiteľa prevezme ďalší flush. `stale_ms` = 3 × `timeout` držiteľa, najmenej 10 s; jedna položka trvá najviac `timeout`.
+- Druhý flush čaká (opakovanie po 25 ms) najviac svoj `timeout`, potom číta outbox znova: zvyčajne je prázdny a nič nejde dvakrát.
+- Čakanie uplynie a iný flush ešte beží: flush nič nepošle a vráti `busy: true` s `remaining`. Volajúci zaradené zápisy nepredbehne: `write` (`send`, `resolve`, `withdraw`) zaradí svoju položku ako pri výpadku (`queued: true`, `message: outbox flush in progress`); `turn` `closed` rovnako (`queued: true`, `error: outbox flush in progress`); `turn` `open` (nikdy sa nezaraďuje) a `obligations` (čítanie) pokračujú bez vlastného flushu.
+- Bežiaci flush číta outbox po každom prechode znova: položku zaradenú počas neho pošle sám. Položku zaradenú po jeho poslednom čítaní pošle ďalší flush.
+- Súbor, ktorý pri mazaní alebo presune do `rejected/` už neexistuje, nie je chyba: dokončil ho iný flush.
 
 Záloha (CL `obligations`): živá odpoveď (po `flush`) prepíše `obligations-cache.json` pre ten istý dotaz; pri výpadku posledná živá odpoveď s `offline: true`, `cached`, `age_s`, bez `recent`, bez `id` s operáciou v outboxe (z `inbox` každá, z `owed` `resolve`, z `awaiting` `withdraw`).
 

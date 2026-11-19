@@ -113,6 +113,10 @@ export function listJsonFiles(dir) {
   }
 }
 
+export function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /** Human readable waiting time for the operator page (Slovak). */
 export function waitingText(sinceIso, now = Date.now()) {
   const s = Math.max(0, Math.round((now - Date.parse(sinceIso)) / 1000));

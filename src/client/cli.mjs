@@ -91,7 +91,8 @@ Správy (vyžadujú kľúč: --key, COMMS_KEY alebo "key" v --config; model poš
                  nová registrácia bez --close ju znovu otvorí
   events [--since <n>|latest] [--wait <ms>]       udalosti budenia novej správy a odpovede (long-poll)
   flush                                           odošle odchádzajúcu schránku (outbox): 409 s konečným stavom zahodí („already <resolution>“),
-                                                  iné odmietnutie presunie do rejected/; pri inom modeli pošty ostane celá
+                                                  iné odmietnutie presunie do rejected/; pri inom modeli pošty ostane celá;
+                                                  jeden flush naraz: keď iný ešte beží po lehote, vráti busy: true a nič nepošle
   clients                                         verzie pošty a workflow podľa odosielateľa (persony) a stroja, ako ich služba videla
                                                   (comms_version a workflow_version null: starý klient bez verzie alebo workflow ju neposlal)
 
@@ -123,6 +124,13 @@ export function parseArgs(argv) {
 
 const camel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
+/**
+ * One CLI call: the exit code; the output goes to `stdout` and `stderr`. The workflow calls it inside its hook process
+ * too (agentic-flow scripts/comms.mjs clientInProcess: no process per call, two calls at once, always with --no-start),
+ * so: the settings of a call (thread, brain, machine, workflow version) are read from process.env before the first await
+ * (resolveConfig below; the caller sets those variables for that part only), nothing is kept between calls in this
+ * module, and no command of a client ends the process.
+ */
 export async function main(argv, { stdout = process.stdout, stderr = process.stderr, stdin = process.stdin } = {}) {
   let args;
   try {

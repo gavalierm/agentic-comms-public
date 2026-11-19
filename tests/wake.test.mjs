@@ -1273,11 +1273,40 @@ test('without the thread state an open record counts only within its deadline: p
   assert.ok(expire(ctx, s1.id).includes(s1.id), 'expired: no code answer');
   const st = await client.message(s1.id);
   assert.deepEqual([st.code_answer, st.status, st.wait_reason], [null, 'pending', 'no-reply']);
-  // Wake: a blocker (it passes the discussion) rings thr-1 as an idle thread; no ring is queued behind its record.
+  // Wake: the stale record holds nothing for its discussion (discussionHolds): both steers and a blocker ring thr-1 as
+  // an idle thread (no dedupe of the bell in this setup); no ring is queued behind its record.
   await client.send({ project: 'p', topic: 't', level: 'blocker', text: 'now', thread_id: 'thr-c' });
   await waker.pollOnce(500);
-  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-1'), [{ holder: 'thr-1', text: `you have mail from alice in topic p/t` }]);
+  assert.deepEqual(adapter.calls.filter((c) => c.holder === 'thr-1'), Array(3).fill({ holder: 'thr-1', text: `you have mail from alice in topic p/t` }));
   assert.deepEqual(waker.state.queued, {});
+  assert.deepEqual(waker.state.held, {});
+});
+
+// keep: core
+// 2026-11-19: the maintainer's thread kept an open turn record with `discussion` for hours (no Stop reached the service);
+// wake held its mail for the discussion for ever and the report expired `no reply`.
+test('stale open discussion record: a steer/assist rings when T3 does not run the thread; held while T3 runs it, rung after the run', async (t) => {
+  const adapter = t3Adapter();
+  const { client, waker, clock } = await setup(t, { adapter, goneCheckMs: 0 });
+  await client.turn({ thread: 'thr-1', state: 'open', machine: 'm1', discussion: 'open' });
+  clock.t += 2 * TURN_BUSY_MAX_MS;   // the record is past its deadline
+  adapter.threads['thr-1'] = {};
+  await client.send({ project: 'p', topic: 't', level: 'assist', text: 'report', thread_id: 'thr-s' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(waker.state.held, {}, 'a stale record holds nothing');
+  assert.equal(adapter.calls.filter((c) => c.holder === 'thr-1').length, 1, 'rung at once');
+
+  // T3 runs the thread: the discussion holds behind an old record too; the end of the run without a Stop rings it.
+  adapter.threads['thr-1'] = { run: 'run-1' };
+  adapter.calls.length = 0;
+  await client.send({ project: 'p', topic: 't', level: 'steer', text: 'stop', thread_id: 'thr-s2' });
+  assert.equal(await waker.pollOnce(500), 1);
+  assert.deepEqual(Object.values(waker.state.held).map((e) => e.held_reason), ['discussion']);
+  assert.deepEqual(adapter.calls, [], 'no ring into the running discussion');
+  adapter.threads['thr-1'] = {};
+  await waker.pollOnce(100);
+  assert.deepEqual(waker.state.held, {});
+  assert.equal(adapter.calls.filter((c) => c.holder === 'thr-1').length, 1, 'rung after the run');
 });
 
 // keep: core

@@ -23,7 +23,7 @@
 // before the last T3 start whose thread no longer runs are rung with
 // KEEPALIVE_TEMPLATE (at most 3 attempts per hour per thread, ≥ 60 s apart) or, in
 // operator mode / after the 3rd failure, reported as `turn-interrupted`.
-// Discussion (D-0015, D-0022): a steer/assist to a holder that discusses with the operator (turn record, `discussionOpen`)
+// Discussion (D-0015, D-0022): a steer/assist to a holder that discusses with the operator (turn record, `discussionHolds`)
 // is held (wake-state `held`) and rung when the discussion ends (event `discussion-closed`, else the next poll); a
 // blocker passes.
 // Busy = the thread runs now (comms-client-wake, 2026-11-15): an open turn record alone is not enough (interrupted,
@@ -319,17 +319,17 @@ export class Waker {
     } catch (e) {
       this.log(`turns: ${e.message}; bez kontroly zaradeného zvončeka`);
     }
-    const discussing = turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record);
+    const inDiscussion = turnsKnown && DISCUSSION_HELD_LEVELS.includes(ev.type) && discussionOpen(record);
     const queuedMark = turnsKnown ? this.state.queued[holder] : null;
     // T3 is asked for every event of a known holder: a closed record does not say the run ended (Stop before the run's end,
     // a bell turn before its hook opened the record).
     const th = turnsKnown
       ? await this.threadNow(holder, record, now) : { busy: false, gone: false, known: false, running: false, run: null };
     // Archived or gone: no later turn comes, no hold and no ring; the message goes back to its sender (undelivered).
-    if (th.gone) return this.undeliverGone(ev, th.why, { holdOnError: discussing, now });
+    if (th.gone) return this.undeliverGone(ev, th.why, { holdOnError: inDiscussion, now });
     // The holder discusses with the operator (D-0015, D-0022): a steer/assist waits for the end of the discussion; a
-    // blocker passes. Without known turn records it rings, as before.
-    if (discussing) {
+    // blocker passes. Without known turn records it rings, as before. A stale open record holds nothing (discussionHolds).
+    if (inDiscussion && this.discussionHolds(record, th, now)) {
       this.hold(ev, now);
       return skip('discussion');
     }
@@ -490,14 +490,26 @@ export class Waker {
     }
   }
 
-  /** A held message's holder is archived or gone: the reason, else null (asked T3 at most once per `goneCheckMs`). */
-  async heldGone(holder) {
+  /** The T3 state of a held message's holder (archived, gone, running), asked at most once per `goneCheckMs`. */
+  async heldT3(holder) {
     const seen = (this.goneSeen ||= {})[holder];
     const now = this.now();
-    if (seen && now - seen.at < this.opts.goneCheckMs) return seen.why;
+    if (seen && now - seen.at < this.opts.goneCheckMs) return seen.t3;
     const t3 = await this.t3State(holder);
-    this.goneSeen[holder] = { at: now, why: t3.gone ? t3.why : null };
-    return this.goneSeen[holder].why;
+    this.goneSeen[holder] = { at: now, t3 };
+    return t3;
+  }
+
+  /**
+   * The discussion of `record` (discussionOpen) holds a steer/assist now. A closed record with `discussion` and an open one
+   * in the operator's dialog (`waiting_operator`) hold. An open record with `discussion` holds while T3 runs the thread,
+   * else only within `turnBusyMaxMs` of its last write (turnFresh: a turn the operator interrupted and goes on with).
+   * An older open record T3 does not run is stale (Stop lost, a session that no longer loads the workflow hooks) and
+   * holds nothing: it held the mail of the maintainer's thread for ever and the report expired `no reply` (2026-11-19).
+   */
+  discussionHolds(record, t3, now = this.now()) {
+    if (!record || record.state !== 'open' || record.waiting_operator) return true;
+    return turnFresh(record, now, this.opts.turnBusyMaxMs) || !!(t3 && t3.known && t3.running);
   }
 
   /**
@@ -576,13 +588,19 @@ export class Waker {
           const rec = turns.find((x) => x.thread === h) || null;
           if (rec && rec.state === 'open' && turnFresh(rec, this.now(), this.opts.turnBusyMaxMs)) continue;
         }
-      } else if (discussionOpen(turns.find((x) => x.thread === String(ev.holder)) || null)) {
-        const why = await this.heldGone(String(ev.holder));
-        if (!why) continue;
-        delete this.state.held[key];
-        this.state.save();
-        await this.undeliverGone(ev, why, { holdOnError: true });
-        continue;
+      } else {
+        const rec = turns.find((x) => x.thread === String(ev.holder)) || null;
+        if (discussionOpen(rec)) {
+          const t3 = await this.heldT3(String(ev.holder));
+          if (t3.gone) {
+            delete this.state.held[key];
+            this.state.save();
+            await this.undeliverGone(ev, t3.why, { holdOnError: true });
+            continue;
+          }
+          // Still discussing; a stale open record ends the hold (discussionHolds) and the message rings below.
+          if (this.discussionHolds(rec, t3)) continue;
+        }
       }
       delete this.state.held[key];
       this.state.save();

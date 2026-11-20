@@ -203,7 +203,7 @@ Zvončeky (celý prompt je presne tento text, nikdy telo správy):
 
 | Zvonček | Kedy |
 |---|---|
-| `you have mail from <odosielateľ> in topic <project>/<topic>` (najprv od koho, potom komu; workflow od v2.0.23; bez témy `thread/<id>`; odosielateľ: jeho téma `<project>/<topic>`, inak jeho kľúč, inak `thread/<id>`) | nová správa pre držiteľa, odpoveď pre odosielateľa (prvý priebežný stav a `hotovo`) |
+| `you have mail from <odosielateľ> in topic <project>/<topic>` (najprv od koho, potom komu; workflow od v2.0.23; bez témy `thread/<id>`; odosielateľ: jeho téma `<project>/<topic>`, inak jeho kľúč, inak `thread/<id>`; od v2.0.31 za ním na vlastnom riadku odkaz na vlákno odosielateľa `[<odosielateľ>](t3-thread://v1/<vlákno>)`, keď je to vlákno na tomto stroji; workflow od v2.0.59) | nová správa pre držiteľa, odpoveď pre odosielateľa (prvý priebežný stav a `hotovo`) |
 | `no reply <message_id>` | splatné čakanie s `wait_reason` `no-reply` (lehota uplynula bez prevzatia) alebo `check` (kontrola po priebežnej či kódovej odpovedi, po potvrdenom zvonení s dvojnásobným odstupom) |
 | `undelivered <message_id>` | splatné čakanie `undelivered` (adresáta sa nedalo zobudiť natrvalo, správu nikto neprevzal) |
 | `recipient closed <message_id>` | splatné čakanie `recipient-closed` (téma príjemcu uzavretá s prevzatou správou) |

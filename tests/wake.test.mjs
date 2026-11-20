@@ -8,7 +8,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeInstance, startInstance, makeClient, addKey, cleanup, sleep, tmpDir } from './helpers.mjs';
-import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, RECIPIENT_CLOSED_TEMPLATE, WAKE_TYPES, wakeText, dueText, pairKey, pairLimit, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
+import { Waker, WAKE_TEMPLATE, KEEPALIVE_TEMPLATE, CONTINUE_TEMPLATE, NO_REPLY_TEMPLATE, UNDELIVERED_TEMPLATE, RECIPIENT_CLOSED_TEMPLATE, WAKE_TYPES, wakeText, sentText, dueText, pairKey, pairLimit, resolveWakeConfig, readSince } from '../src/wake/index.mjs';
 import { acquireWakeLock, readWakeLock, lockHeld, lockFile } from '../src/wake/lock.mjs';
 import { parseTimestamp, parseDuration, TURN_BUSY_MAX_MS } from '../src/common/util.mjs';
 import { createT3Adapter, parseCommand, platformCommand } from '../src/adapters/t3/index.mjs';
@@ -115,6 +115,12 @@ test('blocker rings the topic holder with the fixed template, never the body', a
   assert.equal(wakeText({ project: 'p', topic: 't', from_project: 'q', from_topic: 'u', sender: 'bob' }), 'you have mail from q/u in topic p/t');
   assert.equal(wakeText({ holder: 'thr-9', sender: 'agent bob' }), 'you have mail from agent-bob in topic thread/thr-9');
   assert.equal(wakeText({ project: 'p', topic: 't', thread_id: 'thr-x' }), 'you have mail from thread/thr-x in topic p/t');
+  // the link to the sender's thread (operator 2026-11-20): only a thread of this machine, on a line of its own (cmd.exe: a space)
+  const linked = { project: 'p', topic: 't', from_project: 'q', from_topic: 'u', thread_id: 'mcp:launch:a1', from_machine: 'M1' };
+  assert.equal(sentText(linked, 'm1', 'linux'), 'you have mail from q/u in topic p/t\n[q/u](t3-thread://v1/mcp:launch:a1)');
+  assert.equal(sentText(linked, 'm1', 'win32'), 'you have mail from q/u in topic p/t [q/u](t3-thread://v1/mcp:launch:a1)');
+  for (const ev of [{ ...linked, from_machine: 'm2' }, { ...linked, from_machine: null }, { ...linked, thread_id: 'a b)' }, { ...linked, thread_id: null }]) assert.equal(sentText(ev, 'm1', 'linux'), wakeText(ev));
+  assert.equal(sentText(linked, undefined, 'linux'), wakeText(linked));
   // Cursor persisted; no replay on the next poll.
   assert.equal(await waker.pollOnce(0), 0);
   assert.equal(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).cursor, 1);

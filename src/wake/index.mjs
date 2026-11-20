@@ -136,6 +136,27 @@ export function wakeText(ev) {
   return from ? WAKE_TEMPLATE.replace(/ in topic$/, ` from ${from} in topic`) + ` ${topicLabel(ev)}` : `${WAKE_TEMPLATE} ${topicLabel(ev)}`;
 }
 
+/** Thread ids a T3 link carries as they are (uuid, `mcp:launch:<uuid>`, `thread:subagent:<id>`); no percent sign (cmd.exe). */
+const LINK_THREAD_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
+
+/**
+ * Link to the sender's thread, shown under the bell so the operator opens that thread from the message (operator
+ * 2026-11-20): `[<from>](t3-thread://v1/<thread>)`, a T3 link without an environment (it resolves in the T3 that shows
+ * it). Only for a sender thread on this machine (`from_machine`): a thread of another T3 would show as "no longer
+ * available". Needs workflow v2.0.59 (it recognises the bell with the link). Else ''.
+ */
+export function senderLink(ev, machine) {
+  const id = ev.thread_id == null ? '' : String(ev.thread_id);
+  if (!LINK_THREAD_RE.test(id) || !machine || !ev.from_machine || normalizeMachine(ev.from_machine) !== normalizeMachine(machine)) return '';
+  return `[${fromLabel(ev)}](t3-thread://v1/${id})`;
+}
+
+/** Text sent to the thread: the bell, then its sender link on a line of its own (cmd.exe carries no line break: a space). */
+export function sentText(ev, machine, platform = process.platform) {
+  const link = senderLink(ev, machine);
+  return link ? `${ringText(ev)}${platform === 'win32' ? ' ' : '\n'}${link}` : ringText(ev);
+}
+
 /**
  * Recipient part of a bell: the wake text without its sender. A duplicate bell is a bell to the same recipient (that
  * turn reads all its mail), whoever sent the mail; other bells are compared whole.
@@ -147,7 +168,7 @@ export function bellKey(text) {
   return t.replace(new RegExp(`^${head} from \\S+ in topic `), `${WAKE_TEMPLATE} `).replace(/ from \S+$/, '');
 }
 
-/** Exact ring text of an event (the whole prompt, never the body). */
+/** Exact ring text of an event (the bell, never the body; sentText adds the sender link). */
 export function ringText(ev) {
   return wakeText(ev);
 }
@@ -405,7 +426,8 @@ export class Waker {
     this.state.save();
     let result;
     try {
-      result = await this.adapter.ring(String(ev.holder), text);
+      // The link is not part of `text`: the state, the dedupe (bellKey) and the log keep the bell alone.
+      result = await this.adapter.ring(String(ev.holder), sentText(ev, this.opts.machine));
     } catch (e) {
       result = { ok: false, stderr: e.message };
     }

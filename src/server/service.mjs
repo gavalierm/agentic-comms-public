@@ -1827,7 +1827,7 @@ export function formatDuration(sec) {
 function eventBase(m) {
   return {
     message_id: m.id, level: m.level, project: m.project, topic: m.topic, brain: m.to_brain ?? null, machine: m.to_machine ?? null,
-    sender: m.sender, thread_id: m.thread_id, from_project: m.from_project, from_topic: m.from_topic, from_brain: m.from_brain ?? null, from_machine: m.from_machine ?? null,
+    sender: m.sender, thread_id: m.thread_id, thread_machine: m.thread_machine ?? null, from_project: m.from_project, from_topic: m.from_topic, from_brain: m.from_brain ?? null, from_machine: m.from_machine ?? null,
     text_hash: textHash(m.text),
   };
 }

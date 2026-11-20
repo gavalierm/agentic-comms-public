@@ -142,12 +142,14 @@ const LINK_THREAD_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]*$/;
 /**
  * Link to the sender's thread, shown under the bell so the operator opens that thread from the message (operator
  * 2026-11-20): `[<from>](t3-thread://v1/<thread>)`, a T3 link without an environment (it resolves in the T3 that shows
- * it). Only for a sender thread on this machine (`from_machine`): a thread of another T3 would show as "no longer
- * available". Needs workflow v2.0.59 (it recognises the bell with the link). Else ''.
+ * it). Only for a sender thread on this machine: a thread of another T3 would show as "no longer available". Its
+ * machine is `thread_machine` (a reply and a sender without a topic carry no `from_machine`: 76 of 300 messages,
+ * 2026-11-20), else `from_machine`. Needs workflow v2.0.59 (it recognises the bell with the link). Else ''.
  */
 export function senderLink(ev, machine) {
   const id = ev.thread_id == null ? '' : String(ev.thread_id);
-  if (!LINK_THREAD_RE.test(id) || !machine || !ev.from_machine || normalizeMachine(ev.from_machine) !== normalizeMachine(machine)) return '';
+  const from = ev.thread_machine || ev.from_machine;
+  if (!LINK_THREAD_RE.test(id) || !machine || !from || normalizeMachine(from) !== normalizeMachine(machine)) return '';
   return `[${fromLabel(ev)}](t3-thread://v1/${id})`;
 }
 

@@ -121,6 +121,9 @@ test('blocker rings the topic holder with the fixed template, never the body', a
   assert.equal(sentText(linked, 'm1', 'win32'), 'you have mail from q/u in topic p/t [q/u](t3-thread://v1/mcp:launch:a1)');
   for (const ev of [{ ...linked, from_machine: 'm2' }, { ...linked, from_machine: null }, { ...linked, thread_id: 'a b)' }, { ...linked, thread_id: null }]) assert.equal(sentText(ev, 'm1', 'linux'), wakeText(ev));
   assert.equal(sentText(linked, undefined, 'linux'), wakeText(linked));
+  // a reply carries no from_machine: the machine of the sender's thread decides, also against from_machine
+  assert.match(sentText({ ...linked, from_machine: null, thread_machine: 'm1' }, 'm1', 'linux'), /\n\[q\/u\]\(t3-thread:\/\/v1\/mcp:launch:a1\)$/);
+  assert.equal(sentText({ ...linked, thread_machine: 'm2' }, 'm1', 'linux'), wakeText(linked));
   // Cursor persisted; no replay on the next poll.
   assert.equal(await waker.pollOnce(0), 0);
   assert.equal(JSON.parse(fs.readFileSync(waker.state.file, 'utf8')).cursor, 1);

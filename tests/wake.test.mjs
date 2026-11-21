@@ -989,7 +989,7 @@ test('timer: a turn closed with resume_at is rung at that time, also with the sa
   await assert.rejects(client.turn({ thread: 'thr-1', state: 'closed', next: 'x', resume_at: 'soon' }), /resume_at/);
 });
 
-test('code answer `otázka` (recipient waits for the operator): no ring at the deadline; the sender is rung with `no reply <id>` after the 4 h base', async (t) => {
+test('code answer `otázka` (recipient waits for the operator): no ring at the deadline; the sender is rung with `no reply <id>` once, after 60 h (4 h × 15)', async (t) => {
   const ctx = await setup(t);
   const { inst, client, waker, adapter, svc, clock } = ctx;
   dueByClock(ctx);
@@ -1002,18 +1002,19 @@ test('code answer `otázka` (recipient waits for the operator): no ring at the d
   assert.deepEqual(expire(ctx, m.id), [], 'a code answer, not an expiry');
   const st = await client.message(m.id);
   assert.deepEqual([st.code_answer, st.status, st.wait_reason, st.expired_at], ['otázka', 'pending', 'check', null]);
-  assert.equal(Date.parse(st.wait_due_at), clock.t + 4 * 3600_000, 'the wait restarts with the 4 h base');
-  assert.deepEqual(await waker.dueOnce(), [], 'not due before the base');
-  clock.t += 4 * 3600_000;
+  // operator 2026-11-21: until the end of the span the sender has no step (the hook line says "do not resend"): one ring.
+  assert.equal(Date.parse(st.wait_due_at), clock.t + 60 * 3600_000, 'one ring at the end of the span');
+  clock.t += 59 * 3600_000;
+  assert.deepEqual(await waker.dueOnce(), [], 'not due before the end of the span');
+  clock.t += 3600_000;
   await waker.dueOnce();
   assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the hook reads the state `otázka` from `message`');
   const after = await client.message(m.id);
-  assert.equal(after.wait_n, 1);
-  assert.equal(Date.parse(after.wait_due_at), clock.t + 4 * 3600_000 * 2);
+  assert.deepEqual([after.wait_n, after.wait_due_at], [4, null], 'the one ring ends the wait');
   assert.ok(!svc.due('alice', clock.t).due.length);
 });
 
-test('code answer `busy` (recipient runs a turn that holds the message): the sender is rung with `no reply <id>` after the 4 h base', async (t) => {
+test('code answer `busy` (recipient runs a turn that holds the message): the sender is rung with `no reply <id>` once, after 60 h', async (t) => {
   const ctx = await setup(t);
   const { inst, client, waker, adapter, clock } = ctx;
   dueByClock(ctx);
@@ -1025,13 +1026,13 @@ test('code answer `busy` (recipient runs a turn that holds the message): the sen
   expire(ctx, m.id);
   const st = await client.message(m.id);
   assert.deepEqual([st.code_answer, st.status], ['busy', 'pending']);
-  assert.equal(Date.parse(st.wait_due_at), clock.t + 4 * 3600_000);
-  clock.t += 4 * 3600_000 - 1000;
+  assert.equal(Date.parse(st.wait_due_at), clock.t + 60 * 3600_000);
+  clock.t += 60 * 3600_000 - 1000;
   assert.deepEqual(await waker.dueOnce(), []);
   clock.t += 1000;
   await waker.dueOnce();
   assert.deepEqual(adapter.calls, [{ holder: 'thr-a', text: `no reply ${m.id}` }], 'the hook reads the state `busy` from `message`');
-  assert.equal((await client.message(m.id)).wait_n, 1);
+  assert.equal((await client.message(m.id)).wait_due_at, null, 'the one ring ends the wait');
 });
 
 // D-0015, D-0022: no steer/assist ring into an open discussion with the operator; a blocker passes; the held ring goes

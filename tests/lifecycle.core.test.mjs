@@ -325,6 +325,8 @@ test('I7: due + wait-rang: unconfirmed stays due after 2 h; a confirmation doubl
     // with no step for two messages answered `otázka`): 4 h × 15, then the wait ends with a recent row.
     const asked = await s.send({ text: 'third' });
     await s.a.receive(s.box);
+    // A picked assist is with its recipient: its sender is rung once, 15 h after the pickup.
+    assert.ok(Math.abs(Date.parse(readMsg(s.inst, asked.id).wait_due_at) - Date.now() - 15 * 3600_000) < 5000, 'picked assist: one check after 15 h');
     const t0 = Date.now();
     await s.a.resolve({ ...s.box, id: asked.id, state: 'otázka', text: 'which one?' });
     const w = readMsg(s.inst, asked.id);

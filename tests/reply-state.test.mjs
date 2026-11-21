@@ -78,9 +78,9 @@ test('reply state: stored on the reply, shown in receive, count items, message a
   assert.deepEqual((await bob.obligations({ thread: 'thr-bob' })).owed, []);
 });
 
-test('reply state: the first interim state and the final reply ring the sender; a move between interim states does not', async (t) => {
+test('reply state: the first interim state of a blocker and the final reply ring the sender; a move between interim states does not', async (t) => {
   const { svc, alice, bob, box, ask } = await pair(t, 'rs4');
-  const q = await ask();
+  const q = await ask('decide', { level: 'blocker' });
   await bob.receive(box);
   const start = svc.lastSeq;
   await bob.resolve({ ...box, id: q.id, state: 'otázka', text: 'operator decides' });
@@ -92,6 +92,21 @@ test('reply state: the first interim state and the final reply ring the sender; 
   assert.equal((await alice.receive({ thread: 'thr-alice' })).find((m) => m.id === w.answer_id).wait_for, 'build 42');
   await bob.resolve({ ...box, id: q.id, state: 'hotovo', text: 'built' });
   assert.deepEqual((await alice.events(e1.at(-1).seq)).map((e) => [e.type, e.reply_state]), [['reply', 'hotovo']]);
+});
+
+// operator 2026-11-21: a ring is for a turn that has a step. The sender of an assist does other work and has no step by an
+// interim reply: no ring and no reminder; the reply waits in its inbox, and the final reply rings.
+test('reply state: an interim reply to an assist does not ring the sender and is not reminded; the final reply rings', async (t) => {
+  const { svc, alice, bob, box, ask } = await pair(t, 'rs4a');
+  const q = await ask();
+  await bob.receive(box);
+  const start = svc.lastSeq;
+  const w = await bob.resolve({ ...box, id: q.id, state: 'otázka', text: 'operator decides' });
+  assert.deepEqual(await alice.events(start), [], 'no ring');
+  assert.ok(!svc.unpicked({ now: Date.now() + 3600_000 }).some((e) => e.message_id === w.answer_id), 'no reminder');
+  assert.deepEqual((await alice.count({ thread: 'thr-alice' })).items.map((i) => i.id), [w.answer_id], 'it waits in the inbox of the sender');
+  await bob.resolve({ ...box, id: q.id, state: 'hotovo', text: 'done' });
+  assert.deepEqual((await alice.events(start)).map((e) => [e.type, e.reply_state]), [['reply', 'hotovo']]);
 });
 
 test('cancels: resolve with cancels replaces the own final reply; anyone else, a non-final reply, another id and a second cancel are refused', async (t) => {

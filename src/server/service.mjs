@@ -85,7 +85,7 @@ export const WAKE_SENDER = 'wake';
 /**
  * Base of the sender's wait in seconds (1e): a new blocker 15 min, assist 60 min (steer: its pickup deadline only, then
  * like a blocker); interim `čakám` 60 min; `otázka` and a code answer 4 h. After each confirmed ring the next check is
- * base × 2^n; after WAIT_MAX_RINGS rings the wait ends. An interim answer of the recipient itself rings once (setWait).
+ * base × 2^n; after WAIT_MAX_RINGS rings the wait ends. After an interim answer (of the recipient or of the mail) the wait rings once (setWait).
  */
 export const WAIT_BASE_S = { blocker: 15 * 60, steer: 15 * 60, assist: 60 * 60, 'čakám': 60 * 60, 'otázka': 4 * 3600, code: 4 * 3600 };
 export const WAIT_MAX_RINGS = 4;
@@ -216,8 +216,8 @@ export class Service {
   }
 
   /**
-   * Start (or restart) the sender's wait: due at `from + base`, counter 0. `once` (the recipient itself answered `čakám` or
-   * `otázka`): one ring, at the end of the span the doubling would take (base × (2^WAIT_MAX_RINGS − 1): 15 h, 60 h), and
+   * Start (or restart) the sender's wait: due at `from + base`, counter 0. `once` (the recipient answered `čakám` or
+   * `otázka`, or the mail answered for it: `busy`, `otázka`): one ring, at the end of the span the doubling would take (base × (2^WAIT_MAX_RINGS − 1): 15 h, 60 h), and
    * the wait ends with it. Until then the sender can do nothing, and the final answer wakes it (operator 2026-11-21: a
    * sender was rung four times for two messages the recipient had answered `otázka`; each ring was a turn with no step).
    */
@@ -546,8 +546,8 @@ export class Service {
     m.to_brain_name = rec.brain_name || null;
     m.history = [...(m.history || []), { at, from: m.status, to: m.status, op: 'move', by: 'code' }].slice(-HISTORY_MAX);
     this.store.saveMessage(m);
-    if (event && m.status === 'pending') {
-      const orig = m.reply_to ? this.store.message(m.reply_to) : null;
+    const orig = m.reply_to ? this.store.message(m.reply_to) : null;
+    if (event && m.status === 'pending' && !this.quietReply(m, orig)) {
       this.emitEvent({
         type: m.reply_to ? 'reply' : m.level, ...eventBase(m),
         ...(m.reply_to ? { reply_to: m.reply_to, reply_state: m.reply_state || null, original_level: orig ? orig.level : null } : {}),
@@ -906,6 +906,16 @@ export class Service {
     }
   }
 
+  /**
+   * An interim reply (`čakám`, `otázka`) to an assist: the sender has no step by it (it does other work and neither
+   * resends nor escalates, P-042), so it is not rung and not reminded; it waits in the sender's inbox and the mail lines
+   * of the sender's next turn name it (operator 2026-11-21: a ring is for a turn that has a step). A blocker's sender
+   * goes on by the recommendation of the interim reply: it is rung as before.
+   */
+  quietReply(reply, original) {
+    return !!reply?.reply_to && !!reply.reply_state && reply.reply_state !== FINAL_REPLY_STATE && original?.level === 'assist';
+  }
+
   /** Event of a delivered reply for the original's sender. */
   replyEvent(reply, original) {
     const t = reply.project && reply.topic ? this.resolveKey(recipientTopicKey(reply)) : null;
@@ -1008,7 +1018,13 @@ export class Service {
     m.picked_at = nowIso();
     m.picked_by_thread = thread || null;
     if (m.reply_to || m.level === 'steer') this.apply(m, 'done', 'receive', 'thread', { resolution: 'read' });
-    else this.apply(m, 'picked', 'receive', 'thread');
+    else {
+      // A picked assist is with its recipient, who does it at a free point (the end of its turns reminds it): its sender
+      // does other work and has no step until the result, so the wait rings once, 15 h after the pickup (operator
+      // 2026-11-21: a ring is for a turn that has a step). A blocker keeps its checks: its sender is blocked.
+      if (m.level === 'assist') this.setWait(m, WAIT_BASE_S.assist, 'no-reply', Date.now(), true);
+      this.apply(m, 'picked', 'receive', 'thread');
+    }
     return m;
   }
 
@@ -1122,7 +1138,7 @@ export class Service {
     this.recordOp(m, opId, 'resolve', result);
     this.store.saveMessage(m);
     if (isFinal(m.status)) this.closeNotices(m);
-    if (reply && delivered && (firstAnswer || state === FINAL_REPLY_STATE)) this.replyEvent(reply, m);
+    if (reply && delivered && (firstAnswer || state === FINAL_REPLY_STATE) && !this.quietReply(reply, m)) this.replyEvent(reply, m);
     if (!reply) this.addRecent(this.senderKey(m), { kind: resolution, id: m.id, level: m.level, line: `${resolution} ${m.id}` });
     this.log(`resolve ${m.id} → ${m.status}${m.resolution ? `/${m.resolution}` : ''}${reply ? ` reply ${reply.id}${delivered ? '' : ` undelivered (${reply.undelivered_reason})`}` : ''}`);
     return result;
@@ -1343,7 +1359,7 @@ export class Service {
       m.wait_n = (m.wait_n || 0) + 1;
       if (m.wait_n >= WAIT_MAX_RINGS) {
         m.wait_due_at = null;
-        this.addRecent(this.senderKey(m), { kind: 'no-answer', id: m.id, level: m.level, line: m.wait_once ? `no final answer ${m.id} (interim ${m.answer_state || 'answer'} since ${m.answer_at || '?'})` : `no answer after ${WAIT_MAX_RINGS} checks ${m.id}` });
+        this.addRecent(this.senderKey(m), { kind: 'no-answer', id: m.id, level: m.level, line: !m.wait_once ? `no answer after ${WAIT_MAX_RINGS} checks ${m.id}` : m.answer_state ? `no final answer ${m.id} (interim ${m.answer_state} since ${m.answer_at || '?'})` : `no answer ${m.id} (${m.code_answer ? `not picked, ${m.code_answer} set by the mail` : `picked ${m.picked_at || '?'}`})` });
       } else {
         const base = m.wait_base_s || WAIT_BASE_S[m.level] || WAIT_BASE_S.blocker;
         m.wait_due_at = new Date(at.getTime() + base * 1000 * 2 ** m.wait_n).toISOString();
@@ -1398,7 +1414,7 @@ export class Service {
       if (codeState) {
         m.code_answer = codeState;
         m.code_answer_at = at;
-        this.setWait(m, WAIT_BASE_S.code, 'check', now);
+        this.setWait(m, WAIT_BASE_S.code, 'check', now, true);
         this.store.saveMessage(m);
         const why = codeState === 'busy' ? 'recipient runs a turn, delivered after it' : 'recipient waits for the operator';
         this.log(`code answer ${codeState} ${m.id} (${m.level}) ${m.project}/${m.topic}: ${why}`);
@@ -1434,6 +1450,8 @@ export class Service {
     const out = [];
     for (const m of this.store.messages((x) => x.status === 'pending')) {
       if (now - Date.parse(m.created_at) < olderMs) continue;
+      // A quiet reply is never rung, so it is not reminded either (quietReply).
+      if (m.reply_to && this.quietReply(m, this.store.message(m.reply_to))) continue;
       const t = m.to_thread ? null : (m.project && m.topic ? this.resolveKey(recipientTopicKey(m)) : null);
       const orig = m.reply_to && m.to_thread ? this.store.message(m.reply_to) : null;
       out.push({
@@ -1591,7 +1609,7 @@ export class Service {
       if (!final) { clearWaitFields(o); if (delivered) this.setWait(o, WAIT_BASE_S[last.reply_state] || WAIT_BASE_S.code, 'check', Date.parse(last.created_at), true); }
       if (to === 'same') this.store.saveMessage(o);
       else this.apply(o, to, 'repair', 'code', { resolution: to === 'done' ? 'reply' : null });
-      if (last.status === 'pending' && (first || final)) this.replyEvent(last, o);
+      if (last.status === 'pending' && (first || final) && !this.quietReply(last, o)) this.replyEvent(last, o);
       this.log(`repair: ${o.id} → ${o.status}${o.resolution ? `/${o.resolution}` : ''} from reply ${last.id}`);
       out.push(o.id);
     }

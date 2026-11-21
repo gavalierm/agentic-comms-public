@@ -29,7 +29,7 @@ test('waiting_operator on the open turn: the unpicked message gets the code answ
   const st = await alice.message(m.id);
   assert.deepEqual([st.status, st.expired_at, st.code_answer, st.answer_state, st.wait_reason], ['pending', null, 'otázka', null, 'check']);
   assert.ok(st.code_answer_at);
-  assert.ok(Date.parse(st.wait_due_at) - Date.parse(st.code_answer_at) === WAIT_BASE_S.code * 1000, 'the sender\'s wait restarts as for an interim answer');
+  assert.ok(Date.parse(st.wait_due_at) - Date.parse(st.code_answer_at) === WAIT_BASE_S.code * 1000 * 15, 'the sender\'s wait rings once, at the end of the span (base × 15), as after an interim answer');
   assert.equal(svc.checkExpired(Date.now() + 120_000).length, 0, 'once');
   assert.deepEqual((await alice.count({ project: 'p', topic: 't' })).items.map((i) => [i.id, i.code_answer]), [[m.id, 'otázka']]);
   const awaiting = (await alice.obligations({ thread: 'thr-alice' })).awaiting.find((x) => x.id === m.id);

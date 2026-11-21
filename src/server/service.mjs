@@ -85,7 +85,7 @@ export const WAKE_SENDER = 'wake';
 /**
  * Base of the sender's wait in seconds (1e): a new blocker 15 min, assist 60 min (steer: its pickup deadline only, then
  * like a blocker); interim `čakám` 60 min; `otázka` and a code answer 4 h. After each confirmed ring the next check is
- * base × 2^n; after WAIT_MAX_RINGS rings the wait ends.
+ * base × 2^n; after WAIT_MAX_RINGS rings the wait ends. An interim answer of the recipient itself rings once (setWait).
  */
 export const WAIT_BASE_S = { blocker: 15 * 60, steer: 15 * 60, assist: 60 * 60, 'čakám': 60 * 60, 'otázka': 4 * 3600, code: 4 * 3600 };
 export const WAIT_MAX_RINGS = 4;
@@ -215,13 +215,19 @@ export class Service {
     return !!(m.thread_id || (m.from_project && m.from_topic));
   }
 
-  /** Start (or restart) the sender's wait: due at `from + base`, counter 0. */
-  setWait(m, baseS, reason, from = Date.now()) {
+  /**
+   * Start (or restart) the sender's wait: due at `from + base`, counter 0. `once` (the recipient itself answered `čakám` or
+   * `otázka`): one ring, at the end of the span the doubling would take (base × (2^WAIT_MAX_RINGS − 1): 15 h, 60 h), and
+   * the wait ends with it. Until then the sender can do nothing, and the final answer wakes it (operator 2026-11-21: a
+   * sender was rung four times for two messages the recipient had answered `otázka`; each ring was a turn with no step).
+   */
+  setWait(m, baseS, reason, from = Date.now(), once = false) {
     if (!this.hasWayBack(m) || m.reply_to) return;
     m.wait_base_s = baseS;
-    m.wait_n = 0;
+    m.wait_n = once ? WAIT_MAX_RINGS - 1 : 0;
+    m.wait_once = once || undefined;
     m.wait_reason = reason;
-    m.wait_due_at = new Date(from + baseS * 1000).toISOString();
+    m.wait_due_at = new Date(from + baseS * 1000 * (once ? 2 ** WAIT_MAX_RINGS - 1 : 1)).toISOString();
   }
 
   /** The sender should hear now (deadline, undelivered, recipient closed); a wait due earlier stays. */
@@ -1106,7 +1112,7 @@ export class Service {
     });
     if (to === 'waiting') {
       clearWaitFields(m);
-      if (delivered) this.setWait(m, WAIT_BASE_S[state], 'check');
+      if (delivered) this.setWait(m, WAIT_BASE_S[state], 'check', Date.now(), true);
     }
     transition(m, to, 'resolve', 'thread', { resolution, at: now });
     const result = {
@@ -1337,7 +1343,7 @@ export class Service {
       m.wait_n = (m.wait_n || 0) + 1;
       if (m.wait_n >= WAIT_MAX_RINGS) {
         m.wait_due_at = null;
-        this.addRecent(this.senderKey(m), { kind: 'no-answer', id: m.id, level: m.level, line: `no answer after ${WAIT_MAX_RINGS} checks ${m.id}` });
+        this.addRecent(this.senderKey(m), { kind: 'no-answer', id: m.id, level: m.level, line: m.wait_once ? `no final answer ${m.id} (interim ${m.answer_state || 'answer'} since ${m.answer_at || '?'})` : `no answer after ${WAIT_MAX_RINGS} checks ${m.id}` });
       } else {
         const base = m.wait_base_s || WAIT_BASE_S[m.level] || WAIT_BASE_S.blocker;
         m.wait_due_at = new Date(at.getTime() + base * 1000 * 2 ** m.wait_n).toISOString();
@@ -1582,7 +1588,7 @@ export class Service {
         answer_state: last.reply_state, answer_at: last.created_at, answer_id: last.id, answer_origin: 'reply',
         answer_delivered: delivered, answer_undelivered_reason: delivered ? null : last.undelivered_reason || null,
       });
-      if (!final) { clearWaitFields(o); if (delivered) this.setWait(o, WAIT_BASE_S[last.reply_state] || WAIT_BASE_S.code, 'check', Date.parse(last.created_at)); }
+      if (!final) { clearWaitFields(o); if (delivered) this.setWait(o, WAIT_BASE_S[last.reply_state] || WAIT_BASE_S.code, 'check', Date.parse(last.created_at), true); }
       if (to === 'same') this.store.saveMessage(o);
       else this.apply(o, to, 'repair', 'code', { resolution: to === 'done' ? 'reply' : null });
       if (last.status === 'pending' && (first || final)) this.replyEvent(last, o);

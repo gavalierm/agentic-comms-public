@@ -173,7 +173,7 @@ Záloha (CL `obligations`): živá odpoveď (po `flush`) prepíše `obligations-
 | `send` `blocker` / `assist` | `no-reply` | `created_at + základ` | 15 min / 60 min (`steer` čakanie pri `send` nemá) |
 | lehota uplynula bez prevzatia (`checkExpired`, aj `held`) | `no-reply` | hneď (skoršie splatné ostáva) | podľa úrovne |
 | kódová odpoveď `otázka`/`busy` | `check` | `teraz + 4 h` | 4 h |
-| `resolve` `čakám` / `otázka` (doručená odpoveď) | `check` | `teraz + základ`, `wait_n = 0` | 60 min / 4 h |
+| `resolve` `čakám` / `otázka` (doručená odpoveď príjemcu) | `check` | `teraz + základ × 15`, `wait_n = 3`: **jedno zvonenie** na konci rozpätia zdvojenia, ním čakanie končí (riadok `no final answer <id> …` do `recent`); dovtedy odosielateľ nemá krok a konečná odpoveď ho zobudí sama (operátor 2026-11-21) | 15 h / 60 h |
 | `bounce`, `close` (`→ undelivered`) | `undelivered` | hneď, jednorazovo | – |
 | uzavretie témy príjemcu s `picked`/`waiting` | `recipient-closed` | hneď, jednorazovo | – |
 | konečný prechod | – | vynulované (okrem `undelivered` vyššie) | – |

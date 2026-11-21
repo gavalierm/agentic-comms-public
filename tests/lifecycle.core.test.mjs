@@ -321,6 +321,18 @@ test('I7: due + wait-rang: unconfirmed stays due after 2 h; a confirmation doubl
     await s.a.resolve({ ...s.box, id: other.id, state: 'hotovo' });
     assert.ok(!s.srv.service.due('wake', Date.now() + 365 * 86400_000).due.some((x) => x.id === other.id));
     assert.equal((await wake.call('POST', '/wait-rang', { id: other.id })).status, 409);
+    // An interim answer of the recipient rings the sender once, at the end of the span (operator 2026-11-21: four rings
+    // with no step for two messages answered `otázka`): 4 h × 15, then the wait ends with a recent row.
+    const asked = await s.send({ text: 'third' });
+    await s.a.receive(s.box);
+    const t0 = Date.now();
+    await s.a.resolve({ ...s.box, id: asked.id, state: 'otázka', text: 'which one?' });
+    const w = readMsg(s.inst, asked.id);
+    assert.ok(Math.abs(Date.parse(w.wait_due_at) - t0 - 60 * 3600_000) < 5000, w.wait_due_at);
+    assert.ok(!s.srv.service.due('wake', t0 + 59 * 3600_000).due.some((x) => x.id === asked.id), 'no ring before the end of the span');
+    assert.ok(s.srv.service.due('wake', t0 + 61 * 3600_000).due.some((x) => x.id === asked.id));
+    assert.equal((await wake.waitRang({ id: asked.id, rang_at: new Date(t0 + 61 * 3600_000).toISOString() })).wait_due_at, null, 'one ring ends the wait');
+    assert.ok((await s.a.obligations({ thread: SENDER_THREAD })).recent.some((r) => r.id === asked.id && /^no final answer \S+ \(interim otázka since /.test(r.line)));
   } finally { await s.done(); }
 });
 

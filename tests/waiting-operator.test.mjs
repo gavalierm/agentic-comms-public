@@ -24,6 +24,7 @@ test('waiting_operator on the open turn: the unpicked message gets the code answ
   const flagged = await bob.turn({ thread: 'thr-bob', waiting_operator: true, opened_at: o.turn.opened_at });
   assert.equal(flagged.turn.waiting_operator, true);
   const m = await send(alice);
+  assert.deepEqual([m.recipient_dialog.thread, m.recipient_dialog.since], ['thr-bob', flagged.turn.waiting_operator_at], 'send says at once that the recipient waits for its operator');
   const at = Date.now() + 120_000;
   assert.deepEqual(svc.checkExpired(at), [], 'not expired');
   const st = await alice.message(m.id);

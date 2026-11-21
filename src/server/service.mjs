@@ -678,7 +678,7 @@ export class Service {
       transition(msg, 'pending', 'send', 'thread', { at: created_at });
       this.store.saveMessage(msg);
       this.afterDelivery(msg);
-      const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, to_thread: msg.to_thread };
+      const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, to_thread: msg.to_thread, ...this.dialogNote(msg) };
       this.recordOp(msg, opId, 'send', result);
       this.store.saveMessage(msg);
       this.log(`thread ${msg.id} → vlákno ${msg.to_thread} (${machine})`);
@@ -696,7 +696,7 @@ export class Service {
       transition(msg, 'pending', 'send', 'thread', { at: created_at });
       this.store.saveMessage(msg);
       this.afterDelivery(msg);
-      const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, to_thread: msg.to_thread };
+      const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, to_thread: msg.to_thread, ...this.dialogNote(msg) };
       this.recordOp(msg, opId, 'send', result);
       this.store.saveMessage(msg);
       this.log(`maintainer ${msg.id} → vlákno ${msg.to_thread}`);
@@ -757,7 +757,7 @@ export class Service {
     transition(msg, 'pending', 'send', 'thread', { at: created_at });
     this.store.saveMessage(msg);
     this.afterDelivery(msg);
-    const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, ...(resolved ? { resolved } : {}) };
+    const result = { id: msg.id, status: msg.status, level, notice_id: msg.notice_id, expires_at: msg.expires_at, wait_due_at: msg.wait_due_at || null, ...(resolved ? { resolved } : {}), ...this.dialogNote(msg) };
     this.recordOp(msg, opId, 'send', result);
     this.store.saveMessage(msg);
     return result;
@@ -1464,6 +1464,28 @@ export class Service {
     return out.sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
   }
 
+  /** Turn record of the thread that receives `m`, or null. */
+  recipientTurn(m) {
+    const thread = this.recipientThread(m);
+    return thread ? this.store.turn(thread) : null;
+  }
+
+  /**
+   * The recipient's open turn sits in a dialog with its operator: { thread, since }; else null. Only the operator ends
+   * that wait, so `send` says it at once (`recipient_dialog`; operator 2026-11-21: a sender ended its turn waiting for a
+   * thread that had waited 50 min for the operator's answer, and the operator took the recipient for gone).
+   */
+  recipientDialog(m) {
+    const turn = this.recipientTurn(m);
+    return turn && turn.state === 'open' && turn.waiting_operator ? { thread: turn.thread, since: turn.waiting_operator_at || null } : null;
+  }
+
+  /** Part of a send result: `recipient_dialog` when the recipient cannot pick `m` up before its operator answers. */
+  dialogNote(m) {
+    const d = m.status === 'pending' ? this.recipientDialog(m) : null;
+    return d ? { recipient_dialog: d } : {};
+  }
+
   /**
    * Code answer for an unpicked message past its deadline, or null (`no reply`):
    * - `otázka`: the recipient waits for the operator: its open turn is in the dialog (`waiting_operator`), or, for a
@@ -1474,9 +1496,8 @@ export class Service {
    * A blocker passes the discussion, so its expiry stays `no reply`.
    */
   recipientCodeAnswer(m, now = Date.now()) {
-    const thread = this.recipientThread(m);
-    const turn = thread ? this.store.turn(thread) : null;
-    if (turn && turn.state === 'open' && turn.waiting_operator) return 'otázka';
+    const turn = this.recipientTurn(m);
+    if (this.recipientDialog(m)) return 'otázka';
     if (!DISCUSSION_HELD_LEVELS.includes(m.level) || !discussionOpen(turn)) return null;
     if (turn.state !== 'open') return 'otázka';
     return turnFresh(turn, now) ? 'busy' : null;

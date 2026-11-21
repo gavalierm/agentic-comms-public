@@ -90,7 +90,7 @@ export const WAKE_SENDER = 'wake';
 export const WAIT_BASE_S = { blocker: 15 * 60, steer: 15 * 60, assist: 60 * 60, 'čakám': 60 * 60, 'otázka': 4 * 3600, code: 4 * 3600 };
 export const WAIT_MAX_RINGS = 4;
 /** Wait reasons that ring once: the sender is told, then decides (the message cannot progress by itself). */
-const ONE_SHOT_WAITS = ['undelivered', 'recipient-closed'];
+const ONE_SHOT_WAITS = ['undelivered', 'recipient-closed', 'unanswered'];
 export const OPS_MAX = 10;
 export const RECENT_MAX = 200;
 const OP_ID_RE = /^[A-Za-z0-9._:-]{1,100}$/;
@@ -1131,6 +1131,10 @@ export class Service {
       if (delivered) this.setWait(m, WAIT_BASE_S[state], 'check', Date.now(), true);
     }
     transition(m, to, 'resolve', 'thread', { resolution, at: now });
+    // A blocker that ends without a reply (ack, settle) leaves its sender blocked: its turn ended waiting for the answer,
+    // the final status took the wait, and a recent row rings nobody. One ring tells it (`no reply <id>`), then it decides
+    // (operator 2026-11-21: a ring is for a turn that has a step). An assist stays quiet: its sender does other work.
+    if (!reply && to === 'done' && m.level === 'blocker') this.waitDueNow(m, 'unanswered');
     const result = {
       id: m.id, status: m.status, resolution: m.resolution, answer_state: m.answer_state, answer_id: m.answer_id,
       answer_delivered: m.answer_delivered, ...(m.answer_undelivered_reason ? { reason: m.answer_undelivered_reason } : {}),

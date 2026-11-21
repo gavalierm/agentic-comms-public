@@ -10,6 +10,8 @@ export const DATA_SCHEMA = 3;
 
 export const STATUSES = ['held', 'pending', 'picked', 'waiting', 'done', 'discarded', 'superseded', 'undelivered'];
 export const FINAL_STATUSES = ['done', 'discarded', 'superseded', 'undelivered'];
+/** The one-shot wait a final message may carry (I7), by status: its sender is told once that no answer comes. */
+export const FINAL_WAITS = { undelivered: 'undelivered', done: 'unanswered' };
 export const RESOLUTIONS = ['reply', 'settled', 'acked', 'read', 'withdrawn'];
 export const STATUS_BY = ['thread', 'code', 'operator', 'migration'];
 export const HISTORY_MAX = 20;
@@ -58,7 +60,7 @@ export function findTransition(from, to, op, resolution = null) {
 
 /**
  * The only writer of `status` (I1). Refuses a transition outside 1b with 409 and the current state. A final status
- * clears the sender's wait (I7); the caller sets a one-shot wait afterwards where 1b says so (undelivered).
+ * clears the sender's wait (I7); the caller sets a one-shot wait afterwards where 1b says so (FINAL_WAITS).
  * Mutates and returns `m`; the caller stores it.
  */
 export function transition(m, to, op, by, { resolution = null, at = nowIso(), note = null } = {}) {
@@ -164,7 +166,7 @@ export function verifyInvariants(messages, notices) {
     for (const k of OLD_FIELDS) if (k in m) errors.push({ id: m.id, problem: `old field ${k}` });
     if ((m.reply_to || m.level === 'steer') && ['picked', 'waiting'].includes(m.status)) errors.push({ id: m.id, problem: `${m.reply_to ? 'reply' : 'steer'} owed (${m.status})` });
     if (m.status === 'undelivered' && m.picked_at) errors.push({ id: m.id, problem: 'undelivered but picked' });
-    if (m.wait_due_at && isFinal(m.status) && !(m.status === 'undelivered' && m.wait_reason === 'undelivered')) errors.push({ id: m.id, problem: `wait on final ${m.status}` });
+    if (m.wait_due_at && isFinal(m.status) && FINAL_WAITS[m.status] !== m.wait_reason) errors.push({ id: m.id, problem: `wait on final ${m.status}` });
   }
   for (const n of notices) {
     if (n.state !== 'open' || !n.message_id) continue;

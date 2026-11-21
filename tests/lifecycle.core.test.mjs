@@ -321,6 +321,11 @@ test('I7: due + wait-rang: unconfirmed stays due after 2 h; a confirmation doubl
     await s.a.resolve({ ...s.box, id: other.id, state: 'hotovo' });
     assert.ok(!s.srv.service.due('wake', Date.now() + 365 * 86400_000).due.some((x) => x.id === other.id));
     assert.equal((await wake.call('POST', '/wait-rang', { id: other.id })).status, 409);
+    // A blocker that ends without a reply (ack) rings its blocked sender once (`unanswered`); an acked assist rings nobody
+    // (error report 2026-11-21: a turn that waited for the mail had no waker after the ack).
+    assert.equal((await s.a.resolve({ ...s.box, id, state: 'hotovo', ack: true })).resolution, 'acked');
+    assert.equal(s.srv.service.due('wake', Date.now() + 1000).due.find((x) => x.id === id)?.wait_reason, 'unanswered');
+    assert.equal((await wake.waitRang({ id, rang_at: new Date(Date.now() + 1000).toISOString() })).wait_due_at, null, 'one ring');
     // An interim answer of the recipient rings the sender once, at the end of the span (operator 2026-11-21: four rings
     // with no step for two messages answered `otázka`): 4 h × 15, then the wait ends with a recent row.
     const asked = await s.send({ text: 'third' });
